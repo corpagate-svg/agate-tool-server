@@ -1,0 +1,13 @@
+{
+  "name": "agate-tool-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "物販ツール用の受け取りサーバー",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}

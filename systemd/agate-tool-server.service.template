@@ -1,0 +1,15 @@
+[Unit]
+Description=Agate Tool Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/server/.env
+ExecStart=/usr/bin/env node __APP_DIR__/server/server.js
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
