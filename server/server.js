@@ -1139,13 +1139,11 @@ async function saveOrderField(tr, orderNo, header, value) {
   }
 }
 
-const INV_HIDDEN = ["UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致"];
+const INV_HIDDEN = ["UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致", "バリエーション詳細"];
 
 function renderInventory() {
   if (!invHeaders.length) return;
-  const displayOrder = invHeaders.map((h, i) => i)
-    .filter((i) => invHeaders[i] !== "バリエーション詳細" && !INV_HIDDEN.includes(invHeaders[i]))
-    .concat(invHeaders.map((h, i) => i).filter((i) => invHeaders[i] === "バリエーション詳細"));
+  const displayOrder = invHeaders.map((h, i) => i).filter((i) => !INV_HIDDEN.includes(invHeaders[i]));
   const thead = document.getElementById("inv-thead");
   thead.innerHTML = displayOrder.map((i, pos) => '<th class="' + (INV_NUM_COLS.includes(invHeaders[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '">' + invHeaders[i] + '</th>').join("");
   const q = document.getElementById("inv-q").value.trim().toLowerCase();
