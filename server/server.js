@@ -93,6 +93,53 @@ function isAuthorized(req) {
   return crypto.timingSafeEqual(given, expected);
 }
 
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field); field = "";
+    } else if (c === "\r") {
+      // skip
+    } else if (c === "\n") {
+      row.push(field); rows.push(row); row = []; field = "";
+    } else {
+      field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function csvToObjects(text) {
+  const rows = parseCsv(text).filter((r) => !(r.length === 1 && r[0] === ""));
+  if (!rows.length) return [];
+  const headers = rows[0];
+  return rows.slice(1).map((r) => {
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = r[i] !== undefined ? r[i] : ""; });
+    return obj;
+  });
+}
+
+function numOrNullCsv(v) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function intOrNullCsv(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
@@ -283,6 +330,190 @@ async function handleImportInventory(req, res) {
   sendJson(res, 200, { status: "ok", message: "取り込みが完了しました" });
 }
 
+const INV_HEADER_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F4E78" } };
+const INV_HEADER_FONT = { bold: true, color: { argb: "FFFFFFFF" } };
+const INV_FLAG_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+const INV_REMOVED_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF2DCDB" } };
+
+async function handleRebuildInventory(req, res) {
+  const buf = await readRawBody(req, 30 * 1024 * 1024);
+  const text = buf.toString("utf8").replace(/^﻿/, "");
+  const records = csvToObjects(text);
+  if (!records.length) return sendJson(res, 400, { error: "CSVにデータがありません" });
+  for (const col of ["Title", "Listing site", "Item number"]) {
+    if (!(col in records[0])) {
+      return sendJson(res, 400, { error: `CSVに ${col} 列が見つかりません。eBayの『All active listings report』形式か確認してください` });
+    }
+  }
+
+  const oldWb = await loadInventoryWorkbook();
+  const oldWs = oldWb.getWorksheet("在庫管理表") || oldWb.worksheets[0];
+  const saved = new Map();
+  let maxId = 0;
+  oldWs.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const pid = row.getCell(1).value;
+    if (!pid) return;
+    const idNum = parseInt(String(pid).slice(1), 10);
+    if (Number.isFinite(idNum)) maxId = Math.max(maxId, idNum);
+    const fullRow = [];
+    for (let c = 1; c <= INV_HEADERS.length; c++) fullRow.push(row.getCell(c).value);
+    const key = (fullRow[1] || "") + " || " + (fullRow[2] || "");
+    saved.set(key, {
+      商品ID: pid,
+      fullRow,
+      wasRemoved: String(fullRow[18] || "").includes("見当たりません"),
+    });
+  });
+
+  const groups = new Map();
+  records.forEach((r) => {
+    const key = (r["Title"] || "") + " || " + (r["Variation details"] || "");
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  });
+
+  const anomalous = [];
+  const mainKeys = [];
+  for (const [key, items] of groups) {
+    if (items.length > 3) anomalous.push(...items);
+    else mainKeys.push(key);
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const rowsOut = [];
+  const newProducts = [];
+  let nextId = maxId + 1;
+  const newKeySet = new Set(mainKeys);
+
+  for (const key of mainKeys) {
+    const items = groups.get(key);
+    const first = items[0];
+    const qtys = new Set(items.map((it) => it["Available quantity"]));
+    const bySite = {};
+    items.forEach((it) => {
+      const site = it["Listing site"];
+      if (["US", "UK", "AU"].includes(site) && !bySite[site]) bySite[site] = it;
+    });
+    const siteCount = Object.keys(bySite).length;
+
+    let pid;
+    let purchasePrice = null, purchaseDate = null, purchaseFrom = null, note = "";
+    if (saved.has(key)) {
+      const s = saved.get(key);
+      pid = s.商品ID;
+      purchasePrice = s.fullRow[15]; purchaseDate = s.fullRow[16]; purchaseFrom = s.fullRow[17];
+      note = s.wasRemoved ? "" : (s.fullRow[18] || "");
+    } else {
+      pid = "P" + String(nextId).padStart(4, "0");
+      nextId++;
+      newProducts.push([pid, first["Title"]]);
+    }
+
+    rowsOut.push({
+      row: [
+        pid, first["Title"] || "", first["Variation details"] || null, intOrNullCsv(first["Available quantity"]),
+        siteCount, qtys.size > 1 ? "要確認" : "",
+        bySite.US ? numOrNullCsv(bySite.US["Item number"]) : null, bySite.US ? numOrNullCsv(bySite.US["Current price"]) : null, bySite.US ? intOrNullCsv(bySite.US["Sold quantity"]) : null,
+        bySite.UK ? numOrNullCsv(bySite.UK["Item number"]) : null, bySite.UK ? numOrNullCsv(bySite.UK["Current price"]) : null, bySite.UK ? intOrNullCsv(bySite.UK["Sold quantity"]) : null,
+        bySite.AU ? numOrNullCsv(bySite.AU["Item number"]) : null, bySite.AU ? numOrNullCsv(bySite.AU["Current price"]) : null, bySite.AU ? intOrNullCsv(bySite.AU["Sold quantity"]) : null,
+        purchasePrice, purchaseDate, purchaseFrom, note,
+      ],
+      status: "current",
+      flag: siteCount < 3 || qtys.size > 1,
+    });
+  }
+
+  let removedNewCount = 0;
+  let removedStillCount = 0;
+  for (const [key, s] of saved) {
+    if (newKeySet.has(key)) continue;
+    let note = s.fullRow[18] || "";
+    if (s.wasRemoved) {
+      removedStillCount++;
+    } else {
+      note = (note ? note + " / " : "") + `${today}時点のeBay出品CSVに見当たりません(削除/売り切れの可能性)`;
+      removedNewCount++;
+    }
+    const carried = s.fullRow.slice(0, 15);
+    rowsOut.push({ row: carried.concat([s.fullRow[15], s.fullRow[16], s.fullRow[17], note]), status: "removed" });
+  }
+
+  rowsOut.sort((a, b) => {
+    if ((a.status === "removed") !== (b.status === "removed")) return a.status === "removed" ? 1 : -1;
+    return String(a.row[0]).localeCompare(String(b.row[0]));
+  });
+
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet("在庫管理表");
+  ws.addRow(INV_HEADERS);
+  for (let c = 1; c <= INV_HEADERS.length; c++) {
+    const cell = ws.getRow(1).getCell(c);
+    cell.fill = INV_HEADER_FILL;
+    cell.font = INV_HEADER_FONT;
+    cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+  }
+  ws.getRow(1).height = 30;
+  ws.views = [{ state: "frozen", ySplit: 1 }];
+
+  rowsOut.forEach((r) => {
+    const excelRow = ws.addRow(r.row);
+    if (r.status === "removed" || r.flag) {
+      const fill = r.status === "removed" ? INV_REMOVED_FILL : INV_FLAG_FILL;
+      for (let c = 1; c <= INV_HEADERS.length; c++) excelRow.getCell(c).fill = fill;
+    }
+  });
+  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30];
+  widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+
+  const ws2 = wb.addWorksheet("要確認(重複出品)");
+  ws2.addRow(["名寄せキー", "出品ID", "商品名", "バリエーション詳細", "SKU", "在庫数", "出品国", "現在価格", "通貨"]);
+  for (let c = 1; c <= 9; c++) {
+    ws2.getRow(1).getCell(c).fill = INV_HEADER_FILL;
+    ws2.getRow(1).getCell(c).font = INV_HEADER_FONT;
+  }
+  ws2.views = [{ state: "frozen", ySplit: 1 }];
+  anomalous.forEach((it) => {
+    ws2.addRow([
+      (it["Title"] || "") + " || " + (it["Variation details"] || ""),
+      numOrNullCsv(it["Item number"]), it["Title"], it["Variation details"], it["Custom label (SKU)"],
+      intOrNullCsv(it["Available quantity"]), it["Listing site"], numOrNullCsv(it["Current price"]), it["Currency"],
+    ]);
+  });
+  [50, 14, 40, 30, 20, 10, 10, 12, 10].forEach((w, i) => { ws2.getColumn(i + 1).width = w; });
+
+  const ws3 = wb.addWorksheet("この表について");
+  ws3.getCell("A1").value = "在庫管理表について";
+  ws3.getCell("A1").font = { bold: true, size: 13 };
+  const notes = [
+    `・eBayの『All active listings report』(${today}時点)を元に、サーバー上で自動更新しました。`,
+    "・商品IDは前回から引き継いでいます(売上管理表の商品IDとの対応を保つため)。新しく出品された商品には新しいIDを振っています。",
+    "・黄色でハイライトした行は「3カ国揃っていない」または「在庫数が国ごとに違う」商品です。",
+    "・赤色でハイライトした行は、出品CSVに見当たらなかった商品です。削除されたか、売り切れて自動終了した可能性があります。",
+    "・「要確認(重複出品)」シートには、同じ名前の出品が3件を超えて存在した商品を出品ID単位でそのまま残しています。",
+    "・仕入価格・仕入日・仕入先・備考は、前回入力済みだった内容をそのまま引き継いでいます。",
+  ];
+  notes.forEach((n, i) => {
+    const cell = ws3.getCell(`A${i + 3}`);
+    cell.value = n;
+    cell.font = { italic: true, color: { argb: "FF808080" }, size: 9 };
+  });
+  ws3.getColumn(1).width = 110;
+
+  const tmpPath = INVENTORY_PATH + ".tmp";
+  await wb.xlsx.writeFile(tmpPath);
+  fs.renameSync(tmpPath, INVENTORY_PATH);
+
+  sendJson(res, 200, {
+    status: "ok",
+    total: rowsOut.length,
+    new: newProducts.length,
+    removedNew: removedNewCount,
+    removedStill: removedStillCount,
+    anomalous: anomalous.length,
+  });
+}
+
 function sendHtml(res, html) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(html);
@@ -376,6 +607,18 @@ const DASHBOARD_PAGE = `<!doctype html>
   tr.saving td { background: #fff7e0 !important; }
   tr.saved td { background: #e9f7ec !important; }
   tr.error td { background: #fde8e8 !important; }
+
+  .paste-parse { display: flex; flex-direction: column; gap: 10px; padding: 14px; margin-bottom: 16px; background: var(--surface-2); border: 1px dashed var(--border); border-radius: 10px; }
+  .paste-parse textarea { font: inherit; font-size: 12.5px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 10px; width: 100%; resize: vertical; line-height: 1.5; }
+  .paste-parse textarea:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; }
+  .entry-form { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 12px 14px; }
+  .entry-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+  .entry-form input { font: inherit; font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 7px 9px; }
+  .entry-form input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; }
+  .hint { font-size: 12px; color: var(--ink-muted); }
+  .hint.ok { color: var(--good); }
+  .hint.ng { color: var(--series-cost); }
+  input[type=file] { font-size: 12.5px; color: var(--ink-2); }
 </style></head>
 <body>
 <div class="wrap">
@@ -414,8 +657,15 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div class="tabpanel" id="tab-inventory">
     <div class="panel">
       <h2>在庫一覧(閲覧専用)</h2>
-      <p class="desc">商品名・商品IDで検索できます。</p>
+      <p class="desc">商品名・商品IDで検索できます。eBayの「All active listings report」CSVをアップロードすると、名寄せ・フラグ付けまで自動でやり直します。</p>
       <div class="panel-body">
+        <div class="paste-parse">
+          <div class="browser-toolbar">
+            <input type="file" id="inv-csv-file" accept=".csv">
+            <button class="btn" id="inv-csv-upload">CSVで在庫を更新</button>
+            <span id="inv-csv-status" class="hint"></span>
+          </div>
+        </div>
         <div class="browser-toolbar">
           <input type="text" class="search-input" id="inv-q" placeholder="商品名・商品IDで検索…">
           <span class="result-count" id="inv-count"></span>
@@ -431,6 +681,31 @@ const DASHBOARD_PAGE = `<!doctype html>
   </div>
 
   <div class="tabpanel" id="tab-orders">
+    <div class="panel">
+      <h2>新しい注文を登録</h2>
+      <p class="desc">eBayの注文詳細ページの内容をそのまま貼り付けてください。読み取れる範囲を自動で埋めます。内容を確認・修正してから登録してください(空欄は自分で埋めてください)。</p>
+      <div class="panel-body">
+        <div class="paste-parse">
+          <textarea id="ne-paste" rows="6" placeholder="ここに貼り付け"></textarea>
+          <div class="browser-toolbar">
+            <button class="btn" id="ne-parse-btn">読み取る</button>
+          </div>
+          <div class="entry-form" id="ne-review" style="display:none;">
+            <label>注文番号<input id="ne-order" type="text"></label>
+            <label>日付<input id="ne-date" type="date"></label>
+            <label>サイト<input id="ne-site" type="text"></label>
+            <label>収益USD<input id="ne-usd" type="number" step="any"></label>
+            <label>ドル円レート<input id="ne-rate" type="number" step="any" value="155"></label>
+            <label style="grid-column:span 3;">商品メモ<input id="ne-note" type="text"></label>
+          </div>
+          <div class="browser-toolbar" id="ne-submit-row" style="display:none;">
+            <button class="btn" id="ne-submit-btn">この内容で登録する</button>
+            <span id="ne-status" class="hint"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="panel">
       <h2>注文一覧</h2>
       <p class="desc">注文番号・商品メモ・サイトで検索できます。<b>収益USD・ドル円レート・仕入原価・送料・梱包費は直接書き換えられます</b>(最終利益はその場で再計算・保存されます)。</p>
@@ -625,6 +900,133 @@ function renderInventory() {
 
 document.getElementById("ord-q").addEventListener("input", renderOrders);
 document.getElementById("inv-q").addEventListener("input", renderInventory);
+document.getElementById("inv-csv-upload").addEventListener("click", async () => {
+  const fileInput = document.getElementById("inv-csv-file");
+  const statusEl = document.getElementById("inv-csv-status");
+  statusEl.className = "hint"; statusEl.textContent = "";
+  if (!fileInput.files[0]) { statusEl.textContent = "CSVファイルを選んでください"; statusEl.className = "hint ng"; return; }
+  const token = getToken();
+  statusEl.textContent = "更新中...(数秒かかります)";
+  try {
+    const text = await fileInput.files[0].text();
+    const r = await fetch("/api/inventory/rebuild", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "text/csv; charset=utf-8" },
+      body: text,
+    });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = "更新完了(全" + data.total + "件・新規" + data.new + "件・削除扱い" + data.removedNew + "件・要確認" + data.anomalous + "件)";
+    statusEl.className = "hint ok";
+    await loadAll();
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
+
+const MONTH_MAP = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
+
+function parseOrderText(text) {
+  const lines = text.split(/\\r?\\n/).map((l) => l.trim());
+  const result = { orderNo: "", date: "", site: "", usd: "", note: "" };
+
+  for (const line of lines) {
+    const m = /^(\\d{1,3}-\\d{4,7}-\\d{4,7})$/.exec(line);
+    if (m) { result.orderNo = m[1]; break; }
+  }
+
+  const saleIdx = lines.indexOf("販売");
+  if (saleIdx !== -1) {
+    for (let i = saleIdx + 1; i < lines.length && i < saleIdx + 4; i++) {
+      const dm = /^([A-Za-z]{3})[a-z]*\\s+(\\d{1,2}),\\s*(\\d{4})/.exec(lines[i]);
+      if (dm) {
+        const key = dm[1][0].toUpperCase() + dm[1].slice(1, 3).toLowerCase();
+        const mm = MONTH_MAP[key];
+        if (mm) {
+          result.date = dm[3] + "-" + String(mm).padStart(2, "0") + "-" + String(dm[2]).padStart(2, "0");
+          break;
+        }
+      }
+    }
+  }
+
+  for (const line of lines) {
+    const sm = /^([A-Z]{2})\\s*[£$]/.exec(line);
+    if (sm) { result.site = sm[1]; break; }
+  }
+
+  const revIdx = lines.indexOf("注文の収益");
+  if (revIdx !== -1) {
+    for (let i = revIdx + 1; i < lines.length && i < revIdx + 3; i++) {
+      const um = /US\\s*\\$\\s*([\\d.]+)/.exec(lines[i]);
+      if (um) { result.usd = um[1]; break; }
+    }
+  }
+
+  const titles = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^商品ID/.test(lines[i]) && i >= 2) {
+      const t = lines[i - 2];
+      if (t && !titles.includes(t)) titles.push(t);
+    }
+  }
+  result.note = titles.join(" / ");
+
+  return result;
+}
+
+document.getElementById("ne-parse-btn").addEventListener("click", () => {
+  const parsed = parseOrderText(document.getElementById("ne-paste").value);
+  document.getElementById("ne-order").value = parsed.orderNo;
+  document.getElementById("ne-date").value = parsed.date;
+  document.getElementById("ne-site").value = parsed.site;
+  document.getElementById("ne-usd").value = parsed.usd;
+  document.getElementById("ne-note").value = parsed.note;
+  document.getElementById("ne-review").style.display = "grid";
+  document.getElementById("ne-submit-row").style.display = "flex";
+  document.getElementById("ne-status").textContent = "内容を確認してから登録してください(空欄は自分で埋めてください)";
+  document.getElementById("ne-status").className = "hint";
+});
+
+document.getElementById("ne-submit-btn").addEventListener("click", async () => {
+  const statusEl = document.getElementById("ne-status");
+  const body = {
+    注文番号: document.getElementById("ne-order").value.trim(),
+    日付: document.getElementById("ne-date").value.trim(),
+    サイト: document.getElementById("ne-site").value.trim() || "不明",
+    商品メモ: document.getElementById("ne-note").value.trim(),
+    収益USD: document.getElementById("ne-usd").value,
+    ドル円レート: document.getElementById("ne-rate").value,
+  };
+  if (!body.注文番号 || !body.日付 || !body.収益USD || !body.ドル円レート) {
+    statusEl.textContent = "注文番号・日付・収益USD・ドル円レートは必須です";
+    statusEl.className = "hint ng";
+    return;
+  }
+  statusEl.textContent = "登録中...";
+  statusEl.className = "hint";
+  try {
+    const token = getToken();
+    const r = await fetch("/api/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = "登録しました(収益円: " + data.収益円 + ")";
+    statusEl.className = "hint ok";
+    document.getElementById("ne-paste").value = "";
+    document.getElementById("ne-review").style.display = "none";
+    document.getElementById("ne-submit-row").style.display = "none";
+    await loadAll();
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
+
 if (getToken()) loadAll();
 </script>
 </body></html>`;
@@ -647,7 +1049,7 @@ const server = http.createServer(async (req, res) => {
     return sendHtml(res, DASHBOARD_PAGE);
   }
 
-  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory"];
+  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild"];
   if (protectedRoutes.includes(req.url) && !isAuthorized(req)) {
     return sendJson(res, 401, { error: "認証に失敗しました(トークンを確認してください)" });
   }
@@ -660,6 +1062,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/api/import") return await handleImport(req, res);
     if (req.method === "GET" && req.url === "/api/inventory") return await handleListInventory(req, res);
     if (req.method === "POST" && req.url === "/api/import/inventory") return await handleImportInventory(req, res);
+    if (req.method === "POST" && req.url === "/api/inventory/rebuild") return await handleRebuildInventory(req, res);
   } catch (e) {
     console.error(e);
     return sendJson(res, 500, { error: "サーバー内部でエラーが発生しました" });
