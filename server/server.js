@@ -173,10 +173,16 @@ async function handlePatchOrder(req, res) {
       const cost = "仕入原価円" in body ? numOrNull(body["仕入原価円"]) : numOrNull(row.getCell(COL.仕入原価).value);
       const shipping = "送料円" in body ? numOrNull(body["送料円"]) : numOrNull(row.getCell(COL.送料).value);
       const packing = "梱包費円" in body ? numOrNull(body["梱包費円"]) : numOrNull(row.getCell(COL.梱包費).value);
-      const revenueJpy = Number(row.getCell(COL.収益円).value) || 0;
-      const fee = Number(row.getCell(COL.手数料).value) || 0;
+      const usd = "収益USD" in body ? numOrNull(body["収益USD"]) : numOrNull(row.getCell(COL.収益USD).value);
+      const rate = "ドル円レート" in body ? numOrNull(body["ドル円レート"]) : numOrNull(row.getCell(COL.ドル円レート).value);
+      const revenueJpy = usd !== null && rate !== null ? usd * rate : Number(row.getCell(COL.収益円).value) || 0;
+      const fee = Math.round(revenueJpy * 0.03);
       const { profit, margin } = recompute(revenueJpy, fee, cost, shipping, packing);
 
+      if (usd !== null) row.getCell(COL.収益USD).value = usd;
+      if (rate !== null) row.getCell(COL.ドル円レート).value = rate;
+      row.getCell(COL.収益円).value = Math.round(revenueJpy);
+      row.getCell(COL.手数料).value = fee;
       row.getCell(COL.仕入原価).value = cost === null ? "" : cost;
       row.getCell(COL.送料).value = shipping === null ? "" : shipping;
       row.getCell(COL.梱包費).value = packing === null ? "" : packing;
@@ -236,48 +242,113 @@ function sendHtml(res, html) {
 const ORDERS_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>売上管理表(サーバー版)</title>
+<title>物販事業ツール(サーバー版)</title>
 <style>
-  body { font-family: -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif; margin: 0; background: #f6f7f9; color: #1b1f24; }
-  header { position: sticky; top: 0; background: #1f4e78; color: #fff; padding: 14px 18px; z-index: 5; }
-  header h1 { font-size: 16px; margin: 0 0 8px; }
-  .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  input[type=text], input[type=password] { padding: 6px 8px; border-radius: 6px; border: 1px solid #ccc; font-size: 13px; }
-  #status { font-size: 12px; margin-left: auto; opacity: .9; }
-  main { padding: 12px; }
-  table { border-collapse: collapse; width: 100%; background: #fff; font-size: 12px; }
-  th, td { border: 1px solid #e2e5e9; padding: 5px 7px; white-space: nowrap; }
-  th { background: #eef1f5; position: sticky; top: 66px; text-align: left; }
-  td.num, th.num { text-align: right; }
-  td input { width: 80px; text-align: right; border: 1px solid #ccc; border-radius: 4px; padding: 3px 5px; }
-  tr.saving td { background: #fff7e0; }
-  tr.saved td { background: #e9f7ec; }
-  tr.error td { background: #fde8e8; }
-  .count { color: #556; font-size: 12px; margin: 6px 0; }
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --surface-2:   #f3f2ee;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --ink-muted:   #898781;
+    --border:      rgba(11,11,11,0.10);
+    --good:        #006300;
+    --series-rev:  #2a78d6;
+    --series-cost: #eb6834;
+    --accent-wash: rgba(42,120,214,0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232322;
+      --ink: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781;
+      --border: rgba(255,255,255,0.10); --good: #0ca30c;
+      --series-rev: #3987e5; --series-cost: #d95926;
+      --accent-wash: rgba(57,135,229,0.14);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 60px; display: flex; flex-direction: column; gap: 20px; }
+  .hdr { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px; border-bottom: 1px solid var(--border); padding-bottom: 18px; }
+  .hdr h1 { margin: 0 0 6px; font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }
+  .hdr .sub { margin: 0; color: var(--ink-2); font-size: 13px; }
+
+  .auth-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .auth-row input[type=password] { padding: 8px 10px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink); font-size: 13px; min-width: 260px; }
+  .btn { font: inherit; font-size: 12.5px; font-weight: 600; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; padding: 7px 14px; cursor: pointer; }
+  .btn:hover { background: var(--accent-wash); }
+  #status { font-size: 12.5px; color: var(--ink-muted); }
+
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px 24px 20px; }
+  .panel h2 { margin: 0; font-size: 15px; font-weight: 700; }
+  .panel .desc { margin: 3px 0 0; font-size: 12.5px; color: var(--ink-muted); }
+  .panel-body { margin-top: 16px; }
+
+  .browser-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .search-input { font: inherit; font-size: 13px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; flex: 1; min-width: 220px; }
+  .search-input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
+  .result-count { font-size: 12.5px; color: var(--ink-muted); white-space: nowrap; }
+
+  .table-scroll { overflow-x: auto; min-width: 0; max-height: 640px; overflow-y: auto; margin-top: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead th { text-align: left; font-size: 11.5px; color: var(--ink-muted); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; position: sticky; top: 0; background: var(--surface); z-index: 2; }
+  thead th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody td { padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  tbody tr:hover { background: var(--surface-2); }
+  .sticky-col { position: sticky; left: 0; background: var(--surface); z-index: 1; box-shadow: 2px 0 4px -2px var(--border); }
+  tbody tr:hover td.sticky-col { background: var(--surface-2); }
+  .site-chip { display: inline-block; padding: 2px 8px; border-radius: 100px; background: var(--accent-wash); color: var(--series-rev); font-size: 11.5px; font-weight: 600; }
+  .profit-cell { color: var(--good); font-weight: 600; }
+  .profit-cell.bad { color: var(--series-cost); }
+
+  td input { font: inherit; font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 5px 6px; width: 78px; text-align: right; }
+  td input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
+  tr.saving td { background: #fff7e0 !important; }
+  tr.saved td { background: #e9f7ec !important; }
+  tr.error td { background: #fde8e8 !important; }
 </style></head>
 <body>
-<header>
-  <h1>売上管理表(サーバー版) — 仕入原価・送料・梱包費はここで編集すると即座に保存されます</h1>
-  <div class="bar">
-    <input id="token" type="password" placeholder="アクセストークン">
-    <button id="saveToken">トークンを記憶</button>
-    <input id="q" type="text" placeholder="検索(注文番号・商品メモ)">
-    <span id="status"></span>
+<div class="wrap">
+  <div class="hdr">
+    <div>
+      <h1>物販事業ツール(サーバー版)</h1>
+      <p class="sub">株式会社アゲイト — 注文一覧。仕入原価・送料・梱包費を書き換えると、その場でサーバーに保存されます</p>
+    </div>
+    <div class="auth-row">
+      <input id="token" type="password" placeholder="アクセストークン">
+      <button class="btn" id="saveToken">トークンを記憶</button>
+      <span id="status"></span>
+    </div>
   </div>
-</header>
-<main>
-  <div class="count" id="count"></div>
-  <div style="overflow:auto">
-  <table>
-    <thead><tr id="thead"></tr></thead>
-    <tbody id="tbody"></tbody>
-  </table>
+
+  <div class="panel">
+    <h2>注文一覧</h2>
+    <p class="desc">注文番号・商品メモ・サイトで検索できます。<b>収益USD・ドル円レート・仕入原価・送料・梱包費は直接書き換えられます</b>(最終利益はその場で再計算されます)。</p>
+    <div class="panel-body">
+      <div class="browser-toolbar">
+        <input type="text" class="search-input" id="q" placeholder="注文番号・商品メモ・サイトで検索…">
+        <span class="result-count" id="count"></span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr id="thead"></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
-</main>
+</div>
 <script>
 const HEADERS_META = ["注文番号","日付","サイト","商品メモ","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
-const EDITABLE = ["仕入原価(円)","送料(円)","梱包費(円)"];
+const EDITABLE = ["収益USD","ドル円レート","仕入原価(円)","送料(円)","梱包費(円)"];
 const NUM_COLS = ["収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
+const FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円" };
 let allRows = [];
 
 function getToken() { return localStorage.getItem("agate_token") || ""; }
@@ -313,28 +384,34 @@ async function load() {
 
 function render() {
   const thead = document.getElementById("thead");
-  thead.innerHTML = HEADERS_META.map(h => '<th class="' + (NUM_COLS.includes(h) ? "num" : "") + '">' + h + '</th>').join("");
+  thead.innerHTML = HEADERS_META.map((h, i) => '<th class="' + (NUM_COLS.includes(h) ? "num" : "") + (i === 0 ? " sticky-col" : "") + '">' + h + '</th>').join("");
   const q = document.getElementById("q").value.trim().toLowerCase();
   const tbody = document.getElementById("tbody");
   tbody.innerHTML = "";
   let shown = 0;
   allRows.forEach(row => {
     const orderNo = row[0];
-    const searchable = ((row[0]||"") + " " + (row[3]||"")).toLowerCase();
+    const searchable = ((row[0]||"") + " " + (row[2]||"") + " " + (row[3]||"")).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
     const tr = document.createElement("tr");
     HEADERS_META.forEach((h, i) => {
       const td = document.createElement("td");
+      if (i === 0) td.className = "sticky-col";
       if (EDITABLE.includes(h)) {
-        td.className = "num";
+        td.className = (td.className ? td.className + " " : "") + "num";
         const inp = document.createElement("input");
         inp.type = "number"; inp.step = "any";
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
         inp.addEventListener("change", () => saveField(tr, orderNo, h, inp.value));
         td.appendChild(inp);
+      } else if (h === "サイト") {
+        const chip = document.createElement("span"); chip.className = "site-chip"; chip.textContent = row[i] || "不明"; td.appendChild(chip);
+      } else if (h === "最終利益(円)") {
+        td.className = (td.className ? td.className + " " : "") + "num profit-cell" + (Number(row[i]) < 0 ? " bad" : "");
+        td.textContent = fmt(row[i], h);
       } else {
-        td.className = NUM_COLS.includes(h) ? "num" : "";
+        td.className = (td.className ? td.className + " " : "") + (NUM_COLS.includes(h) ? "num" : "");
         td.textContent = fmt(row[i], h);
       }
       tr.appendChild(td);
@@ -343,8 +420,6 @@ function render() {
   });
   document.getElementById("count").textContent = shown.toLocaleString("ja-JP") + " / " + allRows.length.toLocaleString("ja-JP") + " 件";
 }
-
-const FIELD_KEY = { "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円" };
 
 async function saveField(tr, orderNo, header, value) {
   tr.className = "saving";
