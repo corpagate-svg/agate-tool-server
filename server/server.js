@@ -1071,9 +1071,12 @@ function setupScrollMirror(mirrorId, scrollId) {
   scrollEl.onscroll = () => { if (syncing) return; syncing = true; mirror.scrollLeft = scrollEl.scrollLeft; syncing = false; };
 }
 
+const ORD_HIDDEN = ["商品ID"];
+
 function renderOrders() {
+  const displayOrder = ORD_HEADERS.map((h, i) => i).filter((i) => !ORD_HIDDEN.includes(ORD_HEADERS[i]));
   const thead = document.getElementById("ord-thead");
-  thead.innerHTML = ORD_HEADERS.map((h, i) => '<th class="' + (ORD_NUM_COLS.includes(h) ? "num" : "") + (i === 0 ? " sticky-col" : "") + '">' + h + '</th>').join("");
+  thead.innerHTML = displayOrder.map((i, pos) => '<th class="' + (ORD_NUM_COLS.includes(ORD_HEADERS[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '">' + ORD_HEADERS[i] + '</th>').join("");
   const q = document.getElementById("ord-q").value.trim().toLowerCase();
   const tbody = document.getElementById("ord-tbody");
   tbody.innerHTML = "";
@@ -1085,9 +1088,10 @@ function renderOrders() {
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
     const tr = document.createElement("tr");
-    ORD_HEADERS.forEach((h, i) => {
+    displayOrder.forEach((i, pos) => {
+      const h = ORD_HEADERS[i];
       const td = document.createElement("td");
-      if (i === 0) td.className = "sticky-col";
+      if (pos === 0) td.className = "sticky-col";
       if (ORD_EDITABLE.includes(h)) {
         td.className = (td.className ? td.className + " " : "") + "num";
         const inp = document.createElement("input");
@@ -1100,6 +1104,10 @@ function renderOrders() {
       } else if (h === "最終利益(円)") {
         td.className = (td.className ? td.className + " " : "") + "num profit-cell" + (Number(row[i]) < 0 ? " bad" : "");
         td.textContent = fmt(row[i]);
+      } else if (h === "利益率") {
+        const known = row[i] !== "" && row[i] !== null && row[i] !== undefined;
+        td.className = (td.className ? td.className + " " : "") + "num profit-cell" + (known && Number(row[i]) < 0 ? " bad" : "");
+        td.textContent = fmt(row[i], true);
       } else {
         td.className = (td.className ? td.className + " " : "") + (ORD_NUM_COLS.includes(h) ? "num" : "");
         td.textContent = fmt(row[i], h === "利益率");
@@ -1131,9 +1139,12 @@ async function saveOrderField(tr, orderNo, header, value) {
   }
 }
 
+const INV_HIDDEN = ["UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致"];
+
 function renderInventory() {
   if (!invHeaders.length) return;
-  const displayOrder = invHeaders.map((h, i) => i).filter((i) => invHeaders[i] !== "バリエーション詳細")
+  const displayOrder = invHeaders.map((h, i) => i)
+    .filter((i) => invHeaders[i] !== "バリエーション詳細" && !INV_HIDDEN.includes(invHeaders[i]))
     .concat(invHeaders.map((h, i) => i).filter((i) => invHeaders[i] === "バリエーション詳細"));
   const thead = document.getElementById("inv-thead");
   thead.innerHTML = displayOrder.map((i, pos) => '<th class="' + (INV_NUM_COLS.includes(invHeaders[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '">' + invHeaders[i] + '</th>').join("");
