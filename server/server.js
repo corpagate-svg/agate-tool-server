@@ -533,9 +533,14 @@ const DASHBOARD_PAGE = `<!doctype html>
     --ink-2:       #52514e;
     --ink-muted:   #898781;
     --border:      rgba(11,11,11,0.10);
+    --grid:        #e1e0d9;
+    --baseline:    #c3c2b7;
     --good:        #006300;
     --series-rev:  #2a78d6;
     --series-cost: #eb6834;
+    --series-prof: #1baf7a;
+    --tooltip-bg:  #0b0b0b;
+    --tooltip-ink: #ffffff;
     --accent-wash: rgba(42,120,214,0.10);
   }
   @media (prefers-color-scheme: dark) {
@@ -543,8 +548,9 @@ const DASHBOARD_PAGE = `<!doctype html>
       color-scheme: dark;
       --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232322;
       --ink: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781;
-      --border: rgba(255,255,255,0.10); --good: #0ca30c;
-      --series-rev: #3987e5; --series-cost: #d95926;
+      --border: rgba(255,255,255,0.10); --grid: #2c2c2a; --baseline: #383835; --good: #0ca30c;
+      --series-rev: #3987e5; --series-cost: #d95926; --series-prof: #199e70;
+      --tooltip-bg: #ffffff; --tooltip-ink: #0b0b0b;
       --accent-wash: rgba(57,135,229,0.14);
     }
   }
@@ -602,6 +608,34 @@ const DASHBOARD_PAGE = `<!doctype html>
   .profit-cell.bad { color: var(--series-cost); }
   .stock-zero { color: var(--series-cost); font-weight: 600; }
 
+  .row2 { display: grid; grid-template-columns: 1.3fr 1fr; gap: 20px; }
+  @media (max-width: 860px) { .row2 { grid-template-columns: 1fr; } }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
+  .legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  svg text { font-family: inherit; fill: var(--ink-muted); }
+  .grid-line { stroke: var(--grid); stroke-width: 1; }
+  .baseline-line { stroke: var(--baseline); stroke-width: 1; }
+  .bar-hit { cursor: pointer; }
+  .val-label { font-size: 11px; fill: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .axis-label { font-size: 11px; fill: var(--ink-muted); }
+  .viz-tooltip {
+    position: fixed; pointer-events: none; background: var(--tooltip-bg); color: var(--tooltip-ink);
+    font-size: 12px; line-height: 1.5; padding: 8px 10px; border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25); opacity: 0; transform: translate(-50%, -100%);
+    transition: opacity 0.1s ease; z-index: 50; white-space: nowrap;
+  }
+  .viz-tooltip.show { opacity: 1; }
+  .viz-tooltip b { font-weight: 700; }
+
+  .scroll-mirror-top { overflow-x: scroll; overflow-y: hidden; height: 14px; margin-top: 14px; scrollbar-color: var(--baseline) var(--surface-2); scrollbar-width: auto; }
+  .scroll-mirror-top-inner { height: 1px; }
+  .scroll-mirror-top::-webkit-scrollbar { height: 12px; }
+  .scroll-mirror-top::-webkit-scrollbar-track { background: var(--surface-2); border-radius: 6px; }
+  .scroll-mirror-top::-webkit-scrollbar-thumb { background: var(--baseline); border-radius: 6px; }
+  .scroll-mirror-top::-webkit-scrollbar-thumb:hover { background: var(--ink-muted); }
+  .table-scroll { margin-top: 0 !important; }
+
   td input { font: inherit; font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 5px 6px; width: 78px; text-align: right; }
   td input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
   tr.saving td { background: #fff7e0 !important; }
@@ -642,6 +676,46 @@ const DASHBOARD_PAGE = `<!doctype html>
 
   <div class="tabpanel active" id="tab-sales">
     <div class="kpis" id="kpis"></div>
+
+    <div class="panel">
+      <h2>月次データ</h2>
+      <p class="desc">サーバー上の最新データから自動集計(注文の日付ごとに月単位でまとめています)</p>
+      <div class="panel-body table-scroll">
+        <table>
+          <thead><tr><th>月</th><th class="num">件数</th><th class="num">収益(円)</th><th class="num">仕入(円)</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
+          <tbody id="monthly-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="row2">
+      <div class="panel">
+        <h2>月次推移(収益・仕入・利益)</h2>
+        <div class="panel-body">
+          <div class="legend">
+            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-rev)"></span>収益</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-cost)"></span>仕入価格</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-prof)"></span>最終利益</span>
+          </div>
+          <svg id="chart-monthly" viewBox="0 0 780 300" width="100%"></svg>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>月次利益率</h2>
+        <div class="panel-body">
+          <svg id="chart-margin" viewBox="0 0 480 300" width="100%"></svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>サイト別 収益</h2>
+      <p class="desc">出品先サイトごとの収益合計(円)</p>
+      <div class="panel-body">
+        <svg id="chart-site" viewBox="0 0 780 220" width="100%"></svg>
+      </div>
+    </div>
+
     <div class="panel">
       <h2>利益TOP10の注文</h2>
       <p class="desc">最終利益が大きかった注文(サーバー上の最新データ)</p>
@@ -670,7 +744,8 @@ const DASHBOARD_PAGE = `<!doctype html>
           <input type="text" class="search-input" id="inv-q" placeholder="商品名・商品IDで検索…">
           <span class="result-count" id="inv-count"></span>
         </div>
-        <div class="table-scroll">
+        <div class="scroll-mirror-top" id="inv-table-mirror"><div class="scroll-mirror-top-inner"></div></div>
+        <div class="table-scroll" id="inv-table-scroll">
           <table>
             <thead><tr id="inv-thead"></tr></thead>
             <tbody id="inv-tbody"></tbody>
@@ -714,7 +789,8 @@ const DASHBOARD_PAGE = `<!doctype html>
           <input type="text" class="search-input" id="ord-q" placeholder="注文番号・商品メモ・サイトで検索…">
           <span class="result-count" id="ord-count"></span>
         </div>
-        <div class="table-scroll">
+        <div class="scroll-mirror-top" id="ord-table-mirror"><div class="scroll-mirror-top-inner"></div></div>
+        <div class="table-scroll" id="ord-table-scroll">
           <table>
             <thead><tr id="ord-thead"></tr></thead>
             <tbody id="ord-tbody"></tbody>
@@ -724,6 +800,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     </div>
   </div>
 </div>
+<div class="viz-tooltip" id="tooltip"></div>
 <script>
 const ORD_HEADERS = ["注文番号","日付","サイト","商品メモ","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
 const ORD_EDITABLE = ["収益USD","ドル円レート","仕入原価(円)","送料(円)","梱包費(円)"];
@@ -747,6 +824,8 @@ document.querySelectorAll(".tabbtn").forEach(btn => {
     document.querySelectorAll(".tabpanel").forEach(p => p.classList.remove("active"));
     btn.classList.add("active");
     document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "orders") setupScrollMirror("ord-table-mirror", "ord-table-scroll");
+    if (btn.dataset.tab === "inventory") setupScrollMirror("inv-table-mirror", "inv-table-scroll");
   });
 });
 
@@ -776,6 +855,7 @@ async function loadAll() {
       invHeaders = invData.headers;
     }
     renderKpis();
+    renderSalesTab();
     renderOrders();
     renderInventory();
     statusEl.textContent = "";
@@ -810,6 +890,184 @@ function renderKpis() {
     "</td><td class='num'>" + fmt(r[7]) + "</td><td class='num profit-cell" + (Number(r[12]) < 0 ? " bad" : "") + "'>" + fmt(r[12]) +
     "</td><td class='num'>" + fmt(r[13], true) + "</td></tr>"
   ).join("");
+}
+
+function computeMonthly() {
+  const map = new Map();
+  orderRows.forEach((r) => {
+    const d = String(r[1] || "");
+    if (d.length < 7) return;
+    const month = d.slice(0, 7);
+    if (!map.has(month)) map.set(month, { revenue: 0, cost: 0, profit: 0, count: 0 });
+    const m = map.get(month);
+    m.revenue += Number(r[7]) || 0;
+    m.cost += Number(r[9]) || 0;
+    if (r[12] !== "" && r[12] !== null && r[12] !== undefined) m.profit += Number(r[12]);
+    m.count++;
+  });
+  return Array.from(map.keys()).sort().map((k) => {
+    const v = map.get(k);
+    return { month: k, revenue: v.revenue, cost: v.cost, profit: v.profit, count: v.count, margin: v.revenue ? v.profit / v.revenue : 0 };
+  });
+}
+
+function renderMonthlyTable(monthly) {
+  document.getElementById("monthly-body").innerHTML = monthly.map((m) =>
+    "<tr><td>" + m.month + "</td><td class='num'>" + m.count + "</td><td class='num'>" + fmt(Math.round(m.revenue)) +
+    "</td><td class='num'>" + fmt(Math.round(m.cost)) + "</td><td class='num profit-cell" + (m.profit < 0 ? " bad" : "") + "'>" + fmt(Math.round(m.profit)) +
+    "</td><td class='num'>" + (m.margin * 100).toFixed(1) + "%</td></tr>"
+  ).join("");
+}
+
+function svgNode(tag, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+function showTooltip(evt, html) {
+  const tip = document.getElementById("tooltip");
+  tip.innerHTML = html;
+  tip.style.left = evt.clientX + "px";
+  tip.style.top = (evt.clientY - 10) + "px";
+  tip.classList.add("show");
+}
+function hideTooltip() {
+  document.getElementById("tooltip").classList.remove("show");
+}
+
+function renderMonthlyChart(monthly) {
+  const svg = document.getElementById("chart-monthly");
+  svg.innerHTML = "";
+  if (!monthly.length) return;
+  const W = 780, H = 300, padL = 55, padR = 10, padT = 10, padB = 30;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const maxV = Math.max(1, ...monthly.map((m) => Math.max(m.revenue, m.cost, Math.abs(m.profit))));
+  const n = monthly.length;
+  const bw = innerW / n;
+  const colors = { revenue: "var(--series-rev)", cost: "var(--series-cost)", profit: "var(--series-prof)" };
+  const labels = { revenue: "収益", cost: "仕入", profit: "最終利益" };
+
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + innerH - (innerH * i) / 4;
+    svg.appendChild(svgNode("line", { x1: padL, y1: y, x2: padL + innerW, y2: y, class: "grid-line" }));
+    const lab = svgNode("text", { x: padL - 8, y: y + 4, "text-anchor": "end", class: "val-label" });
+    lab.textContent = fmt(Math.round((maxV * i) / 4));
+    svg.appendChild(lab);
+  }
+  svg.appendChild(svgNode("line", { x1: padL, y1: padT + innerH, x2: padL + innerW, y2: padT + innerH, class: "baseline-line" }));
+
+  monthly.forEach((m, i) => {
+    const x0 = padL + i * bw;
+    const groupW = bw * 0.78;
+    const barW = groupW / 3;
+    ["revenue", "cost", "profit"].forEach((k, j) => {
+      const v = m[k];
+      const h = Math.max(0, (Math.abs(v) / maxV) * innerH);
+      const y = padT + innerH - h;
+      const x = x0 + bw * 0.11 + j * barW;
+      const rect = svgNode("rect", { x: x, y: y, width: Math.max(1, barW * 0.85), height: h, fill: colors[k], rx: 1.5, class: "bar-hit" });
+      rect.addEventListener("mousemove", (evt) => showTooltip(evt, "<b>" + m.month + "</b><br>" + labels[k] + ": ¥" + fmt(Math.round(v))));
+      rect.addEventListener("mouseleave", hideTooltip);
+      svg.appendChild(rect);
+    });
+    const label = svgNode("text", { x: x0 + bw / 2, y: padT + innerH + 16, "text-anchor": "middle", class: "axis-label" });
+    label.textContent = m.month.slice(2).replace("-", "/");
+    svg.appendChild(label);
+  });
+}
+
+function renderMarginChart(monthly) {
+  const svg = document.getElementById("chart-margin");
+  svg.innerHTML = "";
+  if (!monthly.length) return;
+  const W = 480, H = 300, padL = 45, padR = 10, padT = 10, padB = 30;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const maxAbs = Math.max(0.05, ...monthly.map((m) => Math.abs(m.margin)));
+  const n = monthly.length;
+  const stepX = n > 1 ? innerW / (n - 1) : 0;
+  const yFor = (v) => padT + innerH / 2 - (v / maxAbs) * (innerH / 2);
+
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (innerH * i) / 4;
+    svg.appendChild(svgNode("line", { x1: padL, y1: y, x2: padL + innerW, y2: y, class: "grid-line" }));
+  }
+  svg.appendChild(svgNode("line", { x1: padL, y1: yFor(0), x2: padL + innerW, y2: yFor(0), class: "baseline-line" }));
+
+  let d = "";
+  monthly.forEach((m, i) => {
+    const x = padL + i * stepX;
+    const y = yFor(m.margin);
+    d += (i === 0 ? "M" : "L") + x + "," + y + " ";
+  });
+  svg.appendChild(svgNode("path", { d: d.trim(), fill: "none", stroke: "var(--series-rev)", "stroke-width": 2 }));
+
+  const everyN = Math.ceil(n / 8) || 1;
+  monthly.forEach((m, i) => {
+    const x = padL + i * stepX;
+    const y = yFor(m.margin);
+    const c = svgNode("circle", { cx: x, cy: y, r: 3, fill: "var(--series-rev)", class: "bar-hit" });
+    c.addEventListener("mousemove", (evt) => showTooltip(evt, "<b>" + m.month + "</b><br>利益率: " + (m.margin * 100).toFixed(1) + "%"));
+    c.addEventListener("mouseleave", hideTooltip);
+    svg.appendChild(c);
+    if (i % everyN === 0) {
+      const label = svgNode("text", { x: x, y: padT + innerH + 16, "text-anchor": "middle", class: "axis-label" });
+      label.textContent = m.month.slice(2).replace("-", "/");
+      svg.appendChild(label);
+    }
+  });
+}
+
+function renderSiteChart() {
+  const svg = document.getElementById("chart-site");
+  svg.innerHTML = "";
+  const bySite = new Map();
+  orderRows.forEach((r) => {
+    const site = r[2] || "不明";
+    bySite.set(site, (bySite.get(site) || 0) + (Number(r[7]) || 0));
+  });
+  const entries = Array.from(bySite.entries()).sort((a, b) => b[1] - a[1]);
+  if (!entries.length) return;
+  const W = 780, H = Math.max(120, entries.length * 30), padL = 70, padR = 70, padT = 10, padB = 10;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const maxV = Math.max(1, ...entries.map((e) => e[1]));
+  const bh = innerH / entries.length;
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  entries.forEach(([site, val], i) => {
+    const y = padT + i * bh + bh * 0.15;
+    const w = (val / maxV) * innerW;
+    const rect = svgNode("rect", { x: padL, y: y, width: Math.max(1, w), height: bh * 0.7, fill: "var(--series-rev)", rx: 2, class: "bar-hit" });
+    rect.addEventListener("mousemove", (evt) => showTooltip(evt, "<b>" + site + "</b><br>収益: ¥" + fmt(Math.round(val))));
+    rect.addEventListener("mouseleave", hideTooltip);
+    svg.appendChild(rect);
+    const label = svgNode("text", { x: padL - 8, y: y + bh * 0.35 + 4, "text-anchor": "end", class: "axis-label" });
+    label.textContent = site;
+    svg.appendChild(label);
+    const valLabel = svgNode("text", { x: padL + w + 6, y: y + bh * 0.35 + 4, class: "val-label" });
+    valLabel.textContent = "¥" + fmt(Math.round(val));
+    svg.appendChild(valLabel);
+  });
+}
+
+function renderSalesTab() {
+  const monthly = computeMonthly();
+  renderMonthlyTable(monthly);
+  renderMonthlyChart(monthly);
+  renderMarginChart(monthly);
+  renderSiteChart();
+}
+
+function setupScrollMirror(mirrorId, scrollId) {
+  const mirror = document.getElementById(mirrorId);
+  const scrollEl = document.getElementById(scrollId);
+  if (!mirror || !scrollEl) return;
+  const inner = mirror.querySelector(".scroll-mirror-top-inner");
+  const table = scrollEl.querySelector("table");
+  if (!table) return;
+  inner.style.width = table.scrollWidth + "px";
+  let syncing = false;
+  mirror.onscroll = () => { if (syncing) return; syncing = true; scrollEl.scrollLeft = mirror.scrollLeft; syncing = false; };
+  scrollEl.onscroll = () => { if (syncing) return; syncing = true; mirror.scrollLeft = scrollEl.scrollLeft; syncing = false; };
 }
 
 function renderOrders() {
@@ -849,6 +1107,7 @@ function renderOrders() {
     tbody.appendChild(tr);
   });
   document.getElementById("ord-count").textContent = shown.toLocaleString("ja-JP") + " / " + orderRows.length.toLocaleString("ja-JP") + " 件";
+  setupScrollMirror("ord-table-mirror", "ord-table-scroll");
 }
 
 async function saveOrderField(tr, orderNo, header, value) {
@@ -896,6 +1155,7 @@ function renderInventory() {
     tbody.appendChild(tr);
   });
   document.getElementById("inv-count").textContent = shown.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + " 件";
+  setupScrollMirror("inv-table-mirror", "inv-table-scroll");
 }
 
 document.getElementById("ord-q").addEventListener("input", renderOrders);
