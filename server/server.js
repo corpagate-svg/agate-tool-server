@@ -560,7 +560,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Segoe UI", Roboto, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 60px; display: flex; flex-direction: column; gap: 20px; }
+  .wrap { max-width: 1900px; margin: 0 auto; padding: 32px 32px 60px; display: flex; flex-direction: column; gap: 20px; }
   .hdr { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px; border-bottom: 1px solid var(--border); padding-bottom: 18px; }
   .hdr h1 { margin: 0 0 6px; font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }
   .hdr .sub { margin: 0; color: var(--ink-2); font-size: 13px; }
