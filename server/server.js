@@ -912,7 +912,8 @@ function computeMonthly() {
 }
 
 function renderMonthlyTable(monthly) {
-  document.getElementById("monthly-body").innerHTML = monthly.map((m) =>
+  const newestFirst = monthly.slice().reverse();
+  document.getElementById("monthly-body").innerHTML = newestFirst.map((m) =>
     "<tr><td>" + m.month + "</td><td class='num'>" + m.count + "</td><td class='num'>" + fmt(Math.round(m.revenue)) +
     "</td><td class='num'>" + fmt(Math.round(m.cost)) + "</td><td class='num profit-cell" + (m.profit < 0 ? " bad" : "") + "'>" + fmt(Math.round(m.profit)) +
     "</td><td class='num'>" + (m.margin * 100).toFixed(1) + "%</td></tr>"
@@ -1077,7 +1078,8 @@ function renderOrders() {
   const tbody = document.getElementById("ord-tbody");
   tbody.innerHTML = "";
   let shown = 0;
-  orderRows.forEach(row => {
+  const sortedOrders = orderRows.slice().sort((a, b) => String(b[1] || "").localeCompare(String(a[1] || "")));
+  sortedOrders.forEach(row => {
     const orderNo = row[0];
     const searchable = ((row[0]||"") + " " + (row[2]||"") + " " + (row[3]||"")).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
@@ -1138,7 +1140,12 @@ function renderInventory() {
   tbody.innerHTML = "";
   let shown = 0;
   const stockIdx = invHeaders.indexOf("在庫数(現物)");
-  invRows.forEach(row => {
+  const sortedInv = invRows.slice().sort((a, b) => {
+    const na = parseInt(String(a[0] || "").slice(1), 10) || 0;
+    const nb = parseInt(String(b[0] || "").slice(1), 10) || 0;
+    return nb - na;
+  });
+  sortedInv.forEach(row => {
     const searchable = ((row[0]||"") + " " + (row[1]||"")).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
