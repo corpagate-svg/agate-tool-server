@@ -266,6 +266,57 @@ async function handlePatchOrder(req, res) {
   sendJson(res, 200, { status: "ok", ...updated });
 }
 
+async function handleDeleteOrders(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readRawBody(req, 1024 * 1024)).toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  const targets = new Set((body["注文番号"] || []).map(String));
+  if (!targets.size) return sendJson(res, 400, { error: "削除する注文番号を指定してください" });
+
+  const wb = await loadWorkbook();
+  let deleted = 0;
+  for (const ws of dataSheets(wb)) {
+    const toRemove = [];
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const row = ws.getRow(r);
+      if (targets.has(String(row.getCell(COL.注文番号).value || ""))) toRemove.push(r);
+    }
+    for (let i = toRemove.length - 1; i >= 0; i--) {
+      ws.spliceRows(toRemove[i], 1);
+      deleted++;
+    }
+  }
+  if (!deleted) return sendJson(res, 404, { error: "該当する注文が見つかりません" });
+  await wb.xlsx.writeFile(LEDGER_PATH);
+  sendJson(res, 200, { status: "ok", deleted });
+}
+
+async function handleDeleteInventory(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readRawBody(req, 1024 * 1024)).toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  const targets = new Set((body["商品ID"] || []).map(String));
+  if (!targets.size) return sendJson(res, 400, { error: "削除する商品IDを指定してください" });
+
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+  const toRemove = [];
+  for (let r = 2; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    if (targets.has(String(row.getCell(INV_COL.商品ID).value || ""))) toRemove.push(r);
+  }
+  for (let i = toRemove.length - 1; i >= 0; i--) ws.spliceRows(toRemove[i], 1);
+  if (!toRemove.length) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
+  await wb.xlsx.writeFile(INVENTORY_PATH);
+  sendJson(res, 200, { status: "ok", deleted: toRemove.length });
+}
+
 function isOrderRow(row) {
   return Boolean(row.getCell(COL.注文番号).value) && typeof row.getCell(COL.収益USD).value === "number";
 }
@@ -603,6 +654,12 @@ const DASHBOARD_PAGE = `<!doctype html>
   .auth-row input[type=password] { padding: 8px 10px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink); font-size: 13px; min-width: 240px; }
   .btn { font: inherit; font-size: 12.5px; font-weight: 600; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; padding: 7px 14px; cursor: pointer; }
   .btn:hover { background: var(--accent-wash); }
+  .btn:disabled { opacity: 0.45; cursor: default; }
+  .btn:disabled:hover { background: var(--surface-2); }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--ink-2); }
+  th.sortable .sort-arrow { margin-left: 3px; opacity: 0.6; }
+  td.checkbox-col, th.checkbox-col { width: 30px; padding-left: 10px; padding-right: 0; }
   #status { font-size: 12.5px; color: var(--ink-muted); }
 
   .tabnav { display: flex; gap: 4px; border-bottom: 1px solid var(--border); }
@@ -778,6 +835,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         </div>
         <div class="browser-toolbar">
           <input type="text" class="search-input" id="inv-q" placeholder="商品名・商品IDで検索…">
+          <button class="btn" id="inv-delete-btn" disabled>選択した行を削除(<span id="inv-selected-count">0</span>)</button>
+          <button class="btn" id="inv-csv-export">CSVでダウンロード</button>
           <span class="result-count" id="inv-count"></span>
         </div>
         <div class="scroll-mirror-top" id="inv-table-mirror"><div class="scroll-mirror-top-inner"></div></div>
@@ -827,6 +886,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       <div class="panel-body">
         <div class="browser-toolbar">
           <input type="text" class="search-input" id="ord-q" placeholder="注文番号・商品メモ・サイトで検索…">
+          <button class="btn" id="ord-delete-btn" disabled>選択した行を削除(<span id="ord-selected-count">0</span>)</button>
+          <button class="btn" id="ord-csv-export">CSVでダウンロード</button>
           <span class="result-count" id="ord-count"></span>
         </div>
         <div class="scroll-mirror-top" id="ord-table-mirror"><div class="scroll-mirror-top-inner"></div></div>
@@ -1116,22 +1177,86 @@ function setupScrollMirror(mirrorId, scrollId) {
 }
 
 const ORD_HIDDEN = ["商品ID"];
+let ordSort = { idx: 1, dir: -1 };
+let ordSelected = new Set();
+
+function csvEscapeCell(v) {
+  const s = v === null || v === undefined ? "" : String(v);
+  if (/["\\n]/.test(s) || s.indexOf(",") !== -1) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function downloadCsv(filename, headers, rows) {
+  const lines = [headers.map(csvEscapeCell).join(",")];
+  rows.forEach((r) => lines.push(r.map(csvEscapeCell).join(",")));
+  const blob = new Blob(["﻿" + lines.join("\\r\\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function sortRows(rows, headers, numCols, sortState) {
+  const idx = sortState.idx, dir = sortState.dir;
+  const isNum = numCols.includes(headers[idx]);
+  return rows.slice().sort((a, b) => {
+    const av = a[idx], bv = b[idx];
+    if (isNum) {
+      const an = av === "" || av === null || av === undefined ? -Infinity : Number(av);
+      const bn = bv === "" || bv === null || bv === undefined ? -Infinity : Number(bv);
+      return (an - bn) * dir;
+    }
+    return String(av || "").localeCompare(String(bv || "")) * dir;
+  });
+}
+
+function updateOrdDeleteBtn() {
+  document.getElementById("ord-selected-count").textContent = ordSelected.size;
+  document.getElementById("ord-delete-btn").disabled = ordSelected.size === 0;
+}
 
 function renderOrders() {
   const displayOrder = ORD_HEADERS.map((h, i) => i).filter((i) => !ORD_HIDDEN.includes(ORD_HEADERS[i]));
   const thead = document.getElementById("ord-thead");
-  thead.innerHTML = displayOrder.map((i, pos) => '<th class="' + (ORD_NUM_COLS.includes(ORD_HEADERS[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '">' + ORD_HEADERS[i] + '</th>').join("");
+  const checkAllTh = '<th class="checkbox-col"><input type="checkbox" id="ord-select-all"></th>';
+  thead.innerHTML = checkAllTh + displayOrder.map((i, pos) => {
+    const isSortCol = i === ordSort.idx;
+    const arrow = isSortCol ? '<span class="sort-arrow">' + (ordSort.dir === 1 ? "▲" : "▼") + '</span>' : "";
+    return '<th class="sortable ' + (ORD_NUM_COLS.includes(ORD_HEADERS[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '" data-idx="' + i + '">' + ORD_HEADERS[i] + arrow + '</th>';
+  }).join("");
+  thead.querySelectorAll("th.sortable").forEach((th) => {
+    th.addEventListener("click", () => {
+      const idx = Number(th.dataset.idx);
+      ordSort = { idx, dir: ordSort.idx === idx ? -ordSort.dir : -1 };
+      renderOrders();
+    });
+  });
+
   const q = document.getElementById("ord-q").value.trim().toLowerCase();
   const tbody = document.getElementById("ord-tbody");
   tbody.innerHTML = "";
   let shown = 0;
-  const sortedOrders = orderRows.slice().sort((a, b) => String(b[1] || "").localeCompare(String(a[1] || "")));
+  const visible = [];
+  const sortedOrders = sortRows(orderRows, ORD_HEADERS, ORD_NUM_COLS, ordSort);
   sortedOrders.forEach(row => {
     const orderNo = row[0];
     const searchable = ((row[0]||"") + " " + (row[2]||"") + " " + (row[3]||"")).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
+    visible.push(orderNo);
     const tr = document.createElement("tr");
+    const cbTd = document.createElement("td");
+    cbTd.className = "checkbox-col";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = ordSelected.has(orderNo);
+    cb.addEventListener("change", () => {
+      if (cb.checked) ordSelected.add(orderNo); else ordSelected.delete(orderNo);
+      updateOrdDeleteBtn();
+    });
+    cbTd.appendChild(cb);
+    tr.appendChild(cbTd);
     displayOrder.forEach((i, pos) => {
       const h = ORD_HEADERS[i];
       const td = document.createElement("td");
@@ -1168,8 +1293,45 @@ function renderOrders() {
     tbody.appendChild(tr);
   });
   document.getElementById("ord-count").textContent = shown.toLocaleString("ja-JP") + " / " + orderRows.length.toLocaleString("ja-JP") + " 件";
+  const selectAllCb = document.getElementById("ord-select-all");
+  selectAllCb.checked = visible.length > 0 && visible.every((id) => ordSelected.has(id));
+  selectAllCb.addEventListener("change", () => {
+    if (selectAllCb.checked) visible.forEach((id) => ordSelected.add(id));
+    else visible.forEach((id) => ordSelected.delete(id));
+    renderOrders();
+  });
+  updateOrdDeleteBtn();
   setupScrollMirror("ord-table-mirror", "ord-table-scroll");
 }
+
+document.getElementById("ord-delete-btn").addEventListener("click", async () => {
+  if (!ordSelected.size) return;
+  if (!confirm(ordSelected.size + "件の注文を削除します。よろしいですか?(元に戻せません)")) return;
+  const token = getToken();
+  try {
+    const r = await fetch("/api/orders", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ 注文番号: Array.from(ordSelected) }),
+    });
+    if (!r.ok) { alert("削除に失敗しました"); return; }
+    ordSelected.clear();
+    await loadAll();
+  } catch (e) {
+    alert("通信エラー: " + e.message);
+  }
+});
+
+document.getElementById("ord-csv-export").addEventListener("click", () => {
+  const displayOrder = ORD_HEADERS.map((h, i) => i).filter((i) => !ORD_HIDDEN.includes(ORD_HEADERS[i]));
+  const q = document.getElementById("ord-q").value.trim().toLowerCase();
+  const sortedOrders = sortRows(orderRows, ORD_HEADERS, ORD_NUM_COLS, ordSort);
+  const rows = sortedOrders.filter((row) => {
+    const searchable = ((row[0]||"") + " " + (row[2]||"") + " " + (row[3]||"")).toLowerCase();
+    return !q || searchable.indexOf(q) !== -1;
+  }).map((row) => displayOrder.map((i) => row[i]));
+  downloadCsv("注文一覧_" + new Date().toISOString().slice(0, 10) + ".csv", displayOrder.map((i) => ORD_HEADERS[i]), rows);
+});
 
 async function saveOrderField(tr, orderNo, header, value) {
   tr.className = "saving";
@@ -1191,28 +1353,70 @@ async function saveOrderField(tr, orderNo, header, value) {
 }
 
 const INV_HIDDEN = ["UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致", "バリエーション詳細"];
+let invSort = { idx: 0, dir: -1 };
+let invSelected = new Set();
+
+function sortInvRows(rows) {
+  const idx = invSort.idx, dir = invSort.dir;
+  const header = invHeaders[idx];
+  if (header === "商品ID") {
+    return rows.slice().sort((a, b) => {
+      const na = parseInt(String(a[0] || "").slice(1), 10) || 0;
+      const nb = parseInt(String(b[0] || "").slice(1), 10) || 0;
+      return (na - nb) * dir;
+    });
+  }
+  return sortRows(rows, invHeaders, INV_NUM_COLS, invSort);
+}
+
+function updateInvDeleteBtn() {
+  document.getElementById("inv-selected-count").textContent = invSelected.size;
+  document.getElementById("inv-delete-btn").disabled = invSelected.size === 0;
+}
 
 function renderInventory() {
   if (!invHeaders.length) return;
   const displayOrder = invHeaders.map((h, i) => i).filter((i) => !INV_HIDDEN.includes(invHeaders[i]));
   const thead = document.getElementById("inv-thead");
-  thead.innerHTML = displayOrder.map((i, pos) => '<th class="' + (INV_NUM_COLS.includes(invHeaders[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '">' + invHeaders[i] + '</th>').join("");
+  const checkAllTh = '<th class="checkbox-col"><input type="checkbox" id="inv-select-all"></th>';
+  thead.innerHTML = checkAllTh + displayOrder.map((i, pos) => {
+    const isSortCol = i === invSort.idx;
+    const arrow = isSortCol ? '<span class="sort-arrow">' + (invSort.dir === 1 ? "▲" : "▼") + '</span>' : "";
+    return '<th class="sortable ' + (INV_NUM_COLS.includes(invHeaders[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '" data-idx="' + i + '">' + invHeaders[i] + arrow + '</th>';
+  }).join("");
+  thead.querySelectorAll("th.sortable").forEach((th) => {
+    th.addEventListener("click", () => {
+      const idx = Number(th.dataset.idx);
+      invSort = { idx, dir: invSort.idx === idx ? -invSort.dir : -1 };
+      renderInventory();
+    });
+  });
+
   const q = document.getElementById("inv-q").value.trim().toLowerCase();
   const tbody = document.getElementById("inv-tbody");
   tbody.innerHTML = "";
   let shown = 0;
   const stockIdx = invHeaders.indexOf("在庫数(現物)");
-  const sortedInv = invRows.slice().sort((a, b) => {
-    const na = parseInt(String(a[0] || "").slice(1), 10) || 0;
-    const nb = parseInt(String(b[0] || "").slice(1), 10) || 0;
-    return nb - na;
-  });
+  const visible = [];
+  const sortedInv = sortInvRows(invRows);
   sortedInv.forEach(row => {
     const pid = row[0];
     const searchable = ((row[0]||"") + " " + (row[1]||"")).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
+    visible.push(pid);
     const tr = document.createElement("tr");
+    const cbTd = document.createElement("td");
+    cbTd.className = "checkbox-col";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = invSelected.has(pid);
+    cb.addEventListener("change", () => {
+      if (cb.checked) invSelected.add(pid); else invSelected.delete(pid);
+      updateInvDeleteBtn();
+    });
+    cbTd.appendChild(cb);
+    tr.appendChild(cbTd);
     displayOrder.forEach((i, pos) => {
       const h = invHeaders[i];
       const td = document.createElement("td");
@@ -1241,8 +1445,46 @@ function renderInventory() {
     tbody.appendChild(tr);
   });
   document.getElementById("inv-count").textContent = shown.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + " 件";
+  const selectAllCb = document.getElementById("inv-select-all");
+  selectAllCb.checked = visible.length > 0 && visible.every((id) => invSelected.has(id));
+  selectAllCb.addEventListener("change", () => {
+    if (selectAllCb.checked) visible.forEach((id) => invSelected.add(id));
+    else visible.forEach((id) => invSelected.delete(id));
+    renderInventory();
+  });
+  updateInvDeleteBtn();
   setupScrollMirror("inv-table-mirror", "inv-table-scroll");
 }
+
+document.getElementById("inv-delete-btn").addEventListener("click", async () => {
+  if (!invSelected.size) return;
+  if (!confirm(invSelected.size + "件の商品を削除します。よろしいですか?(元に戻せません)")) return;
+  const token = getToken();
+  try {
+    const r = await fetch("/api/inventory", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ 商品ID: Array.from(invSelected) }),
+    });
+    if (!r.ok) { alert("削除に失敗しました"); return; }
+    invSelected.clear();
+    await loadAll();
+  } catch (e) {
+    alert("通信エラー: " + e.message);
+  }
+});
+
+document.getElementById("inv-csv-export").addEventListener("click", () => {
+  if (!invHeaders.length) return;
+  const displayOrder = invHeaders.map((h, i) => i).filter((i) => !INV_HIDDEN.includes(invHeaders[i]));
+  const q = document.getElementById("inv-q").value.trim().toLowerCase();
+  const sortedInv = sortInvRows(invRows);
+  const rows = sortedInv.filter((row) => {
+    const searchable = ((row[0]||"") + " " + (row[1]||"")).toLowerCase();
+    return !q || searchable.indexOf(q) !== -1;
+  }).map((row) => displayOrder.map((i) => row[i]));
+  downloadCsv("在庫一覧_" + new Date().toISOString().slice(0, 10) + ".csv", displayOrder.map((i) => invHeaders[i]), rows);
+});
 
 async function saveInventoryField(tr, pid, header, value) {
   tr.className = "saving";
@@ -1425,7 +1667,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
     });
     return res.end();
@@ -1452,6 +1694,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/api/import") return await handleImport(req, res);
     if (req.method === "GET" && req.url === "/api/inventory") return await handleListInventory(req, res);
     if (req.method === "PATCH" && req.url === "/api/inventory") return await handlePatchInventory(req, res);
+    if (req.method === "DELETE" && req.url === "/api/orders") return await handleDeleteOrders(req, res);
+    if (req.method === "DELETE" && req.url === "/api/inventory") return await handleDeleteInventory(req, res);
     if (req.method === "POST" && req.url === "/api/import/inventory") return await handleImportInventory(req, res);
     if (req.method === "POST" && req.url === "/api/inventory/rebuild") return await handleRebuildInventory(req, res);
   } catch (e) {
