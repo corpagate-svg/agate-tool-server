@@ -807,6 +807,10 @@ const DASHBOARD_PAGE = `<!doctype html>
             <label>サイト<input id="ne-site" type="text"></label>
             <label>収益USD<input id="ne-usd" type="number" step="any"></label>
             <label>ドル円レート<input id="ne-rate" type="number" step="any" value="155"></label>
+            <label>手数料(円)<input id="ne-fee-preview" type="text" disabled placeholder="自動計算(収益円の3%)"></label>
+            <label>仕入原価(円)<input id="ne-cost" type="number" step="any" placeholder="わかれば入力"></label>
+            <label>送料(円)<input id="ne-shipping" type="number" step="any" placeholder="わかれば入力"></label>
+            <label>梱包費(円)<input id="ne-packing" type="number" step="any" placeholder="わかれば入力" value="50"></label>
             <label style="grid-column:span 3;">商品メモ<input id="ne-note" type="text"></label>
           </div>
           <div class="browser-toolbar" id="ne-submit-row" style="display:none;">
@@ -1337,6 +1341,21 @@ function parseOrderText(text) {
   return result;
 }
 
+function updateFeePreview() {
+  const usd = Number(document.getElementById("ne-usd").value);
+  const rate = Number(document.getElementById("ne-rate").value);
+  const preview = document.getElementById("ne-fee-preview");
+  if (Number.isFinite(usd) && Number.isFinite(rate) && usd > 0 && rate > 0) {
+    const revenueJpy = usd * rate;
+    const fee = Math.round(revenueJpy * 0.03);
+    preview.value = "¥" + fee.toLocaleString("ja-JP") + "(収益円 ¥" + Math.round(revenueJpy).toLocaleString("ja-JP") + ")";
+  } else {
+    preview.value = "";
+  }
+}
+document.getElementById("ne-usd").addEventListener("input", updateFeePreview);
+document.getElementById("ne-rate").addEventListener("input", updateFeePreview);
+
 document.getElementById("ne-parse-btn").addEventListener("click", () => {
   const parsed = parseOrderText(document.getElementById("ne-paste").value);
   document.getElementById("ne-order").value = parsed.orderNo;
@@ -1344,9 +1363,13 @@ document.getElementById("ne-parse-btn").addEventListener("click", () => {
   document.getElementById("ne-site").value = parsed.site;
   document.getElementById("ne-usd").value = parsed.usd;
   document.getElementById("ne-note").value = parsed.note;
+  document.getElementById("ne-cost").value = "";
+  document.getElementById("ne-shipping").value = "";
+  document.getElementById("ne-packing").value = "50";
+  updateFeePreview();
   document.getElementById("ne-review").style.display = "grid";
   document.getElementById("ne-submit-row").style.display = "flex";
-  document.getElementById("ne-status").textContent = "内容を確認してから登録してください(空欄は自分で埋めてください)";
+  document.getElementById("ne-status").textContent = "内容を確認してから登録してください(空欄は自分で埋めてください)。手数料(3%)は自動計算されます";
   document.getElementById("ne-status").className = "hint";
 });
 
@@ -1360,6 +1383,12 @@ document.getElementById("ne-submit-btn").addEventListener("click", async () => {
     収益USD: document.getElementById("ne-usd").value,
     ドル円レート: document.getElementById("ne-rate").value,
   };
+  const cost = document.getElementById("ne-cost").value;
+  const shipping = document.getElementById("ne-shipping").value;
+  const packing = document.getElementById("ne-packing").value;
+  if (cost !== "") body.仕入原価円 = cost;
+  if (shipping !== "") body.送料円 = shipping;
+  if (packing !== "") body.梱包費円 = packing;
   if (!body.注文番号 || !body.日付 || !body.収益USD || !body.ドル円レート) {
     statusEl.textContent = "注文番号・日付・収益USD・ドル円レートは必須です";
     statusEl.className = "hint ng";
@@ -1376,7 +1405,7 @@ document.getElementById("ne-submit-btn").addEventListener("click", async () => {
     });
     const data = await r.json();
     if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
-    statusEl.textContent = "登録しました(収益円: " + data.収益円 + ")";
+    statusEl.textContent = "登録しました(収益円: " + data.収益円 + "・手数料: " + data.手数料円 + ")";
     statusEl.className = "hint ok";
     document.getElementById("ne-paste").value = "";
     document.getElementById("ne-review").style.display = "none";
