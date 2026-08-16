@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
 const DATA_DIR = path.join(__dirname, "..", "data");
 const LEDGER_PATH = path.join(DATA_DIR, "売上管理表.xlsx");
+const INVENTORY_PATH = path.join(DATA_DIR, "在庫管理表.xlsx");
 
 const HEADERS = [
   "注文番号", "日付", "サイト", "商品メモ", "商品ID",
@@ -15,6 +16,12 @@ const HEADERS = [
   "仕入原価(円)", "送料(円)", "梱包費(円)", "最終利益(円)", "利益率",
 ];
 const COL = { 注文番号: 1, 日付: 2, サイト: 3, 商品メモ: 4, 商品ID: 5, 収益USD: 6, ドル円レート: 7, 収益円: 8, 手数料: 9, 仕入原価: 10, 送料: 11, 梱包費: 12, 最終利益: 13, 利益率: 14 };
+
+const INV_HEADERS = [
+  "商品ID", "商品名", "バリエーション詳細", "在庫数(現物)", "出品国数", "在庫数不一致",
+  "US_出品ID", "US価格(USD)", "US累計売却数", "UK_出品ID", "UK価格(GBP)", "UK累計売却数",
+  "AU_出品ID", "AU価格(AUD)", "AU累計売却数", "仕入価格(円)", "仕入日", "仕入先", "備考",
+];
 
 if (!API_TOKEN) {
   console.error("API_TOKEN が設定されていません(.env を確認してください)。起動を中止します。");
@@ -24,11 +31,11 @@ if (!API_TOKEN) {
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function isDataSheet(name) {
-  return !name.includes("について");
+  return !name.includes("について") && !name.includes("要確認");
 }
 
-function styleHeaderRow(ws) {
-  ws.addRow(HEADERS);
+function styleHeaderRow(ws, headers) {
+  ws.addRow(headers);
   ws.getRow(1).font = { bold: true };
 }
 
@@ -39,8 +46,20 @@ async function loadWorkbook() {
     return wb;
   }
   const ws = wb.addWorksheet("記録");
-  styleHeaderRow(ws);
+  styleHeaderRow(ws, HEADERS);
   await wb.xlsx.writeFile(LEDGER_PATH);
+  return wb;
+}
+
+async function loadInventoryWorkbook() {
+  const wb = new ExcelJS.Workbook();
+  if (fs.existsSync(INVENTORY_PATH)) {
+    await wb.xlsx.readFile(INVENTORY_PATH);
+    return wb;
+  }
+  const ws = wb.addWorksheet("在庫管理表");
+  styleHeaderRow(ws, INV_HEADERS);
+  await wb.xlsx.writeFile(INVENTORY_PATH);
   return wb;
 }
 
@@ -59,7 +78,7 @@ function getOrCreateMonthSheet(wb, dateStr) {
   let ws = wb.getWorksheet(name);
   if (!ws) {
     ws = wb.addWorksheet(name);
-    styleHeaderRow(ws);
+    styleHeaderRow(ws, HEADERS);
   }
   return ws;
 }
@@ -198,12 +217,17 @@ async function handlePatchOrder(req, res) {
   sendJson(res, 200, { status: "ok", ...updated });
 }
 
+function isOrderRow(row) {
+  return Boolean(row.getCell(COL.注文番号).value) && typeof row.getCell(COL.収益USD).value === "number";
+}
+
 async function handleListOrders(req, res) {
   const wb = await loadWorkbook();
   const rows = [];
   for (const ws of dataSheets(wb)) {
     ws.eachRow((row, rowNumber) => {
       if (rowNumber === 1) return;
+      if (!isOrderRow(row)) return;
       rows.push(row.values.slice(1, HEADERS.length + 1));
     });
   }
@@ -234,12 +258,37 @@ async function handleImport(req, res) {
   sendJson(res, 200, { status: "ok", message: "取り込みが完了しました" });
 }
 
+async function handleListInventory(req, res) {
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+  const rows = [];
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    rows.push(row.values.slice(1, INV_HEADERS.length + 1));
+  });
+  sendJson(res, 200, { headers: INV_HEADERS, rows });
+}
+
+async function handleImportInventory(req, res) {
+  const buf = await readRawBody(req, 30 * 1024 * 1024);
+  const wb = new ExcelJS.Workbook();
+  try {
+    await wb.xlsx.load(buf);
+  } catch (e) {
+    return sendJson(res, 400, { error: "有効なxlsxファイルではありません" });
+  }
+  const tmpPath = INVENTORY_PATH + ".tmp";
+  fs.writeFileSync(tmpPath, buf);
+  fs.renameSync(tmpPath, INVENTORY_PATH);
+  sendJson(res, 200, { status: "ok", message: "取り込みが完了しました" });
+}
+
 function sendHtml(res, html) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(html);
 }
 
-const ORDERS_PAGE = `<!doctype html>
+const DASHBOARD_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>物販事業ツール(サーバー版)</title>
@@ -280,10 +329,24 @@ const ORDERS_PAGE = `<!doctype html>
   .hdr .sub { margin: 0; color: var(--ink-2); font-size: 13px; }
 
   .auth-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .auth-row input[type=password] { padding: 8px 10px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink); font-size: 13px; min-width: 260px; }
+  .auth-row input[type=password] { padding: 8px 10px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink); font-size: 13px; min-width: 240px; }
   .btn { font: inherit; font-size: 12.5px; font-weight: 600; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; padding: 7px 14px; cursor: pointer; }
   .btn:hover { background: var(--accent-wash); }
   #status { font-size: 12.5px; color: var(--ink-muted); }
+
+  .tabnav { display: flex; gap: 4px; border-bottom: 1px solid var(--border); }
+  .tabbtn { font: inherit; font-size: 14px; font-weight: 600; color: var(--ink-muted); background: none; border: none; border-bottom: 2px solid transparent; padding: 10px 16px; cursor: pointer; }
+  .tabbtn:hover { color: var(--ink-2); }
+  .tabbtn.active { color: var(--series-rev); border-bottom-color: var(--series-rev); }
+  .tabpanel { display: none; flex-direction: column; gap: 20px; }
+  .tabpanel.active { display: flex; }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .kpi { background: var(--surface); padding: 16px 18px; display: flex; flex-direction: column; gap: 6px; }
+  .kpi .label { font-size: 12px; color: var(--ink-2); }
+  .kpi .value { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+  .kpi .value.good { color: var(--good); }
+  .kpi .value.bad { color: var(--series-cost); }
 
   .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px 24px 20px; }
   .panel h2 { margin: 0; font-size: 15px; font-weight: 700; }
@@ -295,7 +358,7 @@ const ORDERS_PAGE = `<!doctype html>
   .search-input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
   .result-count { font-size: 12.5px; color: var(--ink-muted); white-space: nowrap; }
 
-  .table-scroll { overflow-x: auto; min-width: 0; max-height: 640px; overflow-y: auto; margin-top: 14px; }
+  .table-scroll { overflow-x: auto; min-width: 0; max-height: 620px; overflow-y: auto; margin-top: 14px; }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   thead th { text-align: left; font-size: 11.5px; color: var(--ink-muted); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; position: sticky; top: 0; background: var(--surface); z-index: 2; }
   thead th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -306,6 +369,7 @@ const ORDERS_PAGE = `<!doctype html>
   .site-chip { display: inline-block; padding: 2px 8px; border-radius: 100px; background: var(--accent-wash); color: var(--series-rev); font-size: 11.5px; font-weight: 600; }
   .profit-cell { color: var(--good); font-weight: 600; }
   .profit-cell.bad { color: var(--series-cost); }
+  .stock-zero { color: var(--series-cost); font-weight: 600; }
 
   td input { font: inherit; font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 5px 6px; width: 78px; text-align: right; }
   td input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
@@ -318,7 +382,7 @@ const ORDERS_PAGE = `<!doctype html>
   <div class="hdr">
     <div>
       <h1>物販事業ツール(サーバー版)</h1>
-      <p class="sub">株式会社アゲイト — 注文一覧。仕入原価・送料・梱包費を書き換えると、その場でサーバーに保存されます</p>
+      <p class="sub">株式会社アゲイト — eBay 注文・在庫・売上。注文タブは書き換えると即座にサーバーに保存されます</p>
     </div>
     <div class="auth-row">
       <input id="token" type="password" placeholder="アクセストークン">
@@ -327,105 +391,196 @@ const ORDERS_PAGE = `<!doctype html>
     </div>
   </div>
 
-  <div class="panel">
-    <h2>注文一覧</h2>
-    <p class="desc">注文番号・商品メモ・サイトで検索できます。<b>収益USD・ドル円レート・仕入原価・送料・梱包費は直接書き換えられます</b>(最終利益はその場で再計算されます)。</p>
-    <div class="panel-body">
-      <div class="browser-toolbar">
-        <input type="text" class="search-input" id="q" placeholder="注文番号・商品メモ・サイトで検索…">
-        <span class="result-count" id="count"></span>
-      </div>
-      <div class="table-scroll">
+  <div class="tabnav">
+    <button class="tabbtn active" data-tab="sales">売上分析</button>
+    <button class="tabbtn" data-tab="inventory">在庫</button>
+    <button class="tabbtn" data-tab="orders">注文</button>
+  </div>
+
+  <div class="tabpanel active" id="tab-sales">
+    <div class="kpis" id="kpis"></div>
+    <div class="panel">
+      <h2>利益TOP10の注文</h2>
+      <p class="desc">最終利益が大きかった注文(サーバー上の最新データ)</p>
+      <div class="panel-body table-scroll">
         <table>
-          <thead><tr id="thead"></tr></thead>
-          <tbody id="tbody"></tbody>
+          <thead><tr><th>日付</th><th>サイト</th><th>商品メモ</th><th class="num">収益(円)</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
+          <tbody id="top10-body"></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabpanel" id="tab-inventory">
+    <div class="panel">
+      <h2>在庫一覧(閲覧専用)</h2>
+      <p class="desc">商品名・商品IDで検索できます。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar">
+          <input type="text" class="search-input" id="inv-q" placeholder="商品名・商品IDで検索…">
+          <span class="result-count" id="inv-count"></span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr id="inv-thead"></tr></thead>
+            <tbody id="inv-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabpanel" id="tab-orders">
+    <div class="panel">
+      <h2>注文一覧</h2>
+      <p class="desc">注文番号・商品メモ・サイトで検索できます。<b>収益USD・ドル円レート・仕入原価・送料・梱包費は直接書き換えられます</b>(最終利益はその場で再計算・保存されます)。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar">
+          <input type="text" class="search-input" id="ord-q" placeholder="注文番号・商品メモ・サイトで検索…">
+          <span class="result-count" id="ord-count"></span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr id="ord-thead"></tr></thead>
+            <tbody id="ord-tbody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
 </div>
 <script>
-const HEADERS_META = ["注文番号","日付","サイト","商品メモ","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
-const EDITABLE = ["収益USD","ドル円レート","仕入原価(円)","送料(円)","梱包費(円)"];
-const NUM_COLS = ["収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
-const FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円" };
-let allRows = [];
+const ORD_HEADERS = ["注文番号","日付","サイト","商品メモ","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
+const ORD_EDITABLE = ["収益USD","ドル円レート","仕入原価(円)","送料(円)","梱包費(円)"];
+const ORD_NUM_COLS = ["収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
+const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円" };
+const INV_NUM_COLS = ["在庫数(現物)","出品国数","US価格(USD)","US累計売却数","UK価格(GBP)","UK累計売却数","AU価格(AUD)","AU累計売却数","仕入価格(円)"];
+let orderRows = [];
+let invRows = [];
+let invHeaders = [];
 
 function getToken() { return localStorage.getItem("agate_token") || ""; }
 document.getElementById("token").value = getToken();
 document.getElementById("saveToken").addEventListener("click", () => {
   localStorage.setItem("agate_token", document.getElementById("token").value.trim());
-  load();
+  loadAll();
 });
 
-function fmt(v, key) {
+document.querySelectorAll(".tabbtn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tabbtn").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".tabpanel").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+  });
+});
+
+function fmt(v, isPercent) {
   if (v === null || v === undefined || v === "") return "";
-  if (key === "利益率") return (Number(v) * 100).toFixed(1) + "%";
+  if (isPercent) return (Number(v) * 100).toFixed(1) + "%";
   if (typeof v === "number") return v.toLocaleString("ja-JP", { maximumFractionDigits: 2 });
   return v;
 }
 
-async function load() {
+async function loadAll() {
   const token = getToken();
   const statusEl = document.getElementById("status");
   if (!token) { statusEl.textContent = "トークンを入力してください"; return; }
   statusEl.textContent = "読み込み中...";
   try {
-    const r = await fetch("/api/orders", { headers: { Authorization: "Bearer " + token } });
-    if (!r.ok) { statusEl.textContent = "エラー: " + r.status + "(トークンを確認してください)"; return; }
-    const data = await r.json();
-    allRows = data.rows;
-    render();
+    const [ordRes, invRes] = await Promise.all([
+      fetch("/api/orders", { headers: { Authorization: "Bearer " + token } }),
+      fetch("/api/inventory", { headers: { Authorization: "Bearer " + token } }),
+    ]);
+    if (!ordRes.ok) { statusEl.textContent = "エラー: " + ordRes.status + "(トークンを確認してください)"; return; }
+    const ordData = await ordRes.json();
+    orderRows = ordData.rows;
+    if (invRes.ok) {
+      const invData = await invRes.json();
+      invRows = invData.rows;
+      invHeaders = invData.headers;
+    }
+    renderKpis();
+    renderOrders();
+    renderInventory();
     statusEl.textContent = "";
   } catch (e) {
     statusEl.textContent = "通信エラー: " + e.message;
   }
 }
 
-function render() {
-  const thead = document.getElementById("thead");
-  thead.innerHTML = HEADERS_META.map((h, i) => '<th class="' + (NUM_COLS.includes(h) ? "num" : "") + (i === 0 ? " sticky-col" : "") + '">' + h + '</th>').join("");
-  const q = document.getElementById("q").value.trim().toLowerCase();
-  const tbody = document.getElementById("tbody");
+function renderKpis() {
+  let revenue = 0, cost = 0, profit = 0, profitKnown = 0;
+  orderRows.forEach(r => {
+    revenue += Number(r[7]) || 0;
+    cost += Number(r[9]) || 0;
+    if (r[12] !== "" && r[12] !== null && r[12] !== undefined) { profit += Number(r[12]); profitKnown++; }
+  });
+  const margin = revenue !== 0 ? profit / revenue : 0;
+  const tiles = [
+    { label: "総収益", value: "¥" + fmt(Math.round(revenue)) },
+    { label: "総仕入価格", value: "¥" + fmt(Math.round(cost)) },
+    { label: "総最終利益", value: "¥" + fmt(Math.round(profit)), cls: profit >= 0 ? "good" : "bad" },
+    { label: "利益率(判明分)", value: (margin * 100).toFixed(1) + "%", cls: margin >= 0 ? "good" : "bad" },
+    { label: "総注文数", value: orderRows.length.toLocaleString("ja-JP") + " 件" },
+  ];
+  document.getElementById("kpis").innerHTML = tiles.map(t =>
+    '<div class="kpi"><div class="label">' + t.label + '</div><div class="value' + (t.cls ? " " + t.cls : "") + '">' + t.value + '</div></div>'
+  ).join("");
+
+  const top10 = orderRows.filter(r => r[12] !== "" && r[12] !== null && r[12] !== undefined)
+    .slice().sort((a, b) => Number(b[12]) - Number(a[12])).slice(0, 10);
+  document.getElementById("top10-body").innerHTML = top10.map(r =>
+    "<tr><td>" + (r[1] || "") + "</td><td><span class='site-chip'>" + (r[2] || "不明") + "</span></td><td>" + (r[3] || "") +
+    "</td><td class='num'>" + fmt(r[7]) + "</td><td class='num profit-cell" + (Number(r[12]) < 0 ? " bad" : "") + "'>" + fmt(r[12]) +
+    "</td><td class='num'>" + fmt(r[13], true) + "</td></tr>"
+  ).join("");
+}
+
+function renderOrders() {
+  const thead = document.getElementById("ord-thead");
+  thead.innerHTML = ORD_HEADERS.map((h, i) => '<th class="' + (ORD_NUM_COLS.includes(h) ? "num" : "") + (i === 0 ? " sticky-col" : "") + '">' + h + '</th>').join("");
+  const q = document.getElementById("ord-q").value.trim().toLowerCase();
+  const tbody = document.getElementById("ord-tbody");
   tbody.innerHTML = "";
   let shown = 0;
-  allRows.forEach(row => {
+  orderRows.forEach(row => {
     const orderNo = row[0];
     const searchable = ((row[0]||"") + " " + (row[2]||"") + " " + (row[3]||"")).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
     const tr = document.createElement("tr");
-    HEADERS_META.forEach((h, i) => {
+    ORD_HEADERS.forEach((h, i) => {
       const td = document.createElement("td");
       if (i === 0) td.className = "sticky-col";
-      if (EDITABLE.includes(h)) {
+      if (ORD_EDITABLE.includes(h)) {
         td.className = (td.className ? td.className + " " : "") + "num";
         const inp = document.createElement("input");
         inp.type = "number"; inp.step = "any";
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
-        inp.addEventListener("change", () => saveField(tr, orderNo, h, inp.value));
+        inp.addEventListener("change", () => saveOrderField(tr, orderNo, h, inp.value));
         td.appendChild(inp);
       } else if (h === "サイト") {
         const chip = document.createElement("span"); chip.className = "site-chip"; chip.textContent = row[i] || "不明"; td.appendChild(chip);
       } else if (h === "最終利益(円)") {
         td.className = (td.className ? td.className + " " : "") + "num profit-cell" + (Number(row[i]) < 0 ? " bad" : "");
-        td.textContent = fmt(row[i], h);
+        td.textContent = fmt(row[i]);
       } else {
-        td.className = (td.className ? td.className + " " : "") + (NUM_COLS.includes(h) ? "num" : "");
-        td.textContent = fmt(row[i], h);
+        td.className = (td.className ? td.className + " " : "") + (ORD_NUM_COLS.includes(h) ? "num" : "");
+        td.textContent = fmt(row[i], h === "利益率");
       }
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
   });
-  document.getElementById("count").textContent = shown.toLocaleString("ja-JP") + " / " + allRows.length.toLocaleString("ja-JP") + " 件";
+  document.getElementById("ord-count").textContent = shown.toLocaleString("ja-JP") + " / " + orderRows.length.toLocaleString("ja-JP") + " 件";
 }
 
-async function saveField(tr, orderNo, header, value) {
+async function saveOrderField(tr, orderNo, header, value) {
   tr.className = "saving";
   const token = getToken();
   const body = { 注文番号: orderNo };
-  body[FIELD_KEY[header]] = value === "" ? "" : Number(value);
+  body[ORD_FIELD_KEY[header]] = value === "" ? "" : Number(value);
   try {
     const r = await fetch("/api/orders", {
       method: "PATCH",
@@ -440,8 +595,37 @@ async function saveField(tr, orderNo, header, value) {
   }
 }
 
-document.getElementById("q").addEventListener("input", render);
-if (getToken()) load();
+function renderInventory() {
+  if (!invHeaders.length) return;
+  const thead = document.getElementById("inv-thead");
+  thead.innerHTML = invHeaders.map((h, i) => '<th class="' + (INV_NUM_COLS.includes(h) ? "num" : "") + (i === 0 ? " sticky-col" : "") + '">' + h + '</th>').join("");
+  const q = document.getElementById("inv-q").value.trim().toLowerCase();
+  const tbody = document.getElementById("inv-tbody");
+  tbody.innerHTML = "";
+  let shown = 0;
+  const stockIdx = invHeaders.indexOf("在庫数(現物)");
+  invRows.forEach(row => {
+    const searchable = ((row[0]||"") + " " + (row[1]||"")).toLowerCase();
+    if (q && searchable.indexOf(q) === -1) return;
+    shown++;
+    const tr = document.createElement("tr");
+    invHeaders.forEach((h, i) => {
+      const td = document.createElement("td");
+      if (i === 0) td.className = "sticky-col";
+      const isNum = INV_NUM_COLS.includes(h);
+      td.className = (td.className ? td.className + " " : "") + (isNum ? "num" : "");
+      if (i === stockIdx && (row[i] === 0 || row[i] === null || row[i] === undefined)) td.className += " stock-zero";
+      td.textContent = row[i] === null || row[i] === undefined ? "" : (isNum && typeof row[i] === "number" ? fmt(row[i]) : row[i]);
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  document.getElementById("inv-count").textContent = shown.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + " 件";
+}
+
+document.getElementById("ord-q").addEventListener("input", renderOrders);
+document.getElementById("inv-q").addEventListener("input", renderInventory);
+if (getToken()) loadAll();
 </script>
 </body></html>`;
 
@@ -459,11 +643,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     return res.end("agate-tool-server: OK");
   }
-  if (req.method === "GET" && req.url === "/orders") {
-    return sendHtml(res, ORDERS_PAGE);
+  if (req.method === "GET" && (req.url === "/orders" || req.url === "/dashboard")) {
+    return sendHtml(res, DASHBOARD_PAGE);
   }
 
-  const protectedRoutes = ["/api/orders", "/download/売上管理表.xlsx", "/api/import"];
+  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory"];
   if (protectedRoutes.includes(req.url) && !isAuthorized(req)) {
     return sendJson(res, 401, { error: "認証に失敗しました(トークンを確認してください)" });
   }
@@ -474,6 +658,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/api/orders") return await handleListOrders(req, res);
     if (req.method === "GET" && req.url === "/download/売上管理表.xlsx") return await handleDownload(req, res);
     if (req.method === "POST" && req.url === "/api/import") return await handleImport(req, res);
+    if (req.method === "GET" && req.url === "/api/inventory") return await handleListInventory(req, res);
+    if (req.method === "POST" && req.url === "/api/import/inventory") return await handleImportInventory(req, res);
   } catch (e) {
     console.error(e);
     return sendJson(res, 500, { error: "サーバー内部でエラーが発生しました" });
