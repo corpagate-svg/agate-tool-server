@@ -1133,8 +1133,10 @@ async function saveOrderField(tr, orderNo, header, value) {
 
 function renderInventory() {
   if (!invHeaders.length) return;
+  const displayOrder = invHeaders.map((h, i) => i).filter((i) => invHeaders[i] !== "バリエーション詳細")
+    .concat(invHeaders.map((h, i) => i).filter((i) => invHeaders[i] === "バリエーション詳細"));
   const thead = document.getElementById("inv-thead");
-  thead.innerHTML = invHeaders.map((h, i) => '<th class="' + (INV_NUM_COLS.includes(h) ? "num" : "") + (i === 0 ? " sticky-col" : "") + '">' + h + '</th>').join("");
+  thead.innerHTML = displayOrder.map((i, pos) => '<th class="' + (INV_NUM_COLS.includes(invHeaders[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '">' + invHeaders[i] + '</th>').join("");
   const q = document.getElementById("inv-q").value.trim().toLowerCase();
   const tbody = document.getElementById("inv-tbody");
   tbody.innerHTML = "";
@@ -1150,9 +1152,10 @@ function renderInventory() {
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
     const tr = document.createElement("tr");
-    invHeaders.forEach((h, i) => {
+    displayOrder.forEach((i, pos) => {
+      const h = invHeaders[i];
       const td = document.createElement("td");
-      if (i === 0) td.className = "sticky-col";
+      if (pos === 0) td.className = "sticky-col";
       const isNum = INV_NUM_COLS.includes(h);
       td.className = (td.className ? td.className + " " : "") + (isNum ? "num" : "");
       if (i === stockIdx && (row[i] === 0 || row[i] === null || row[i] === undefined)) td.className += " stock-zero";
