@@ -22,6 +22,7 @@ const INV_HEADERS = [
   "US_出品ID", "US価格(USD)", "US累計売却数", "UK_出品ID", "UK価格(GBP)", "UK累計売却数",
   "AU_出品ID", "AU価格(AUD)", "AU累計売却数", "仕入価格(円)", "仕入日", "仕入先", "備考",
 ];
+const INV_COL = { 商品ID: 1, 商品名: 2, バリエーション詳細: 3, 在庫数: 4, 出品国数: 5, 在庫数不一致: 6, 仕入価格: 16, 仕入日: 17, 仕入先: 18, 備考: 19 };
 
 if (!API_TOKEN) {
   console.error("API_TOKEN が設定されていません(.env を確認してください)。起動を中止します。");
@@ -247,6 +248,7 @@ async function handlePatchOrder(req, res) {
 
       if (usd !== null) row.getCell(COL.収益USD).value = usd;
       if (rate !== null) row.getCell(COL.ドル円レート).value = rate;
+      if ("商品メモ" in body) row.getCell(COL.商品メモ).value = body["商品メモ"];
       row.getCell(COL.収益円).value = Math.round(revenueJpy);
       row.getCell(COL.手数料).value = fee;
       row.getCell(COL.仕入原価).value = cost === null ? "" : cost;
@@ -314,6 +316,38 @@ async function handleListInventory(req, res) {
     rows.push(row.values.slice(1, INV_HEADERS.length + 1));
   });
   sendJson(res, 200, { headers: INV_HEADERS, rows });
+}
+
+async function handlePatchInventory(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readRawBody(req, 1024 * 1024)).toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  const pid = body["商品ID"];
+  if (!pid) return sendJson(res, 400, { error: "商品ID は必須です" });
+
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+  let updated = false;
+  for (let r = 2; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    if (String(row.getCell(INV_COL.商品ID).value || "") !== String(pid)) continue;
+    if ("仕入価格円" in body) {
+      const v = numOrNull(body["仕入価格円"]);
+      row.getCell(INV_COL.仕入価格).value = v === null ? "" : v;
+    }
+    if ("仕入日" in body) row.getCell(INV_COL.仕入日).value = body["仕入日"];
+    if ("仕入先" in body) row.getCell(INV_COL.仕入先).value = body["仕入先"];
+    if ("備考" in body) row.getCell(INV_COL.備考).value = body["備考"];
+    row.commit();
+    updated = true;
+  }
+
+  if (!updated) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
+  await wb.xlsx.writeFile(INVENTORY_PATH);
+  sendJson(res, 200, { status: "ok", 商品ID: pid });
 }
 
 async function handleImportInventory(req, res) {
@@ -638,6 +672,8 @@ const DASHBOARD_PAGE = `<!doctype html>
 
   td input { font: inherit; font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 5px 6px; width: 78px; text-align: right; }
   td input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
+  td input.wide-input { width: 160px; text-align: left; }
+  td input.wide-input.wider { width: 280px; }
   tr.saving td { background: #fff7e0 !important; }
   tr.saved td { background: #e9f7ec !important; }
   tr.error td { background: #fde8e8 !important; }
@@ -804,9 +840,13 @@ const DASHBOARD_PAGE = `<!doctype html>
 <script>
 const ORD_HEADERS = ["注文番号","日付","サイト","商品メモ","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
 const ORD_EDITABLE = ["収益USD","ドル円レート","仕入原価(円)","送料(円)","梱包費(円)"];
+const ORD_EDITABLE_TEXT = ["商品メモ"];
 const ORD_NUM_COLS = ["収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
-const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円" };
+const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円", "商品メモ": "商品メモ" };
 const INV_NUM_COLS = ["在庫数(現物)","出品国数","US価格(USD)","US累計売却数","UK価格(GBP)","UK累計売却数","AU価格(AUD)","AU累計売却数","仕入価格(円)"];
+const INV_EDITABLE_TEXT = ["仕入日","仕入先","備考"];
+const INV_EDITABLE_NUM = ["仕入価格(円)"];
+const INV_FIELD_KEY = { "仕入価格(円)": "仕入価格円", "仕入日": "仕入日", "仕入先": "仕入先", "備考": "備考" };
 let orderRows = [];
 let invRows = [];
 let invHeaders = [];
@@ -1099,6 +1139,13 @@ function renderOrders() {
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
         inp.addEventListener("change", () => saveOrderField(tr, orderNo, h, inp.value));
         td.appendChild(inp);
+      } else if (ORD_EDITABLE_TEXT.includes(h)) {
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.className = "wide-input";
+        inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
+        inp.addEventListener("change", () => saveOrderField(tr, orderNo, h, inp.value));
+        td.appendChild(inp);
       } else if (h === "サイト") {
         const chip = document.createElement("span"); chip.className = "site-chip"; chip.textContent = row[i] || "不明"; td.appendChild(chip);
       } else if (h === "最終利益(円)") {
@@ -1124,7 +1171,7 @@ async function saveOrderField(tr, orderNo, header, value) {
   tr.className = "saving";
   const token = getToken();
   const body = { 注文番号: orderNo };
-  body[ORD_FIELD_KEY[header]] = value === "" ? "" : Number(value);
+  body[ORD_FIELD_KEY[header]] = ORD_EDITABLE_TEXT.includes(header) ? value : (value === "" ? "" : Number(value));
   try {
     const r = await fetch("/api/orders", {
       method: "PATCH",
@@ -1157,6 +1204,7 @@ function renderInventory() {
     return nb - na;
   });
   sortedInv.forEach(row => {
+    const pid = row[0];
     const searchable = ((row[0]||"") + " " + (row[1]||"")).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
@@ -1168,13 +1216,47 @@ function renderInventory() {
       const isNum = INV_NUM_COLS.includes(h);
       td.className = (td.className ? td.className + " " : "") + (isNum ? "num" : "");
       if (i === stockIdx && (row[i] === 0 || row[i] === null || row[i] === undefined)) td.className += " stock-zero";
-      td.textContent = row[i] === null || row[i] === undefined ? "" : (isNum && typeof row[i] === "number" ? fmt(row[i]) : row[i]);
+      if (INV_EDITABLE_NUM.includes(h)) {
+        const inp = document.createElement("input");
+        inp.type = "number"; inp.step = "any";
+        inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
+        inp.addEventListener("change", () => saveInventoryField(tr, pid, h, inp.value));
+        td.appendChild(inp);
+      } else if (INV_EDITABLE_TEXT.includes(h)) {
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.className = h === "備考" ? "wide-input wider" : "wide-input";
+        inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
+        inp.addEventListener("change", () => saveInventoryField(tr, pid, h, inp.value));
+        td.appendChild(inp);
+      } else {
+        td.textContent = row[i] === null || row[i] === undefined ? "" : (isNum && typeof row[i] === "number" ? fmt(row[i]) : row[i]);
+      }
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
   });
   document.getElementById("inv-count").textContent = shown.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + " 件";
   setupScrollMirror("inv-table-mirror", "inv-table-scroll");
+}
+
+async function saveInventoryField(tr, pid, header, value) {
+  tr.className = "saving";
+  const token = getToken();
+  const body = { 商品ID: pid };
+  body[INV_FIELD_KEY[header]] = INV_EDITABLE_NUM.includes(header) ? (value === "" ? "" : Number(value)) : value;
+  try {
+    const r = await fetch("/api/inventory", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { tr.className = "error"; return; }
+    tr.className = "saved";
+    setTimeout(() => { tr.className = ""; }, 1500);
+  } catch (e) {
+    tr.className = "error";
+  }
 }
 
 document.getElementById("ord-q").addEventListener("input", renderOrders);
@@ -1340,6 +1422,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/download/売上管理表.xlsx") return await handleDownload(req, res);
     if (req.method === "POST" && req.url === "/api/import") return await handleImport(req, res);
     if (req.method === "GET" && req.url === "/api/inventory") return await handleListInventory(req, res);
+    if (req.method === "PATCH" && req.url === "/api/inventory") return await handlePatchInventory(req, res);
     if (req.method === "POST" && req.url === "/api/import/inventory") return await handleImportInventory(req, res);
     if (req.method === "POST" && req.url === "/api/inventory/rebuild") return await handleRebuildInventory(req, res);
   } catch (e) {
