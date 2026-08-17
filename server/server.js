@@ -711,6 +711,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   .sticky-col { position: sticky; left: 0; background: var(--surface); z-index: 1; box-shadow: 2px 0 4px -2px var(--border); }
   tbody tr:hover td.sticky-col { background: var(--surface-2); }
   .site-chip { display: inline-block; padding: 2px 8px; border-radius: 100px; background: var(--accent-wash); color: var(--series-rev); font-size: 11.5px; font-weight: 600; }
+  td.truncate { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .profit-cell { color: var(--good); font-weight: 600; }
   .profit-cell.bad { color: var(--series-cost); }
   .stock-zero { color: var(--series-cost); font-weight: 600; }
@@ -1020,7 +1021,7 @@ function renderKpis() {
   const top10 = orderRows.filter(r => r[13] !== "" && r[13] !== null && r[13] !== undefined)
     .slice().sort((a, b) => Number(b[13]) - Number(a[13])).slice(0, 10);
   document.getElementById("top10-body").innerHTML = top10.map(r =>
-    "<tr><td>" + (r[1] || "") + "</td><td><span class='site-chip'>" + (r[2] || "不明") + "</span></td><td>" + (r[3] || "") +
+    "<tr><td>" + (r[1] || "") + "</td><td><span class='site-chip'>" + (r[2] || "不明") + "</span></td><td class='truncate' title='" + (String(r[3] || "").replace(/'/g, "&#39;")) + "'>" + (r[3] || "") +
     "</td><td class='num'>" + fmt(r[8]) + "</td><td class='num profit-cell" + (Number(r[13]) < 0 ? " bad" : "") + "'>" + fmt(r[13]) +
     "</td><td class='num'>" + fmt(r[14], true) + "</td></tr>"
   ).join("");
@@ -1117,16 +1118,24 @@ function renderMarginChart(monthly) {
   const svg = document.getElementById("chart-margin");
   svg.innerHTML = "";
   if (!monthly.length) return;
-  const W = 480, H = 300, padL = 45, padR = 10, padT = 10, padB = 30;
+  const W = 480, H = 300, padL = 50, padR = 10, padT = 10, padB = 30;
   const innerW = W - padL - padR, innerH = H - padT - padB;
-  const maxAbs = Math.max(0.05, ...monthly.map((m) => Math.abs(m.margin)));
+  const dataMin = Math.min(...monthly.map((m) => m.margin));
+  const dataMax = Math.max(...monthly.map((m) => m.margin));
+  const minV = Math.min(0, dataMin);
+  const maxV = Math.max(0.01, dataMax);
+  const range = (maxV - minV) || 1;
   const n = monthly.length;
   const stepX = n > 1 ? innerW / (n - 1) : 0;
-  const yFor = (v) => padT + innerH / 2 - (v / maxAbs) * (innerH / 2);
+  const yFor = (v) => padT + innerH - ((v - minV) / range) * innerH;
 
   for (let i = 0; i <= 4; i++) {
-    const y = padT + (innerH * i) / 4;
+    const v = minV + (range * i) / 4;
+    const y = yFor(v);
     svg.appendChild(svgNode("line", { x1: padL, y1: y, x2: padL + innerW, y2: y, class: "grid-line" }));
+    const lab = svgNode("text", { x: padL - 8, y: y + 4, "text-anchor": "end", class: "val-label" });
+    lab.textContent = (v * 100).toFixed(0) + "%";
+    svg.appendChild(lab);
   }
   svg.appendChild(svgNode("line", { x1: padL, y1: yFor(0), x2: padL + innerW, y2: yFor(0), class: "baseline-line" }));
 
