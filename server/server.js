@@ -421,6 +421,16 @@ const INV_HEADER_FONT = { bold: true, color: { argb: "FFFFFFFF" } };
 const INV_FLAG_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
 const INV_REMOVED_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF2DCDB" } };
 
+const MONTH_ABBR_EN = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
+function parseEbayStartDate(s) {
+  const m = /^([A-Za-z]{3})-(\d{1,2})-(\d{2})/.exec(String(s || ""));
+  if (!m) return null;
+  const mm = MONTH_ABBR_EN[m[1]];
+  if (!mm) return null;
+  const yyyy = 2000 + parseInt(m[3], 10);
+  return `${yyyy}-${String(mm).padStart(2, "0")}-${String(m[2]).padStart(2, "0")}`;
+}
+
 async function handleRebuildInventory(req, res) {
   const buf = await readRawBody(req, 30 * 1024 * 1024);
   const text = buf.toString("utf8").replace(/^﻿/, "");
@@ -495,6 +505,7 @@ async function handleRebuildInventory(req, res) {
       nextId++;
       newProducts.push([pid, first["Title"]]);
     }
+    if (!purchaseDate) purchaseDate = parseEbayStartDate(first["Start date"]);
 
     rowsOut.push({
       row: [
@@ -827,6 +838,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>在庫一覧(閲覧専用)</h2>
       <p class="desc">商品名・商品IDで検索できます。eBayの「All active listings report」CSVをアップロードすると、名寄せ・フラグ付けまで自動でやり直します。</p>
       <div class="panel-body">
+        <div class="kpis" id="inv-kpis" style="margin-bottom:16px;"></div>
         <div class="paste-parse">
           <div class="browser-toolbar">
             <input type="file" id="inv-csv-file" accept=".csv">
@@ -919,7 +931,7 @@ const ORD_EDITABLE_TEXT = ["商品メモ"];
 const ORD_NUM_COLS = ["収益USD","ドル円レート","数量","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
 const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円", "商品メモ": "商品メモ", "数量": "数量" };
 const INV_NUM_COLS = ["在庫数(現物)","出品国数","US価格(USD)","US累計売却数","UK価格(GBP)","UK累計売却数","AU価格(AUD)","AU累計売却数","仕入価格(円)"];
-const INV_EDITABLE_TEXT = ["仕入日","仕入先","備考"];
+const INV_EDITABLE_TEXT = ["仕入日","備考"];
 const INV_EDITABLE_NUM = ["仕入価格(円)"];
 const INV_FIELD_KEY = { "仕入価格(円)": "仕入価格円", "仕入日": "仕入日", "仕入先": "仕入先", "備考": "備考" };
 let orderRows = [];
@@ -980,10 +992,11 @@ async function loadAll() {
 }
 
 function renderKpis() {
-  let revenue = 0, cost = 0, profit = 0, profitKnown = 0;
+  let revenue = 0, cost = 0, profit = 0, profitKnown = 0, qty = 0;
   orderRows.forEach(r => {
     revenue += Number(r[8]) || 0;
     cost += Number(r[10]) || 0;
+    qty += Number(r[4]) || 0;
     if (r[13] !== "" && r[13] !== null && r[13] !== undefined) { profit += Number(r[13]); profitKnown++; }
   });
   const margin = revenue !== 0 ? profit / revenue : 0;
@@ -993,6 +1006,8 @@ function renderKpis() {
     { label: "総最終利益", value: "¥" + fmt(Math.round(profit)), cls: profit >= 0 ? "good" : "bad" },
     { label: "利益率(判明分)", value: (margin * 100).toFixed(1) + "%", cls: margin >= 0 ? "good" : "bad" },
     { label: "総注文数", value: orderRows.length.toLocaleString("ja-JP") + " 件" },
+    { label: "総販売個数", value: qty.toLocaleString("ja-JP") + " 個" },
+    { label: "在庫評価額(仕入ベース)", value: "¥" + fmt(Math.round(computeInventoryValue().total)) },
   ];
   document.getElementById("kpis").innerHTML = tiles.map(t =>
     '<div class="kpi"><div class="label">' + t.label + '</div><div class="value' + (t.cls ? " " + t.cls : "") + '">' + t.value + '</div></div>'
@@ -1362,7 +1377,7 @@ async function saveOrderField(tr, orderNo, header, value) {
   }
 }
 
-const INV_HIDDEN = ["UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致", "バリエーション詳細"];
+const INV_HIDDEN = ["UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致", "バリエーション詳細", "仕入先"];
 let invSort = { idx: 0, dir: -1 };
 let invSelected = new Set();
 
@@ -1384,8 +1399,31 @@ function updateInvDeleteBtn() {
   document.getElementById("inv-delete-btn").disabled = invSelected.size === 0;
 }
 
+function computeInventoryValue() {
+  if (!invHeaders.length) return { total: 0, priced: 0 };
+  const priceIdx = invHeaders.indexOf("仕入価格(円)");
+  const stockIdx = invHeaders.indexOf("在庫数(現物)");
+  let total = 0, priced = 0;
+  invRows.forEach((row) => {
+    const price = Number(row[priceIdx]);
+    if (!Number.isFinite(price) || price <= 0) return;
+    const stock = Number(row[stockIdx]) || 0;
+    total += price * stock;
+    priced++;
+  });
+  return { total, priced };
+}
+
+function renderInvKpis() {
+  const { total, priced } = computeInventoryValue();
+  document.getElementById("inv-kpis").innerHTML =
+    '<div class="kpi"><div class="label">在庫評価額(仕入単価×在庫数の合計)</div><div class="value">¥' + fmt(Math.round(total)) + '</div></div>' +
+    '<div class="kpi"><div class="label">仕入価格が入っている商品数</div><div class="value">' + priced.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + '</div></div>';
+}
+
 function renderInventory() {
   if (!invHeaders.length) return;
+  renderInvKpis();
   const displayOrder = invHeaders.map((h, i) => i).filter((i) => !INV_HIDDEN.includes(invHeaders[i]));
   const thead = document.getElementById("inv-thead");
   const checkAllTh = '<th class="checkbox-col"><input type="checkbox" id="inv-select-all"></th>';
