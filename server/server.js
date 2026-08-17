@@ -421,6 +421,10 @@ const INV_HEADER_FONT = { bold: true, color: { argb: "FFFFFFFF" } };
 const INV_FLAG_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
 const INV_REMOVED_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF2DCDB" } };
 
+function normText(s) {
+  return String(s || "").trim().replace(/\s+/g, " ");
+}
+
 const MONTH_ABBR_EN = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
 function parseEbayStartDate(s) {
   const m = /^([A-Za-z]{3})-(\d{1,2})-(\d{2})/.exec(String(s || ""));
@@ -454,7 +458,7 @@ async function handleRebuildInventory(req, res) {
     if (Number.isFinite(idNum)) maxId = Math.max(maxId, idNum);
     const fullRow = [];
     for (let c = 1; c <= INV_HEADERS.length; c++) fullRow.push(row.getCell(c).value);
-    const key = (fullRow[1] || "") + " || " + (fullRow[2] || "");
+    const key = normText(fullRow[1]) + " || " + normText(fullRow[2]);
     saved.set(key, {
       商品ID: pid,
       fullRow,
@@ -464,7 +468,7 @@ async function handleRebuildInventory(req, res) {
 
   const groups = new Map();
   records.forEach((r) => {
-    const key = (r["Title"] || "") + " || " + (r["Variation details"] || "");
+    const key = normText(r["Title"]) + " || " + normText(r["Variation details"]);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   });
@@ -509,7 +513,7 @@ async function handleRebuildInventory(req, res) {
 
     rowsOut.push({
       row: [
-        pid, first["Title"] || "", first["Variation details"] || null, intOrNullCsv(first["Available quantity"]),
+        pid, normText(first["Title"]), normText(first["Variation details"]) || null, intOrNullCsv(first["Available quantity"]),
         siteCount, qtys.size > 1 ? "要確認" : "",
         bySite.US ? numOrNullCsv(bySite.US["Item number"]) : null, bySite.US ? numOrNullCsv(bySite.US["Current price"]) : null, bySite.US ? intOrNullCsv(bySite.US["Sold quantity"]) : null,
         bySite.UK ? numOrNullCsv(bySite.UK["Item number"]) : null, bySite.UK ? numOrNullCsv(bySite.UK["Current price"]) : null, bySite.UK ? intOrNullCsv(bySite.UK["Sold quantity"]) : null,
