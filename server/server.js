@@ -792,7 +792,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p class="desc">サーバー上の最新データから自動集計(注文の日付ごとに月単位でまとめています)</p>
       <div class="panel-body table-scroll">
         <table>
-          <thead><tr><th>月</th><th class="num">件数</th><th class="num">総個数</th><th class="num">収益(円)</th><th class="num">原価回収額</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
+          <thead><tr><th>月</th><th class="num">件数</th><th class="num">総個数</th><th class="num">受取額(円)</th><th class="num">仕入回収額</th><th class="num">純利益(円)</th><th class="num">利益率</th></tr></thead>
           <tbody id="monthly-body"></tbody>
         </table>
       </div>
@@ -1006,10 +1006,10 @@ function renderKpis() {
   });
   const margin = revenue !== 0 ? profit / revenue : 0;
   const tiles = [
-    { label: "総収益", value: "¥" + fmt(Math.round(revenue)) },
-    { label: "総原価回収額", value: "¥" + fmt(Math.round(cost)) },
-    { label: "総最終利益", value: "¥" + fmt(Math.round(profit)), cls: profit >= 0 ? "good" : "bad" },
-    { label: "利益率(判明分)", value: (margin * 100).toFixed(1) + "%", cls: margin >= 0 ? "good" : "bad" },
+    { label: "受取総額", value: "¥" + fmt(Math.round(revenue)) },
+    { label: "仕入回収額", value: "¥" + fmt(Math.round(cost)) },
+    { label: "純利益", value: "¥" + fmt(Math.round(profit)), cls: profit >= 0 ? "good" : "bad" },
+    { label: "利益率", value: (margin * 100).toFixed(1) + "%", cls: margin >= 0 ? "good" : "bad" },
     { label: "総注文数", value: orderRows.length.toLocaleString("ja-JP") + " 件" },
     { label: "総販売個数", value: qty.toLocaleString("ja-JP") + " 個" },
     { label: "在庫評価額(仕入ベース)", value: "¥" + fmt(Math.round(computeInventoryValue().total)) },
