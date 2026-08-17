@@ -787,7 +787,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p class="desc">サーバー上の最新データから自動集計(注文の日付ごとに月単位でまとめています)</p>
       <div class="panel-body table-scroll">
         <table>
-          <thead><tr><th>月</th><th class="num">件数</th><th class="num">収益(円)</th><th class="num">原価回収額</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
+          <thead><tr><th>月</th><th class="num">件数</th><th class="num">総個数</th><th class="num">収益(円)</th><th class="num">原価回収額</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
           <tbody id="monthly-body"></tbody>
         </table>
       </div>
@@ -1002,7 +1002,7 @@ function renderKpis() {
   const margin = revenue !== 0 ? profit / revenue : 0;
   const tiles = [
     { label: "総収益", value: "¥" + fmt(Math.round(revenue)) },
-    { label: "総仕入価格", value: "¥" + fmt(Math.round(cost)) },
+    { label: "総原価回収額", value: "¥" + fmt(Math.round(cost)) },
     { label: "総最終利益", value: "¥" + fmt(Math.round(profit)), cls: profit >= 0 ? "good" : "bad" },
     { label: "利益率(判明分)", value: (margin * 100).toFixed(1) + "%", cls: margin >= 0 ? "good" : "bad" },
     { label: "総注文数", value: orderRows.length.toLocaleString("ja-JP") + " 件" },
@@ -1028,23 +1028,24 @@ function computeMonthly() {
     const d = String(r[1] || "");
     if (d.length < 7) return;
     const month = d.slice(0, 7);
-    if (!map.has(month)) map.set(month, { revenue: 0, cost: 0, profit: 0, count: 0 });
+    if (!map.has(month)) map.set(month, { revenue: 0, cost: 0, profit: 0, count: 0, qty: 0 });
     const m = map.get(month);
     m.revenue += Number(r[8]) || 0;
     m.cost += Number(r[10]) || 0;
+    m.qty += Number(r[4]) || 0;
     if (r[13] !== "" && r[13] !== null && r[13] !== undefined) m.profit += Number(r[13]);
     m.count++;
   });
   return Array.from(map.keys()).sort().map((k) => {
     const v = map.get(k);
-    return { month: k, revenue: v.revenue, cost: v.cost, profit: v.profit, count: v.count, margin: v.revenue ? v.profit / v.revenue : 0 };
+    return { month: k, revenue: v.revenue, cost: v.cost, profit: v.profit, count: v.count, qty: v.qty, margin: v.revenue ? v.profit / v.revenue : 0 };
   });
 }
 
 function renderMonthlyTable(monthly) {
   const newestFirst = monthly.slice().reverse();
   document.getElementById("monthly-body").innerHTML = newestFirst.map((m) =>
-    "<tr><td>" + m.month + "</td><td class='num'>" + m.count + "</td><td class='num'>" + fmt(Math.round(m.revenue)) +
+    "<tr><td>" + m.month + "</td><td class='num'>" + m.count + "</td><td class='num'>" + m.qty + "</td><td class='num'>" + fmt(Math.round(m.revenue)) +
     "</td><td class='num'>" + fmt(Math.round(m.cost)) + "</td><td class='num profit-cell" + (m.profit < 0 ? " bad" : "") + "'>" + fmt(Math.round(m.profit)) +
     "</td><td class='num'>" + (m.margin * 100).toFixed(1) + "%</td></tr>"
   ).join("");
