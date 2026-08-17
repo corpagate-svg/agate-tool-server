@@ -886,6 +886,14 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>注文一覧</h2>
       <p class="desc">注文番号・商品メモ・サイトで検索できます。<b>収益USD・ドル円レート・仕入原価・送料・梱包費は直接書き換えられます</b>(最終利益はその場で再計算・保存されます)。</p>
       <div class="panel-body">
+        <div class="paste-parse">
+          <div class="browser-toolbar">
+            <input type="file" id="ord-xlsx-file" accept=".xlsx">
+            <button class="btn" id="ord-xlsx-upload">売上管理表(xlsx)を丸ごと取り込む</button>
+            <span id="ord-xlsx-status" class="hint"></span>
+          </div>
+          <p class="hint">サーバー上の注文データがこのファイルの内容で完全に置き換わります。手元で作り直した売上管理表を反映したいときに使ってください。</p>
+        </div>
         <div class="browser-toolbar">
           <input type="text" class="search-input" id="ord-q" placeholder="注文番号・商品メモ・サイトで検索…">
           <button class="btn" id="ord-delete-btn" disabled>選択した行を削除(<span id="ord-selected-count">0</span>)</button>
@@ -1526,6 +1534,31 @@ document.getElementById("inv-csv-upload").addEventListener("click", async () => 
     const data = await r.json();
     if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
     statusEl.textContent = "更新完了(全" + data.total + "件・新規" + data.new + "件・削除扱い" + data.removedNew + "件・要確認" + data.anomalous + "件)";
+    statusEl.className = "hint ok";
+    await loadAll();
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
+
+document.getElementById("ord-xlsx-upload").addEventListener("click", async () => {
+  const fileInput = document.getElementById("ord-xlsx-file");
+  const statusEl = document.getElementById("ord-xlsx-status");
+  statusEl.className = "hint"; statusEl.textContent = "";
+  if (!fileInput.files[0]) { statusEl.textContent = "xlsxファイルを選んでください"; statusEl.className = "hint ng"; return; }
+  const token = getToken();
+  statusEl.textContent = "取り込み中...";
+  try {
+    const buf = await fileInput.files[0].arrayBuffer();
+    const r = await fetch("/api/import", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/octet-stream" },
+      body: buf,
+    });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = "成功しました: " + (data.message || "取り込み完了");
     statusEl.className = "hint ok";
     await loadAll();
   } catch (e) {
