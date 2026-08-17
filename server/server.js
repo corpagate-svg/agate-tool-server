@@ -800,12 +800,12 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     <div class="row2">
       <div class="panel">
-        <h2>月次推移(収益・仕入・利益)</h2>
+        <h2>月次推移(受取額・仕入回収・純利益)</h2>
         <div class="panel-body">
           <div class="legend">
-            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-rev)"></span>収益</span>
-            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-cost)"></span>仕入価格</span>
-            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-prof)"></span>最終利益</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-rev)"></span>受取額</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-cost)"></span>仕入回収額</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:var(--series-prof)"></span>純利益</span>
           </div>
           <svg id="chart-monthly" viewBox="0 0 780 300" width="100%"></svg>
         </div>
@@ -819,8 +819,8 @@ const DASHBOARD_PAGE = `<!doctype html>
     </div>
 
     <div class="panel">
-      <h2>サイト別 収益</h2>
-      <p class="desc">出品先サイトごとの収益合計(円)</p>
+      <h2>サイト別 受取額</h2>
+      <p class="desc">出品先サイトごとの受取額合計(円)</p>
       <div class="panel-body">
         <svg id="chart-site" viewBox="0 0 780 220" width="100%"></svg>
       </div>
@@ -831,7 +831,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p class="desc">最終利益が大きかった注文(サーバー上の最新データ)</p>
       <div class="panel-body table-scroll">
         <table>
-          <thead><tr><th>日付</th><th>サイト</th><th>商品メモ</th><th class="num">収益(円)</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
+          <thead><tr><th>日付</th><th>サイト</th><th>商品メモ</th><th class="num">総個数</th><th class="num">収益(円)</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
           <tbody id="top10-body"></tbody>
         </table>
       </div>
@@ -1022,7 +1022,7 @@ function renderKpis() {
     .slice().sort((a, b) => Number(b[13]) - Number(a[13])).slice(0, 10);
   document.getElementById("top10-body").innerHTML = top10.map(r =>
     "<tr><td>" + (r[1] || "") + "</td><td><span class='site-chip'>" + (r[2] || "不明") + "</span></td><td class='truncate' title='" + (String(r[3] || "").replace(/'/g, "&#39;")) + "'>" + (r[3] || "") +
-    "</td><td class='num'>" + fmt(r[8]) + "</td><td class='num profit-cell" + (Number(r[13]) < 0 ? " bad" : "") + "'>" + fmt(r[13]) +
+    "</td><td class='num'>" + fmt(r[4]) + "</td><td class='num'>" + fmt(r[8]) + "</td><td class='num profit-cell" + (Number(r[13]) < 0 ? " bad" : "") + "'>" + fmt(r[13]) +
     "</td><td class='num'>" + fmt(r[14], true) + "</td></tr>"
   ).join("");
 }
@@ -1083,7 +1083,7 @@ function renderMonthlyChart(monthly) {
   const n = monthly.length;
   const bw = innerW / n;
   const colors = { revenue: "var(--series-rev)", cost: "var(--series-cost)", profit: "var(--series-prof)" };
-  const labels = { revenue: "収益", cost: "仕入", profit: "最終利益" };
+  const labels = { revenue: "受取額", cost: "仕入回収額", profit: "純利益" };
 
   for (let i = 0; i <= 4; i++) {
     const y = padT + innerH - (innerH * i) / 4;
@@ -1182,7 +1182,7 @@ function renderSiteChart() {
     const y = padT + i * bh + bh * 0.15;
     const w = (val / maxV) * innerW;
     const rect = svgNode("rect", { x: padL, y: y, width: Math.max(1, w), height: bh * 0.7, fill: "var(--series-rev)", rx: 2, class: "bar-hit" });
-    rect.addEventListener("mousemove", (evt) => showTooltip(evt, "<b>" + site + "</b><br>収益: ¥" + fmt(Math.round(val))));
+    rect.addEventListener("mousemove", (evt) => showTooltip(evt, "<b>" + site + "</b><br>受取額: ¥" + fmt(Math.round(val))));
     rect.addEventListener("mouseleave", hideTooltip);
     svg.appendChild(rect);
     const label = svgNode("text", { x: padL - 8, y: y + bh * 0.35 + 4, "text-anchor": "end", class: "axis-label" });
