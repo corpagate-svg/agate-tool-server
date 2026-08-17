@@ -776,7 +776,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p class="desc">サーバー上の最新データから自動集計(注文の日付ごとに月単位でまとめています)</p>
       <div class="panel-body table-scroll">
         <table>
-          <thead><tr><th>月</th><th class="num">件数</th><th class="num">収益(円)</th><th class="num">仕入(円)</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
+          <thead><tr><th>月</th><th class="num">件数</th><th class="num">収益(円)</th><th class="num">原価回収額</th><th class="num">最終利益(円)</th><th class="num">利益率</th></tr></thead>
           <tbody id="monthly-body"></tbody>
         </table>
       </div>
