@@ -982,9 +982,9 @@ async function loadAll() {
 function renderKpis() {
   let revenue = 0, cost = 0, profit = 0, profitKnown = 0;
   orderRows.forEach(r => {
-    revenue += Number(r[7]) || 0;
-    cost += Number(r[9]) || 0;
-    if (r[12] !== "" && r[12] !== null && r[12] !== undefined) { profit += Number(r[12]); profitKnown++; }
+    revenue += Number(r[8]) || 0;
+    cost += Number(r[10]) || 0;
+    if (r[13] !== "" && r[13] !== null && r[13] !== undefined) { profit += Number(r[13]); profitKnown++; }
   });
   const margin = revenue !== 0 ? profit / revenue : 0;
   const tiles = [
@@ -998,12 +998,12 @@ function renderKpis() {
     '<div class="kpi"><div class="label">' + t.label + '</div><div class="value' + (t.cls ? " " + t.cls : "") + '">' + t.value + '</div></div>'
   ).join("");
 
-  const top10 = orderRows.filter(r => r[12] !== "" && r[12] !== null && r[12] !== undefined)
-    .slice().sort((a, b) => Number(b[12]) - Number(a[12])).slice(0, 10);
+  const top10 = orderRows.filter(r => r[13] !== "" && r[13] !== null && r[13] !== undefined)
+    .slice().sort((a, b) => Number(b[13]) - Number(a[13])).slice(0, 10);
   document.getElementById("top10-body").innerHTML = top10.map(r =>
     "<tr><td>" + (r[1] || "") + "</td><td><span class='site-chip'>" + (r[2] || "不明") + "</span></td><td>" + (r[3] || "") +
-    "</td><td class='num'>" + fmt(r[7]) + "</td><td class='num profit-cell" + (Number(r[12]) < 0 ? " bad" : "") + "'>" + fmt(r[12]) +
-    "</td><td class='num'>" + fmt(r[13], true) + "</td></tr>"
+    "</td><td class='num'>" + fmt(r[8]) + "</td><td class='num profit-cell" + (Number(r[13]) < 0 ? " bad" : "") + "'>" + fmt(r[13]) +
+    "</td><td class='num'>" + fmt(r[14], true) + "</td></tr>"
   ).join("");
 }
 
@@ -1015,9 +1015,9 @@ function computeMonthly() {
     const month = d.slice(0, 7);
     if (!map.has(month)) map.set(month, { revenue: 0, cost: 0, profit: 0, count: 0 });
     const m = map.get(month);
-    m.revenue += Number(r[7]) || 0;
-    m.cost += Number(r[9]) || 0;
-    if (r[12] !== "" && r[12] !== null && r[12] !== undefined) m.profit += Number(r[12]);
+    m.revenue += Number(r[8]) || 0;
+    m.cost += Number(r[10]) || 0;
+    if (r[13] !== "" && r[13] !== null && r[13] !== undefined) m.profit += Number(r[13]);
     m.count++;
   });
   return Array.from(map.keys()).sort().map((k) => {
@@ -1140,7 +1140,7 @@ function renderSiteChart() {
   const bySite = new Map();
   orderRows.forEach((r) => {
     const site = r[2] || "不明";
-    bySite.set(site, (bySite.get(site) || 0) + (Number(r[7]) || 0));
+    bySite.set(site, (bySite.get(site) || 0) + (Number(r[8]) || 0));
   });
   const entries = Array.from(bySite.entries()).sort((a, b) => b[1] - a[1]);
   if (!entries.length) return;
