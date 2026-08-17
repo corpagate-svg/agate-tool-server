@@ -11,11 +11,11 @@ const LEDGER_PATH = path.join(DATA_DIR, "売上管理表.xlsx");
 const INVENTORY_PATH = path.join(DATA_DIR, "在庫管理表.xlsx");
 
 const HEADERS = [
-  "注文番号", "日付", "サイト", "商品メモ", "商品ID",
+  "注文番号", "日付", "サイト", "商品メモ", "数量", "商品ID",
   "収益USD", "ドル円レート", "収益円", "手数料(円)",
   "仕入原価(円)", "送料(円)", "梱包費(円)", "最終利益(円)", "利益率",
 ];
-const COL = { 注文番号: 1, 日付: 2, サイト: 3, 商品メモ: 4, 商品ID: 5, 収益USD: 6, ドル円レート: 7, 収益円: 8, 手数料: 9, 仕入原価: 10, 送料: 11, 梱包費: 12, 最終利益: 13, 利益率: 14 };
+const COL = { 注文番号: 1, 日付: 2, サイト: 3, 商品メモ: 4, 数量: 5, 商品ID: 6, 収益USD: 7, ドル円レート: 8, 収益円: 9, 手数料: 10, 仕入原価: 11, 送料: 12, 梱包費: 13, 最終利益: 14, 利益率: 15 };
 
 const INV_HEADERS = [
   "商品ID", "商品名", "バリエーション詳細", "在庫数(現物)", "出品国数", "在庫数不一致",
@@ -209,7 +209,7 @@ async function handleAddOrder(req, res) {
   const wb = await loadWorkbook();
   const ws = getOrCreateMonthSheet(wb, body["日付"]);
   ws.addRow([
-    body["注文番号"], body["日付"], body["サイト"], body["商品メモ"], body["商品ID"] || "",
+    body["注文番号"], body["日付"], body["サイト"], body["商品メモ"], numOrNull(body["数量"]) === null ? "" : numOrNull(body["数量"]), body["商品ID"] || "",
     usd, rate, Math.round(revenueJpy), fee,
     cost === null ? "" : cost, shipping === null ? "" : shipping, packing === null ? "" : packing,
     profit, margin,
@@ -249,6 +249,7 @@ async function handlePatchOrder(req, res) {
       if (usd !== null) row.getCell(COL.収益USD).value = usd;
       if (rate !== null) row.getCell(COL.ドル円レート).value = rate;
       if ("商品メモ" in body) row.getCell(COL.商品メモ).value = body["商品メモ"];
+      if ("数量" in body) { const q = numOrNull(body["数量"]); row.getCell(COL.数量).value = q === null ? "" : q; }
       row.getCell(COL.収益円).value = Math.round(revenueJpy);
       row.getCell(COL.手数料).value = fee;
       row.getCell(COL.仕入原価).value = cost === null ? "" : cost;
@@ -870,7 +871,8 @@ const DASHBOARD_PAGE = `<!doctype html>
             <label>仕入原価(円)<input id="ne-cost" type="number" step="any" placeholder="わかれば入力"></label>
             <label>送料(円)<input id="ne-shipping" type="number" step="any" placeholder="わかれば入力"></label>
             <label>梱包費(円)<input id="ne-packing" type="number" step="any" placeholder="わかれば入力" value="50"></label>
-            <label style="grid-column:span 3;">商品メモ<input id="ne-note" type="text"></label>
+            <label>数量<input id="ne-qty" type="number" step="1"></label>
+            <label style="grid-column:span 2;">商品メモ<input id="ne-note" type="text"></label>
           </div>
           <div class="browser-toolbar" id="ne-submit-row" style="display:none;">
             <button class="btn" id="ne-submit-btn">この内容で登録する</button>
@@ -903,11 +905,11 @@ const DASHBOARD_PAGE = `<!doctype html>
 </div>
 <div class="viz-tooltip" id="tooltip"></div>
 <script>
-const ORD_HEADERS = ["注文番号","日付","サイト","商品メモ","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
-const ORD_EDITABLE = ["収益USD","ドル円レート","仕入原価(円)","送料(円)","梱包費(円)"];
+const ORD_HEADERS = ["注文番号","日付","サイト","商品メモ","数量","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
+const ORD_EDITABLE = ["収益USD","ドル円レート","数量","仕入原価(円)","送料(円)","梱包費(円)"];
 const ORD_EDITABLE_TEXT = ["商品メモ"];
-const ORD_NUM_COLS = ["収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
-const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円", "商品メモ": "商品メモ" };
+const ORD_NUM_COLS = ["収益USD","ドル円レート","数量","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
+const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円", "商品メモ": "商品メモ", "数量": "数量" };
 const INV_NUM_COLS = ["在庫数(現物)","出品国数","US価格(USD)","US累計売却数","UK価格(GBP)","UK累計売却数","AU価格(AUD)","AU累計売却数","仕入価格(円)"];
 const INV_EDITABLE_TEXT = ["仕入日","仕入先","備考"];
 const INV_EDITABLE_NUM = ["仕入価格(円)"];
@@ -1536,7 +1538,7 @@ const MONTH_MAP = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug:
 
 function parseOrderText(text) {
   const lines = text.split(/\\r?\\n/).map((l) => l.trim());
-  const result = { orderNo: "", date: "", site: "", usd: "", note: "" };
+  const result = { orderNo: "", date: "", site: "", usd: "", note: "", qty: "" };
 
   for (const line of lines) {
     const m = /^(\\d{1,3}-\\d{4,7}-\\d{4,7})$/.exec(line);
@@ -1580,6 +1582,15 @@ function parseOrderText(text) {
   }
   result.note = titles.join(" / ");
 
+  let qtySum = 0, qtyFound = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] === "数量" && i + 1 < lines.length) {
+      const qm = /^(\\d+)$/.exec(lines[i + 1]);
+      if (qm) { qtySum += Number(qm[1]); qtyFound = true; }
+    }
+  }
+  if (qtyFound) result.qty = String(qtySum);
+
   return result;
 }
 
@@ -1605,6 +1616,7 @@ document.getElementById("ne-parse-btn").addEventListener("click", () => {
   document.getElementById("ne-site").value = parsed.site;
   document.getElementById("ne-usd").value = parsed.usd;
   document.getElementById("ne-note").value = parsed.note;
+  document.getElementById("ne-qty").value = parsed.qty;
   document.getElementById("ne-cost").value = "";
   document.getElementById("ne-shipping").value = "";
   document.getElementById("ne-packing").value = "50";
@@ -1628,9 +1640,11 @@ document.getElementById("ne-submit-btn").addEventListener("click", async () => {
   const cost = document.getElementById("ne-cost").value;
   const shipping = document.getElementById("ne-shipping").value;
   const packing = document.getElementById("ne-packing").value;
+  const qty = document.getElementById("ne-qty").value;
   if (cost !== "") body.仕入原価円 = cost;
   if (shipping !== "") body.送料円 = shipping;
   if (packing !== "") body.梱包費円 = packing;
+  if (qty !== "") body.数量 = qty;
   if (!body.注文番号 || !body.日付 || !body.収益USD || !body.ドル円レート) {
     statusEl.textContent = "注文番号・日付・収益USD・ドル円レートは必須です";
     statusEl.className = "hint ng";
