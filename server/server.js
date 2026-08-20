@@ -87,11 +87,22 @@ function getOrCreateMonthSheet(wb, dateStr) {
 function isAuthorized(req) {
   const auth = req.headers["authorization"] || "";
   const m = /^Bearer (.+)$/.exec(auth);
-  if (!m) return false;
-  const given = Buffer.from(m[1]);
+  let given = null;
+  if (m) {
+    given = m[1];
+  } else if (req.method === "GET") {
+    // GET専用: 外部ツールが簡単にポーリングできるよう、?token=... でも認証可能にする
+    try {
+      given = new URL(req.url, "http://localhost").searchParams.get("token");
+    } catch (e) {
+      given = null;
+    }
+  }
+  if (!given) return false;
+  const givenBuf = Buffer.from(given);
   const expected = Buffer.from(API_TOKEN);
-  if (given.length !== expected.length) return false;
-  return crypto.timingSafeEqual(given, expected);
+  if (givenBuf.length !== expected.length) return false;
+  return crypto.timingSafeEqual(givenBuf, expected);
 }
 
 function parseCsv(text) {
@@ -1907,32 +1918,39 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  if (req.method === "GET" && req.url === "/") {
+  let pathname = req.url;
+  try {
+    pathname = new URL(req.url, "http://localhost").pathname;
+  } catch (e) {
+    // フォールバック: req.urlをそのまま使う
+  }
+
+  if (req.method === "GET" && pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     return res.end("agate-tool-server: OK");
   }
-  if (req.method === "GET" && (req.url === "/orders" || req.url === "/dashboard")) {
+  if (req.method === "GET" && (pathname === "/orders" || pathname === "/dashboard")) {
     return sendHtml(res, DASHBOARD_PAGE);
   }
 
   const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary"];
-  if (protectedRoutes.includes(req.url) && !isAuthorized(req)) {
+  if (protectedRoutes.includes(pathname) && !isAuthorized(req)) {
     return sendJson(res, 401, { error: "認証に失敗しました(トークンを確認してください)" });
   }
 
   try {
-    if (req.method === "POST" && req.url === "/api/orders") return await handleAddOrder(req, res);
-    if (req.method === "PATCH" && req.url === "/api/orders") return await handlePatchOrder(req, res);
-    if (req.method === "GET" && req.url === "/api/orders") return await handleListOrders(req, res);
-    if (req.method === "GET" && req.url === "/download/売上管理表.xlsx") return await handleDownload(req, res);
-    if (req.method === "POST" && req.url === "/api/import") return await handleImport(req, res);
-    if (req.method === "GET" && req.url === "/api/inventory") return await handleListInventory(req, res);
-    if (req.method === "GET" && req.url === "/api/summary") return await handleSummary(req, res);
-    if (req.method === "PATCH" && req.url === "/api/inventory") return await handlePatchInventory(req, res);
-    if (req.method === "DELETE" && req.url === "/api/orders") return await handleDeleteOrders(req, res);
-    if (req.method === "DELETE" && req.url === "/api/inventory") return await handleDeleteInventory(req, res);
-    if (req.method === "POST" && req.url === "/api/import/inventory") return await handleImportInventory(req, res);
-    if (req.method === "POST" && req.url === "/api/inventory/rebuild") return await handleRebuildInventory(req, res);
+    if (req.method === "POST" && pathname === "/api/orders") return await handleAddOrder(req, res);
+    if (req.method === "PATCH" && pathname === "/api/orders") return await handlePatchOrder(req, res);
+    if (req.method === "GET" && pathname === "/api/orders") return await handleListOrders(req, res);
+    if (req.method === "GET" && pathname === "/download/売上管理表.xlsx") return await handleDownload(req, res);
+    if (req.method === "POST" && pathname === "/api/import") return await handleImport(req, res);
+    if (req.method === "GET" && pathname === "/api/inventory") return await handleListInventory(req, res);
+    if (req.method === "GET" && pathname === "/api/summary") return await handleSummary(req, res);
+    if (req.method === "PATCH" && pathname === "/api/inventory") return await handlePatchInventory(req, res);
+    if (req.method === "DELETE" && pathname === "/api/orders") return await handleDeleteOrders(req, res);
+    if (req.method === "DELETE" && pathname === "/api/inventory") return await handleDeleteInventory(req, res);
+    if (req.method === "POST" && pathname === "/api/import/inventory") return await handleImportInventory(req, res);
+    if (req.method === "POST" && pathname === "/api/inventory/rebuild") return await handleRebuildInventory(req, res);
   } catch (e) {
     console.error(e);
     return sendJson(res, 500, { error: "サーバー内部でエラーが発生しました" });
