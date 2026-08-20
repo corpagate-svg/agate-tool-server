@@ -370,6 +370,107 @@ async function handleListInventory(req, res) {
   sendJson(res, 200, { headers: INV_HEADERS, rows });
 }
 
+async function handleSummary(req, res) {
+  const wb = await loadWorkbook();
+  const orderRows = [];
+  for (const ws of dataSheets(wb)) {
+    ws.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return;
+      if (!isOrderRow(row)) return;
+      orderRows.push(row.values.slice(1, HEADERS.length + 1));
+    });
+  }
+
+  const invWb = await loadInventoryWorkbook();
+  const invWs = invWb.getWorksheet("在庫管理表") || invWb.worksheets[0];
+  const invRows = [];
+  invWs.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    invRows.push(row.values.slice(1, INV_HEADERS.length + 1));
+  });
+
+  let totalRevenue = 0, totalCost = 0, totalProfit = 0, totalQty = 0;
+  orderRows.forEach((r) => {
+    totalRevenue += Number(r[8]) || 0;
+    totalCost += Number(r[10]) || 0;
+    totalProfit += Number(r[13]) || 0;
+    totalQty += Number(r[4]) || 0;
+  });
+
+  const monthlyMap = new Map();
+  orderRows.forEach((r) => {
+    const ym = String(r[1] || "").slice(0, 7);
+    if (!ym) return;
+    if (!monthlyMap.has(ym)) monthlyMap.set(ym, { month: ym, count: 0, qty: 0, revenue: 0, cost: 0, profit: 0 });
+    const m = monthlyMap.get(ym);
+    m.count += 1;
+    m.qty += Number(r[4]) || 0;
+    m.revenue += Number(r[8]) || 0;
+    m.cost += Number(r[10]) || 0;
+    m.profit += Number(r[13]) || 0;
+  });
+  const monthly = Array.from(monthlyMap.values())
+    .sort((a, b) => a.month.localeCompare(b.month))
+    .map((m) => ({
+      month: m.month, count: m.count, qty: m.qty,
+      revenue: Math.round(m.revenue), cost: Math.round(m.cost), profit: Math.round(m.profit),
+      margin: m.revenue ? Math.round((m.profit / m.revenue) * 1000) / 1000 : null,
+    }));
+
+  const siteMap = new Map();
+  orderRows.forEach((r) => {
+    const site = r[2] || "不明";
+    siteMap.set(site, (siteMap.get(site) || 0) + (Number(r[8]) || 0));
+  });
+  const bySite = Array.from(siteMap.entries())
+    .map(([site, revenue]) => ({ site, revenue: Math.round(revenue) }))
+    .sort((a, b) => b.revenue - a.revenue);
+
+  let inventoryValue = 0, pricedCount = 0;
+  invRows.forEach((r) => {
+    const price = Number(r[15]);
+    const qty = Number(r[3]) || 0;
+    if (price > 0) {
+      inventoryValue += price * qty;
+      pricedCount += 1;
+    }
+  });
+
+  const recentOrders = orderRows
+    .slice()
+    .sort((a, b) => String(b[1] || "").localeCompare(String(a[1] || "")))
+    .slice(0, 30)
+    .map((r) => ({
+      注文番号: r[0], 日付: r[1], サイト: r[2], 商品メモ: r[3], 数量: r[4],
+      収益円: r[8], 最終利益円: r[13], 利益率: r[14],
+    }));
+
+  sendJson(res, 200, {
+    generatedAt: new Date().toISOString(),
+    summary: {
+      totalOrders: orderRows.length,
+      totalQty,
+      totalRevenue: Math.round(totalRevenue),
+      totalCost: Math.round(totalCost),
+      totalProfit: Math.round(totalProfit),
+      totalMargin: totalRevenue ? Math.round((totalProfit / totalRevenue) * 1000) / 1000 : null,
+    },
+    monthly,
+    bySite,
+    byCategory: null,
+    inventory: {
+      totalValue: Math.round(inventoryValue),
+      pricedProductCount: pricedCount,
+      totalProductCount: invRows.length,
+    },
+    recentOrders,
+    notes: [
+      "byCategory は商品カテゴリ分類のデータが現状ないため未対応です(null)。",
+      "bySite は eBay出品先サイト(US/UK/AU等)ごとの集計です。Shopee連携実装後はそちらのサイトもここに含まれます。",
+    ],
+  });
+}
+
 async function handlePatchInventory(req, res) {
   let body;
   try {
@@ -425,6 +526,30 @@ function normText(s) {
   return String(s || "").trim().replace(/\s+/g, " ");
 }
 
+const SHIPPING_NOTE_SUFFIXES = [
+  "【Extra Items Ship FREE】",
+  "【FlaExtra Items Ship FREE】",
+  "【Flat S/H】",
+  "(Flat rate after first)",
+];
+function stripShippingNote(title) {
+  let t = String(title || "").trim();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suf of SHIPPING_NOTE_SUFFIXES) {
+      if (t.endsWith(suf)) {
+        t = t.slice(0, -suf.length).trim();
+        changed = true;
+      }
+    }
+  }
+  return t;
+}
+function nameKey(title, variation) {
+  return normText(stripShippingNote(title)) + " || " + normText(variation);
+}
+
 const MONTH_ABBR_EN = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
 function parseEbayStartDate(s) {
   const m = /^([A-Za-z]{3})-(\d{1,2})-(\d{2})/.exec(String(s || ""));
@@ -458,7 +583,7 @@ async function handleRebuildInventory(req, res) {
     if (Number.isFinite(idNum)) maxId = Math.max(maxId, idNum);
     const fullRow = [];
     for (let c = 1; c <= INV_HEADERS.length; c++) fullRow.push(row.getCell(c).value);
-    const key = normText(fullRow[1]) + " || " + normText(fullRow[2]);
+    const key = nameKey(fullRow[1], fullRow[2]);
     saved.set(key, {
       商品ID: pid,
       fullRow,
@@ -468,7 +593,7 @@ async function handleRebuildInventory(req, res) {
 
   const groups = new Map();
   records.forEach((r) => {
-    const key = normText(r["Title"]) + " || " + normText(r["Variation details"]);
+    const key = nameKey(r["Title"], r["Variation details"]);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   });
@@ -483,18 +608,26 @@ async function handleRebuildInventory(req, res) {
   const today = new Date().toISOString().slice(0, 10);
   const rowsOut = [];
   const newProducts = [];
+  const noUsSkipped = [];
   let nextId = maxId + 1;
-  const newKeySet = new Set(mainKeys);
+  const newKeySet = new Set();
 
   for (const key of mainKeys) {
     const items = groups.get(key);
-    const first = items[0];
     const qtys = new Set(items.map((it) => it["Available quantity"]));
     const bySite = {};
     items.forEach((it) => {
       const site = it["Listing site"];
       if (["US", "UK", "AU"].includes(site) && !bySite[site]) bySite[site] = it;
     });
+
+    // USに出品していないものは商品リストに載せない(USを基準にUK/AUへ転送している運用のため)
+    if (!bySite.US) {
+      noUsSkipped.push(...items);
+      continue;
+    }
+    newKeySet.add(key);
+    const anchor = bySite.US;
     const siteCount = Object.keys(bySite).length;
 
     let pid;
@@ -507,15 +640,15 @@ async function handleRebuildInventory(req, res) {
     } else {
       pid = "P" + String(nextId).padStart(4, "0");
       nextId++;
-      newProducts.push([pid, first["Title"]]);
+      newProducts.push([pid, anchor["Title"]]);
     }
-    if (!purchaseDate) purchaseDate = parseEbayStartDate(first["Start date"]);
+    if (!purchaseDate) purchaseDate = parseEbayStartDate(anchor["Start date"]);
 
     rowsOut.push({
       row: [
-        pid, normText(first["Title"]), normText(first["Variation details"]) || null, intOrNullCsv(first["Available quantity"]),
+        pid, normText(stripShippingNote(anchor["Title"])), normText(anchor["Variation details"]) || null, intOrNullCsv(anchor["Available quantity"]),
         siteCount, qtys.size > 1 ? "要確認" : "",
-        bySite.US ? numOrNullCsv(bySite.US["Item number"]) : null, bySite.US ? numOrNullCsv(bySite.US["Current price"]) : null, bySite.US ? intOrNullCsv(bySite.US["Sold quantity"]) : null,
+        numOrNullCsv(bySite.US["Item number"]), numOrNullCsv(bySite.US["Current price"]), intOrNullCsv(bySite.US["Sold quantity"]),
         bySite.UK ? numOrNullCsv(bySite.UK["Item number"]) : null, bySite.UK ? numOrNullCsv(bySite.UK["Current price"]) : null, bySite.UK ? intOrNullCsv(bySite.UK["Sold quantity"]) : null,
         bySite.AU ? numOrNullCsv(bySite.AU["Item number"]) : null, bySite.AU ? numOrNullCsv(bySite.AU["Current price"]) : null, bySite.AU ? intOrNullCsv(bySite.AU["Sold quantity"]) : null,
         purchasePrice, purchaseDate, purchaseFrom, note,
@@ -592,6 +725,7 @@ async function handleRebuildInventory(req, res) {
     "・黄色でハイライトした行は「3カ国揃っていない」または「在庫数が国ごとに違う」商品です。",
     "・赤色でハイライトした行は、出品CSVに見当たらなかった商品です。削除されたか、売り切れて自動終了した可能性があります。",
     "・「要確認(重複出品)」シートには、同じ名前の出品が3件を超えて存在した商品を出品ID単位でそのまま残しています。",
+    "・USに出品されていない商品(UK/AUのみ)は、転送漏れ・名称不一致とみなし商品リストには含めていません。",
     "・仕入価格・仕入日・仕入先・備考は、前回入力済みだった内容をそのまま引き継いでいます。",
   ];
   notes.forEach((n, i) => {
@@ -612,6 +746,7 @@ async function handleRebuildInventory(req, res) {
     removedNew: removedNewCount,
     removedStill: removedStillCount,
     anomalous: anomalous.length,
+    noUsSkipped: noUsSkipped.length,
   });
 }
 
@@ -1780,7 +1915,7 @@ const server = http.createServer(async (req, res) => {
     return sendHtml(res, DASHBOARD_PAGE);
   }
 
-  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild"];
+  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary"];
   if (protectedRoutes.includes(req.url) && !isAuthorized(req)) {
     return sendJson(res, 401, { error: "認証に失敗しました(トークンを確認してください)" });
   }
@@ -1792,6 +1927,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/download/売上管理表.xlsx") return await handleDownload(req, res);
     if (req.method === "POST" && req.url === "/api/import") return await handleImport(req, res);
     if (req.method === "GET" && req.url === "/api/inventory") return await handleListInventory(req, res);
+    if (req.method === "GET" && req.url === "/api/summary") return await handleSummary(req, res);
     if (req.method === "PATCH" && req.url === "/api/inventory") return await handlePatchInventory(req, res);
     if (req.method === "DELETE" && req.url === "/api/orders") return await handleDeleteOrders(req, res);
     if (req.method === "DELETE" && req.url === "/api/inventory") return await handleDeleteInventory(req, res);
