@@ -10,6 +10,13 @@ const DATA_DIR = path.join(__dirname, "..", "data");
 const LEDGER_PATH = path.join(DATA_DIR, "売上管理表.xlsx");
 const INVENTORY_PATH = path.join(DATA_DIR, "在庫管理表.xlsx");
 
+// eBay連携(Inventory API・読み取り専用。sell.inventory.readonly のみ使用。個人情報は一切取得しない)
+const EBAY_APP_ID = process.env.EBAY_APP_ID || "";
+const EBAY_CERT_ID = process.env.EBAY_CERT_ID || "";
+const EBAY_RUNAME = process.env.EBAY_RUNAME || "";
+const EBAY_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.inventory.readonly";
+const EBAY_TOKEN_PATH = path.join(DATA_DIR, "ebay_token.json");
+
 const HEADERS = [
   "注文番号", "日付", "サイト", "商品メモ", "数量", "商品ID",
   "収益USD", "ドル円レート", "収益円", "手数料(円)",
@@ -103,6 +110,149 @@ function isAuthorized(req) {
   const expected = Buffer.from(API_TOKEN);
   if (givenBuf.length !== expected.length) return false;
   return crypto.timingSafeEqual(givenBuf, expected);
+}
+
+// ---- eBay連携(読み取り専用) ----
+
+function loadEbayToken() {
+  try {
+    return JSON.parse(fs.readFileSync(EBAY_TOKEN_PATH, "utf8"));
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveEbayToken(data) {
+  fs.writeFileSync(EBAY_TOKEN_PATH, JSON.stringify(data, null, 2));
+}
+
+let ebayAccessTokenCache = { token: null, expiresAt: 0 };
+
+async function ebayTokenRequest(params) {
+  const basic = Buffer.from(`${EBAY_APP_ID}:${EBAY_CERT_ID}`).toString("base64");
+  const res = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${basic}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams(params).toString(),
+  });
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`eBayトークン取得に失敗しました(${res.status}): ${text.slice(0, 200)}`);
+  }
+  if (!res.ok) {
+    throw new Error(data.error_description || data.error || `eBayトークン取得に失敗しました(${res.status})`);
+  }
+  return data;
+}
+
+async function ebayExchangeCode(code) {
+  return ebayTokenRequest({ grant_type: "authorization_code", code, redirect_uri: EBAY_RUNAME });
+}
+
+async function ebayRefreshAccessToken(refreshToken) {
+  return ebayTokenRequest({ grant_type: "refresh_token", refresh_token: refreshToken, scope: EBAY_SCOPE });
+}
+
+async function getEbayAccessToken() {
+  const now = Date.now();
+  if (ebayAccessTokenCache.token && ebayAccessTokenCache.expiresAt > now + 60 * 1000) {
+    return ebayAccessTokenCache.token;
+  }
+  const stored = loadEbayToken();
+  if (!stored || !stored.refresh_token) {
+    throw new Error("eBayとの連携がまだ完了していません(/ebay/connect から認可を行ってください)");
+  }
+  const data = await ebayRefreshAccessToken(stored.refresh_token);
+  ebayAccessTokenCache = { token: data.access_token, expiresAt: now + data.expires_in * 1000 };
+  return data.access_token;
+}
+
+async function ebayApiGet(pathAndQuery) {
+  const token = await getEbayAccessToken();
+  const res = await fetch(`https://api.ebay.com${pathAndQuery}`, {
+    headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+  });
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`eBay APIエラー(${res.status}): ${text.slice(0, 200)}`);
+  }
+  if (!res.ok) {
+    throw new Error(data.errors ? JSON.stringify(data.errors) : `eBay APIエラー(${res.status})`);
+  }
+  return data;
+}
+
+async function fetchAllEbayInventoryItems() {
+  const items = [];
+  const limit = 100;
+  let offset = 0;
+  while (true) {
+    const data = await ebayApiGet(`/sell/inventory/v1/inventory_item?limit=${limit}&offset=${offset}`);
+    const batch = data.inventoryItems || [];
+    items.push(...batch);
+    if (batch.length < limit) break;
+    offset += limit;
+  }
+  return items;
+}
+
+async function handleEbayConnect(req, res) {
+  if (!EBAY_APP_ID || !EBAY_RUNAME) {
+    return sendJson(res, 500, { error: "EBAY_APP_ID / EBAY_RUNAME が設定されていません(.envを確認してください)" });
+  }
+  const params = new URLSearchParams({
+    client_id: EBAY_APP_ID,
+    redirect_uri: EBAY_RUNAME,
+    response_type: "code",
+    scope: EBAY_SCOPE,
+  });
+  res.writeHead(302, { Location: `https://auth.ebay.com/oauth2/authorize?${params.toString()}` });
+  res.end();
+}
+
+async function handleEbayCallback(req, res) {
+  const urlObj = new URL(req.url, "http://localhost");
+  const code = urlObj.searchParams.get("code");
+  if (!code) {
+    return sendHtml(res, "<p>認可コードが見つかりませんでした。もう一度 /ebay/connect からやり直してください。</p>");
+  }
+  try {
+    const data = await ebayExchangeCode(code);
+    saveEbayToken({
+      refresh_token: data.refresh_token,
+      refresh_token_expires_in: data.refresh_token_expires_in,
+      connected_at: new Date().toISOString(),
+    });
+    ebayAccessTokenCache = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
+    return sendHtml(res, "<p>eBayとの連携が完了しました。このタブは閉じて構いません。</p>");
+  } catch (e) {
+    return sendHtml(res, "<p>連携に失敗しました: " + String((e && e.message) || e) + "</p>");
+  }
+}
+
+async function handleEbayInventory(req, res) {
+  try {
+    const items = await fetchAllEbayInventoryItems();
+    const rows = items.map((it) => ({
+      sku: it.sku,
+      title: it.product && it.product.title,
+      description: it.product && it.product.description,
+      condition: it.condition,
+      quantity: it.availability && it.availability.shipToLocationAvailability && it.availability.shipToLocationAvailability.quantity,
+    }));
+    sendJson(res, 200, { count: rows.length, items: rows });
+  } catch (e) {
+    sendJson(res, 502, { error: String((e && e.message) || e) });
+  }
 }
 
 function parseCsv(text) {
@@ -919,6 +1069,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     </div>
     <div class="auth-row">
       <input id="token" type="password" placeholder="アクセストークン">
+      <button class="btn" id="toggleToken" type="button">表示</button>
       <button class="btn" id="saveToken">トークンを記憶</button>
       <span id="status"></span>
     </div>
@@ -1933,12 +2084,15 @@ const server = http.createServer(async (req, res) => {
     return sendHtml(res, DASHBOARD_PAGE);
   }
 
-  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary"];
+  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary", "/ebay/connect", "/api/ebay/inventory"];
   if (protectedRoutes.includes(pathname) && !isAuthorized(req)) {
     return sendJson(res, 401, { error: "認証に失敗しました(トークンを確認してください)" });
   }
 
   try {
+    if (req.method === "GET" && pathname === "/ebay/connect") return await handleEbayConnect(req, res);
+    if (req.method === "GET" && pathname === "/ebay/callback") return await handleEbayCallback(req, res);
+    if (req.method === "GET" && pathname === "/api/ebay/inventory") return await handleEbayInventory(req, res);
     if (req.method === "POST" && pathname === "/api/orders") return await handleAddOrder(req, res);
     if (req.method === "PATCH" && pathname === "/api/orders") return await handlePatchOrder(req, res);
     if (req.method === "GET" && pathname === "/api/orders") return await handleListOrders(req, res);
