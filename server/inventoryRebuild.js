@@ -120,26 +120,37 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
 
     let pid;
     let purchasePrice = null, purchaseDate = null, purchaseFrom = null, note = "";
+    let realStock = null, realStockConfirmedAt = null, stocktakeQty = null, stocktakeAt = null;
     if (saved.has(key)) {
       const s = saved.get(key);
       pid = s.商品ID;
       purchasePrice = s.fullRow[15]; purchaseDate = s.fullRow[16]; purchaseFrom = s.fullRow[17];
       note = s.wasRemoved ? "" : (s.fullRow[18] || "");
+      realStock = s.fullRow[21] ?? null;
+      realStockConfirmedAt = s.fullRow[22] ?? null;
+      stocktakeQty = s.fullRow[23] ?? null;
+      stocktakeAt = s.fullRow[24] ?? null;
     } else {
       pid = "P" + String(nextId).padStart(4, "0");
       nextId++;
       newProducts.push([pid, anchor["Title"]]);
     }
     if (!purchaseDate) purchaseDate = parseEbayStartDate(anchor["Start date"]);
+    const usQty = intOrNullCsv(anchor["Available quantity"]);
+    // リアル在庫は「当社が実際に保有する数量」の独自管理値。CSV再取込では上書きしない。
+    // ただし未設定(導入前・移行直後)の場合のみ、初期値としてeBayのUS在庫数をコピーする。
+    if (realStock === null || realStock === undefined) realStock = usQty;
 
     rowsOut.push({
       row: [
-        pid, normText(stripShippingNote(anchor["Title"])), normText(anchor["Variation details"]) || null, intOrNullCsv(anchor["Available quantity"]),
+        pid, normText(stripShippingNote(anchor["Title"])), normText(anchor["Variation details"]) || null, usQty,
         siteCount, qtys.size > 1 ? "要確認" : "",
         numOrNullCsv(bySite.US["Item number"]), numOrNullCsv(bySite.US["Current price"]), intOrNullCsv(bySite.US["Sold quantity"]),
         bySite.UK ? numOrNullCsv(bySite.UK["Item number"]) : null, bySite.UK ? numOrNullCsv(bySite.UK["Current price"]) : null, bySite.UK ? intOrNullCsv(bySite.UK["Sold quantity"]) : null,
         bySite.AU ? numOrNullCsv(bySite.AU["Item number"]) : null, bySite.AU ? numOrNullCsv(bySite.AU["Current price"]) : null, bySite.AU ? intOrNullCsv(bySite.AU["Sold quantity"]) : null,
         purchasePrice, purchaseDate, purchaseFrom, note,
+        bySite.UK ? intOrNullCsv(bySite.UK["Available quantity"]) : null, bySite.AU ? intOrNullCsv(bySite.AU["Available quantity"]) : null,
+        realStock, realStockConfirmedAt, stocktakeQty, stocktakeAt,
       ],
       status: "current",
       flag: siteCount < 3 || qtys.size > 1,
@@ -158,7 +169,10 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
       removedNewCount++;
     }
     const carried = s.fullRow.slice(0, 15);
-    rowsOut.push({ row: carried.concat([s.fullRow[15], s.fullRow[16], s.fullRow[17], note]), status: "removed" });
+    rowsOut.push({
+      row: carried.concat([s.fullRow[15], s.fullRow[16], s.fullRow[17], note]).concat(s.fullRow.slice(19, 25)),
+      status: "removed",
+    });
   }
 
   rowsOut.sort((a, b) => {
@@ -185,7 +199,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
       for (let c = 1; c <= INV_HEADERS.length; c++) excelRow.getCell(c).fill = fill;
     }
   });
-  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30];
+  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30, 12, 12, 12, 16, 12, 18];
   widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
   const ws2 = wb.addWorksheet("要確認(重複出品)");
@@ -215,6 +229,8 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
     "・「要確認(重複出品)」シートには、同じ名前の出品が3件を超えて存在した商品を出品ID単位でそのまま残しています。",
     "・USに出品されていない商品(UK/AUのみ)は、転送漏れ・名称不一致とみなし商品リストには含めていません。",
     "・仕入価格・仕入日・仕入先・備考は、前回入力済みだった内容をそのまま引き継いでいます。",
+    "・「リアル在庫」「リアル在庫確認日」「棚卸入力数量」「棚卸入力日時」は当社独自管理の値のため、このCSV再取込では一切上書きしません(前回の値をそのまま引き継ぎます)。",
+    "・「UK在庫数」「AU在庫数」は、eBay自己申告のCSV上の在庫数をそのまま反映したものです(リアル在庫とは別物です)。",
   ];
   notes.forEach((n, i) => {
     const cell = ws3.getCell(`A${i + 3}`);

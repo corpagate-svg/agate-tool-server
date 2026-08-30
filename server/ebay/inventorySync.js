@@ -153,6 +153,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
 
     let pid;
     let purchasePrice = null, purchaseDate = null, purchaseFrom = null, note = "";
+    let realStock = null, realStockConfirmedAt = null, stocktakeQty = null, stocktakeAt = null;
     if (savedRow) {
       claimedSaved.add(savedRow);
       pid = savedRow.商品ID;
@@ -160,12 +161,19 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
       purchaseDate = savedRow.fullRow[16];
       purchaseFrom = savedRow.fullRow[17];
       note = savedRow.wasRemoved ? "" : (savedRow.fullRow[18] || "");
+      realStock = savedRow.fullRow[21] ?? null;
+      realStockConfirmedAt = savedRow.fullRow[22] ?? null;
+      stocktakeQty = savedRow.fullRow[23] ?? null;
+      stocktakeAt = savedRow.fullRow[24] ?? null;
     } else {
       pid = "P" + String(nextId).padStart(4, "0");
       nextId++;
       newProducts.push([pid, usItem.title]);
     }
     if (!purchaseDate && usItem.startTime) purchaseDate = usItem.startTime.slice(0, 10);
+    // リアル在庫は当社独自管理の値。eBay APIでの再取込では上書きしない。
+    // 未設定(導入前・移行直後)の場合のみ、初期値としてUSの在庫数をコピーする。
+    if (realStock === null || realStock === undefined) realStock = usItem.quantityAvailable;
 
     rowsOut.push({
       row: [
@@ -185,6 +193,9 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
         auResult.match ? auResult.match.price : null,
         auResult.match ? auResult.match.quantitySold : null,
         purchasePrice, purchaseDate, purchaseFrom, note,
+        ukResult.match ? ukResult.match.quantityAvailable : null,
+        auResult.match ? auResult.match.quantityAvailable : null,
+        realStock, realStockConfirmedAt, stocktakeQty, stocktakeAt,
       ],
       flag: Boolean(flag),
     });
@@ -227,7 +238,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
       for (let c = 1; c <= INV_HEADERS.length; c++) excelRow.getCell(c).fill = INV_FLAG_FILL;
     }
   });
-  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30];
+  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30, 12, 12, 12, 16, 12, 18];
   widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
   const ws2 = wb.addWorksheet("UK_AU保管(US未紐付け)");
@@ -253,6 +264,9 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     "・UK/AUが複数候補ある場合は、US出品の出品開始日時に最も近いものを自動選択しています(確実な保証はできないため、該当行は黄色でハイライトしています)。",
     "・UK/AUの出品のうち、どのUS出品にも対応付けられなかったものは「UK_AU保管(US未紐付け)」シートに保管しています。次回の取り込み時に対応するUS出品が見つかれば自動的にメインシートへ統合され、eBay上で削除・売り切れが確認された場合は保管領域からも自動的に取り除かれます。",
     "・商品IDは、USの出品ID(Item Number)が前回と同じ場合はそのまま引き継ぎます。出品IDが変わった場合でも商品名が一致すれば引き継ぎます。仕入価格・仕入日・仕入先・備考は前回入力済みの内容をそのまま引き継ぎます。",
+    "・「リアル在庫」「リアル在庫確認日」「棚卸入力数量」「棚卸入力日時」は当社独自管理の値のため、このeBay同期では一切上書きしません(前回の値をそのまま引き継ぎます)。",
+    "・「UK在庫数」「AU在庫数」は、eBay自己申告の在庫数をそのまま反映したものです(リアル在庫とは別物です)。",
+    "・注意: US出品が削除・終了してメインシートから消えた商品は、その時点のリアル在庫の記録もこの表からは消えます(削除自体は行われず単に一覧から除外されるため、現物在庫が残っている場合は「相違」ページや在庫変更履歴で確認してください)。",
   ];
   notes.forEach((n, i) => {
     const cell = ws3.getCell(`A${i + 3}`);

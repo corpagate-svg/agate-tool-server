@@ -3,15 +3,19 @@ const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
 const ExcelJS = require("exceljs");
-const { sendJson, sendHtml } = require("./httpUtil");
+const { sendJson, sendHtml, contentDispositionAttachment } = require("./httpUtil");
 const { handleEbayConnect, handleEbayCallback, handleEbayInventory, createInventoryRebuildHandler } = require("./ebay/routes");
 const { rebuildInventoryFromRecords } = require("./inventoryRebuild");
+const realInv = require("./realInventory");
+const { listHistory } = require("./inventoryHistory");
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
 const DATA_DIR = path.join(__dirname, "..", "data");
 const LEDGER_PATH = path.join(DATA_DIR, "売上管理表.xlsx");
 const INVENTORY_PATH = path.join(DATA_DIR, "在庫管理表.xlsx");
+const HISTORY_PATH = path.join(DATA_DIR, "在庫変更履歴.xlsx");
+const SNAPSHOT_DIR = path.join(DATA_DIR, "snapshots");
 
 const HEADERS = [
   "注文番号", "日付", "サイト", "商品メモ", "数量", "商品ID",
@@ -24,8 +28,12 @@ const INV_HEADERS = [
   "商品ID", "商品名", "バリエーション詳細", "在庫数(現物)", "出品国数", "在庫数不一致",
   "US_出品ID", "US価格(USD)", "US累計売却数", "UK_出品ID", "UK価格(GBP)", "UK累計売却数",
   "AU_出品ID", "AU価格(AUD)", "AU累計売却数", "仕入価格(円)", "仕入日", "仕入先", "備考",
+  "UK在庫数", "AU在庫数", "リアル在庫", "リアル在庫確認日", "棚卸入力数量", "棚卸入力日時",
 ];
-const INV_COL = { 商品ID: 1, 商品名: 2, バリエーション詳細: 3, 在庫数: 4, 出品国数: 5, 在庫数不一致: 6, 仕入価格: 16, 仕入日: 17, 仕入先: 18, 備考: 19 };
+const INV_COL = {
+  商品ID: 1, 商品名: 2, バリエーション詳細: 3, 在庫数: 4, 出品国数: 5, 在庫数不一致: 6, 仕入価格: 16, 仕入日: 17, 仕入先: 18, 備考: 19,
+  UK在庫数: 20, AU在庫数: 21, リアル在庫: 22, リアル在庫確認日: 23, 棚卸入力数量: 24, 棚卸入力日時: 25,
+};
 
 if (!API_TOKEN) {
   console.error("API_TOKEN が設定されていません(.env を確認してください)。起動を中止します。");
@@ -204,16 +212,40 @@ async function handleAddOrder(req, res) {
   const { profit, margin } = recompute(revenueJpy, fee, cost, shipping, packing);
 
   const wb = await loadWorkbook();
+  if (findOrderRowByNo(wb, body["注文番号"])) {
+    return sendJson(res, 409, { error: `注文番号「${body["注文番号"]}」は既に登録されています(二重登録防止のため中止しました)` });
+  }
   const ws = getOrCreateMonthSheet(wb, body["日付"]);
+  const pid = body["商品ID"] || "";
+  const qty = numOrNull(body["数量"]) === null ? 1 : numOrNull(body["数量"]);
   ws.addRow([
-    body["注文番号"], body["日付"], body["サイト"], body["商品メモ"], numOrNull(body["数量"]) === null ? "" : numOrNull(body["数量"]), body["商品ID"] || "",
+    body["注文番号"], body["日付"], body["サイト"], body["商品メモ"], numOrNull(body["数量"]) === null ? "" : numOrNull(body["数量"]), pid,
     usd, rate, Math.round(revenueJpy), fee,
     cost === null ? "" : cost, shipping === null ? "" : shipping, packing === null ? "" : packing,
     profit, margin,
   ]);
   await wb.xlsx.writeFile(LEDGER_PATH);
 
-  sendJson(res, 200, { status: "ok", 収益円: Math.round(revenueJpy), 手数料円: fee, 最終利益円: profit, 利益率: margin });
+  let warning = null;
+  if (pid) {
+    const r = await realInv.adjustRealStock({
+      loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL,
+      pid, delta: -qty, reason: "注文登録", orderNo: body["注文番号"],
+    });
+    warning = r.warning;
+  }
+
+  sendJson(res, 200, { status: "ok", 収益円: Math.round(revenueJpy), 手数料円: fee, 最終利益円: profit, 利益率: margin, warning });
+}
+
+function findOrderRowByNo(wb, orderNo) {
+  for (const ws of dataSheets(wb)) {
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const row = ws.getRow(r);
+      if (String(row.getCell(COL.注文番号).value || "") === String(orderNo)) return row;
+    }
+  }
+  return null;
 }
 
 async function handlePatchOrder(req, res) {
@@ -229,10 +261,14 @@ async function handlePatchOrder(req, res) {
   const wb = await loadWorkbook();
   const sheets = dataSheets(wb);
   let updated = null;
+  let stockAdjustments = [];
   for (const ws of sheets) {
     for (let r = 2; r <= ws.rowCount; r++) {
       const row = ws.getRow(r);
       if (String(row.getCell(COL.注文番号).value || "") !== String(orderNo)) continue;
+
+      const oldPid = String(row.getCell(COL.商品ID).value || "");
+      const oldQty = numOrNull(row.getCell(COL.数量).value) === null ? 1 : numOrNull(row.getCell(COL.数量).value);
 
       const cost = "仕入原価円" in body ? numOrNull(body["仕入原価円"]) : numOrNull(row.getCell(COL.仕入原価).value);
       const shipping = "送料円" in body ? numOrNull(body["送料円"]) : numOrNull(row.getCell(COL.送料).value);
@@ -247,6 +283,7 @@ async function handlePatchOrder(req, res) {
       if (rate !== null) row.getCell(COL.ドル円レート).value = rate;
       if ("商品メモ" in body) row.getCell(COL.商品メモ).value = body["商品メモ"];
       if ("数量" in body) { const q = numOrNull(body["数量"]); row.getCell(COL.数量).value = q === null ? "" : q; }
+      if ("商品ID" in body) row.getCell(COL.商品ID).value = body["商品ID"] || "";
       row.getCell(COL.収益円).value = Math.round(revenueJpy);
       row.getCell(COL.手数料).value = fee;
       row.getCell(COL.仕入原価).value = cost === null ? "" : cost;
@@ -256,12 +293,31 @@ async function handlePatchOrder(req, res) {
       row.getCell(COL.利益率).value = margin;
       row.commit();
       updated = { 注文番号: orderNo, 最終利益円: profit, 利益率: margin };
+
+      const newPid = "商品ID" in body ? String(body["商品ID"] || "") : oldPid;
+      const newQty = "数量" in body ? (numOrNull(body["数量"]) === null ? 1 : numOrNull(body["数量"])) : oldQty;
+      if (newPid !== oldPid) {
+        if (oldPid) stockAdjustments.push({ pid: oldPid, delta: oldQty, reason: "注文編集(商品ID変更・戻し)" });
+        if (newPid) stockAdjustments.push({ pid: newPid, delta: -newQty, reason: "注文編集(商品ID変更)" });
+      } else if (newQty !== oldQty && oldPid) {
+        stockAdjustments.push({ pid: oldPid, delta: oldQty - newQty, reason: "注文編集(数量変更)" });
+      }
     }
   }
 
   if (!updated) return sendJson(res, 404, { error: "該当する注文番号が見つかりません" });
   await wb.xlsx.writeFile(LEDGER_PATH);
-  sendJson(res, 200, { status: "ok", ...updated });
+
+  const warnings = [];
+  for (const adj of stockAdjustments) {
+    const r = await realInv.adjustRealStock({
+      loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL,
+      pid: adj.pid, delta: adj.delta, reason: adj.reason, orderNo,
+    });
+    if (r.warning) warnings.push(r.warning);
+  }
+
+  sendJson(res, 200, { status: "ok", ...updated, warning: warnings.length ? warnings.join(" / ") : null });
 }
 
 async function handleDeleteOrders(req, res) {
@@ -276,11 +332,16 @@ async function handleDeleteOrders(req, res) {
 
   const wb = await loadWorkbook();
   let deleted = 0;
+  const restores = [];
   for (const ws of dataSheets(wb)) {
     const toRemove = [];
     for (let r = 2; r <= ws.rowCount; r++) {
       const row = ws.getRow(r);
-      if (targets.has(String(row.getCell(COL.注文番号).value || ""))) toRemove.push(r);
+      if (!targets.has(String(row.getCell(COL.注文番号).value || ""))) continue;
+      toRemove.push(r);
+      const pid = String(row.getCell(COL.商品ID).value || "");
+      const qty = numOrNull(row.getCell(COL.数量).value) === null ? 1 : numOrNull(row.getCell(COL.数量).value);
+      if (pid) restores.push({ pid, qty, orderNo: String(row.getCell(COL.注文番号).value || "") });
     }
     for (let i = toRemove.length - 1; i >= 0; i--) {
       ws.spliceRows(toRemove[i], 1);
@@ -289,7 +350,17 @@ async function handleDeleteOrders(req, res) {
   }
   if (!deleted) return sendJson(res, 404, { error: "該当する注文が見つかりません" });
   await wb.xlsx.writeFile(LEDGER_PATH);
-  sendJson(res, 200, { status: "ok", deleted });
+
+  const warnings = [];
+  for (const r of restores) {
+    const result = await realInv.adjustRealStock({
+      loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL,
+      pid: r.pid, delta: r.qty, reason: "注文削除", orderNo: r.orderNo,
+    });
+    if (result.warning) warnings.push(result.warning);
+  }
+
+  sendJson(res, 200, { status: "ok", deleted, warning: warnings.length ? warnings.join(" / ") : null });
 }
 
 async function handleDeleteInventory(req, res) {
@@ -336,7 +407,7 @@ async function handleDownload(req, res) {
   await loadWorkbook();
   res.writeHead(200, {
     "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "Content-Disposition": "attachment; filename=\"売上管理表.xlsx\"",
+    "Content-Disposition": contentDispositionAttachment("売上管理表.xlsx"),
     "Access-Control-Allow-Origin": "*",
   });
   fs.createReadStream(LEDGER_PATH).pipe(res);
@@ -497,6 +568,23 @@ async function handlePatchInventory(req, res) {
 
   if (!updated) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
   await wb.xlsx.writeFile(INVENTORY_PATH);
+
+  // リアル在庫・棚卸入力数量は当社独自管理の値のため、履歴記録を伴う専用ロジック(realInventory.js)へ委譲する。
+  if ("リアル在庫" in body) {
+    const v = numOrNull(body["リアル在庫"]);
+    if (v === null) return sendJson(res, 400, { error: "リアル在庫 は数値で指定してください" });
+    const r = await realInv.setRealStock({
+      loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL,
+      pid, value: v, confirmedAt: body["リアル在庫確認日"] || null,
+    });
+    if (!r.ok) return sendJson(res, 404, { error: r.error });
+  }
+  if ("棚卸入力数量" in body) {
+    const v = body["棚卸入力数量"] === "" || body["棚卸入力数量"] === null ? null : numOrNull(body["棚卸入力数量"]);
+    const r = await realInv.stageStocktakeQty({ loadInventoryWorkbook, INVENTORY_PATH, INV_COL, pid, qty: v });
+    if (!r.ok) return sendJson(res, 404, { error: r.error });
+  }
+
   sendJson(res, 200, { status: "ok", 商品ID: pid });
 }
 
@@ -535,6 +623,109 @@ async function handleRebuildInventory(req, res) {
     loadInventoryWorkbook,
   });
   sendJson(res, 200, { status: "ok", ...summary });
+}
+
+async function handleDiscrepancies(req, res) {
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+  const rows = realInv.computeDiscrepancies({ ws, INV_HEADERS, INV_COL });
+  sendJson(res, 200, { count: rows.length, rows });
+}
+
+async function handleStocktakePreview(req, res) {
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+  const preview = realInv.previewStocktake({ ws, INV_HEADERS });
+  sendJson(res, 200, preview);
+}
+
+async function handleStocktakeConfirm(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readRawBody(req, 1024 * 1024)).toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  const result = await realInv.confirmStocktake({
+    loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_HEADERS, INV_COL,
+    targetPids: Array.isArray(body["商品ID"]) ? body["商品ID"] : null,
+  });
+  sendJson(res, 200, { status: "ok", ...result });
+}
+
+async function handleInventoryHistory(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const pid = url.searchParams.get("商品ID") || undefined;
+  const rows = await listHistory(HISTORY_PATH, { pid });
+  sendJson(res, 200, { headers: require("./inventoryHistory").HISTORY_HEADERS, rows });
+}
+
+async function handleClosingChecklist(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const asOf = url.searchParams.get("asOf") || new Date().toISOString().slice(0, 10);
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+  const rows = realInv.closingChecklist({ ws, INV_HEADERS, asOf });
+  sendJson(res, 200, { asOf, count: rows.length, rows });
+}
+
+async function handleClosingExport(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const asOf = url.searchParams.get("asOf") || new Date().toISOString().slice(0, 10);
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+  const { workbook } = await realInv.exportClosingXlsx({ ws, INV_HEADERS, asOf });
+  res.writeHead(200, {
+    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "Content-Disposition": contentDispositionAttachment(`棚卸資産_${asOf}.xlsx`),
+    "Access-Control-Allow-Origin": "*",
+  });
+  await workbook.xlsx.write(res);
+  res.end();
+}
+
+async function handleClosingSnapshot(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readRawBody(req, 1024 * 1024)).toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  const asOf = body["asOf"] || new Date().toISOString().slice(0, 10);
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+  const { workbook, totalValue, rowCount } = await realInv.exportClosingXlsx({ ws, INV_HEADERS, asOf });
+  fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+  const fileName = `棚卸資産_${asOf}.xlsx`;
+  const snapshotPath = path.join(SNAPSHOT_DIR, fileName);
+  if (fs.existsSync(snapshotPath)) {
+    return sendJson(res, 409, { error: `基準日「${asOf}」のスナップショットは既に保存されています(上書きはできません。別の基準日を指定するか、既存ファイルを確認してください)` });
+  }
+  const tmpPath = snapshotPath + ".tmp";
+  await workbook.xlsx.writeFile(tmpPath);
+  fs.renameSync(tmpPath, snapshotPath);
+  sendJson(res, 200, { status: "ok", asOf, fileName, totalValue, rowCount });
+}
+
+async function handleListSnapshots(req, res) {
+  fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+  const files = fs.readdirSync(SNAPSHOT_DIR).filter((f) => f.endsWith(".xlsx")).sort().reverse();
+  sendJson(res, 200, { files });
+}
+
+async function handleDownloadSnapshot(req, res, pathname) {
+  const fileName = decodeURIComponent(pathname.replace("/download/snapshots/", ""));
+  if (fileName.includes("..") || fileName.includes("/") || fileName.includes("\\")) {
+    return sendJson(res, 400, { error: "不正なファイル名です" });
+  }
+  const filePath = path.join(SNAPSHOT_DIR, fileName);
+  if (!fs.existsSync(filePath)) return sendJson(res, 404, { error: "ファイルが見つかりません" });
+  res.writeHead(200, {
+    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "Content-Disposition": contentDispositionAttachment(fileName),
+    "Access-Control-Allow-Origin": "*",
+  });
+  fs.createReadStream(filePath).pipe(res);
 }
 
 const DASHBOARD_PAGE = `<!doctype html>
@@ -1754,8 +1945,14 @@ const server = http.createServer(async (req, res) => {
     return sendHtml(res, DASHBOARD_PAGE);
   }
 
-  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary", "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild"];
-  if (protectedRoutes.includes(pathname) && !isAuthorized(req)) {
+  const protectedRoutes = [
+    "/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary",
+    "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild",
+    "/api/inventory/discrepancies", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/history",
+    "/api/closing/checklist", "/api/closing/export", "/api/closing/snapshot", "/api/closing/snapshots",
+  ];
+  const isProtected = protectedRoutes.includes(pathname) || pathname.startsWith("/download/snapshots/");
+  if (isProtected && !isAuthorized(req)) {
     return sendJson(res, 401, { error: "認証に失敗しました(トークンを確認してください)" });
   }
 
@@ -1776,6 +1973,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && pathname === "/api/inventory") return await handleDeleteInventory(req, res);
     if (req.method === "POST" && pathname === "/api/import/inventory") return await handleImportInventory(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/rebuild") return await handleRebuildInventory(req, res);
+    if (req.method === "GET" && pathname === "/api/inventory/discrepancies") return await handleDiscrepancies(req, res);
+    if (req.method === "GET" && pathname === "/api/inventory/stocktake/preview") return await handleStocktakePreview(req, res);
+    if (req.method === "POST" && pathname === "/api/inventory/stocktake/confirm") return await handleStocktakeConfirm(req, res);
+    if (req.method === "GET" && pathname === "/api/inventory/history") return await handleInventoryHistory(req, res);
+    if (req.method === "GET" && pathname === "/api/closing/checklist") return await handleClosingChecklist(req, res);
+    if (req.method === "GET" && pathname === "/api/closing/export") return await handleClosingExport(req, res);
+    if (req.method === "POST" && pathname === "/api/closing/snapshot") return await handleClosingSnapshot(req, res);
+    if (req.method === "GET" && pathname === "/api/closing/snapshots") return await handleListSnapshots(req, res);
+    if (req.method === "GET" && pathname.startsWith("/download/snapshots/")) return await handleDownloadSnapshot(req, res, pathname);
   } catch (e) {
     console.error(e);
     return sendJson(res, 500, { error: "サーバー内部でエラーが発生しました" });
