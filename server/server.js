@@ -3,19 +3,15 @@ const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
 const ExcelJS = require("exceljs");
+const { sendJson, sendHtml } = require("./httpUtil");
+const { handleEbayConnect, handleEbayCallback, handleEbayInventory, createInventoryRebuildHandler } = require("./ebay/routes");
+const { rebuildInventoryFromRecords } = require("./inventoryRebuild");
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
 const DATA_DIR = path.join(__dirname, "..", "data");
 const LEDGER_PATH = path.join(DATA_DIR, "売上管理表.xlsx");
 const INVENTORY_PATH = path.join(DATA_DIR, "在庫管理表.xlsx");
-
-// eBay連携(Inventory API・読み取り専用。sell.inventory.readonly のみ使用。個人情報は一切取得しない)
-const EBAY_APP_ID = process.env.EBAY_APP_ID || "";
-const EBAY_CERT_ID = process.env.EBAY_CERT_ID || "";
-const EBAY_RUNAME = process.env.EBAY_RUNAME || "";
-const EBAY_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.inventory.readonly";
-const EBAY_TOKEN_PATH = path.join(DATA_DIR, "ebay_token.json");
 
 const HEADERS = [
   "注文番号", "日付", "サイト", "商品メモ", "数量", "商品ID",
@@ -71,6 +67,8 @@ async function loadInventoryWorkbook() {
   return wb;
 }
 
+const handleEbayInventoryRebuild = createInventoryRebuildHandler({ INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook });
+
 function dataSheets(wb) {
   return wb.worksheets.filter((ws) => isDataSheet(ws.name));
 }
@@ -112,149 +110,6 @@ function isAuthorized(req) {
   return crypto.timingSafeEqual(givenBuf, expected);
 }
 
-// ---- eBay連携(読み取り専用) ----
-
-function loadEbayToken() {
-  try {
-    return JSON.parse(fs.readFileSync(EBAY_TOKEN_PATH, "utf8"));
-  } catch (e) {
-    return null;
-  }
-}
-
-function saveEbayToken(data) {
-  fs.writeFileSync(EBAY_TOKEN_PATH, JSON.stringify(data, null, 2));
-}
-
-let ebayAccessTokenCache = { token: null, expiresAt: 0 };
-
-async function ebayTokenRequest(params) {
-  const basic = Buffer.from(`${EBAY_APP_ID}:${EBAY_CERT_ID}`).toString("base64");
-  const res = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams(params).toString(),
-  });
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new Error(`eBayトークン取得に失敗しました(${res.status}): ${text.slice(0, 200)}`);
-  }
-  if (!res.ok) {
-    throw new Error(data.error_description || data.error || `eBayトークン取得に失敗しました(${res.status})`);
-  }
-  return data;
-}
-
-async function ebayExchangeCode(code) {
-  return ebayTokenRequest({ grant_type: "authorization_code", code, redirect_uri: EBAY_RUNAME });
-}
-
-async function ebayRefreshAccessToken(refreshToken) {
-  return ebayTokenRequest({ grant_type: "refresh_token", refresh_token: refreshToken, scope: EBAY_SCOPE });
-}
-
-async function getEbayAccessToken() {
-  const now = Date.now();
-  if (ebayAccessTokenCache.token && ebayAccessTokenCache.expiresAt > now + 60 * 1000) {
-    return ebayAccessTokenCache.token;
-  }
-  const stored = loadEbayToken();
-  if (!stored || !stored.refresh_token) {
-    throw new Error("eBayとの連携がまだ完了していません(/ebay/connect から認可を行ってください)");
-  }
-  const data = await ebayRefreshAccessToken(stored.refresh_token);
-  ebayAccessTokenCache = { token: data.access_token, expiresAt: now + data.expires_in * 1000 };
-  return data.access_token;
-}
-
-async function ebayApiGet(pathAndQuery) {
-  const token = await getEbayAccessToken();
-  const res = await fetch(`https://api.ebay.com${pathAndQuery}`, {
-    headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-  });
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new Error(`eBay APIエラー(${res.status}): ${text.slice(0, 200)}`);
-  }
-  if (!res.ok) {
-    throw new Error(data.errors ? JSON.stringify(data.errors) : `eBay APIエラー(${res.status})`);
-  }
-  return data;
-}
-
-async function fetchAllEbayInventoryItems() {
-  const items = [];
-  const limit = 100;
-  let offset = 0;
-  while (true) {
-    const data = await ebayApiGet(`/sell/inventory/v1/inventory_item?limit=${limit}&offset=${offset}`);
-    const batch = data.inventoryItems || [];
-    items.push(...batch);
-    if (batch.length < limit) break;
-    offset += limit;
-  }
-  return items;
-}
-
-async function handleEbayConnect(req, res) {
-  if (!EBAY_APP_ID || !EBAY_RUNAME) {
-    return sendJson(res, 500, { error: "EBAY_APP_ID / EBAY_RUNAME が設定されていません(.envを確認してください)" });
-  }
-  const params = new URLSearchParams({
-    client_id: EBAY_APP_ID,
-    redirect_uri: EBAY_RUNAME,
-    response_type: "code",
-    scope: EBAY_SCOPE,
-  });
-  res.writeHead(302, { Location: `https://auth.ebay.com/oauth2/authorize?${params.toString()}` });
-  res.end();
-}
-
-async function handleEbayCallback(req, res) {
-  const urlObj = new URL(req.url, "http://localhost");
-  const code = urlObj.searchParams.get("code");
-  if (!code) {
-    return sendHtml(res, "<p>認可コードが見つかりませんでした。もう一度 /ebay/connect からやり直してください。</p>");
-  }
-  try {
-    const data = await ebayExchangeCode(code);
-    saveEbayToken({
-      refresh_token: data.refresh_token,
-      refresh_token_expires_in: data.refresh_token_expires_in,
-      connected_at: new Date().toISOString(),
-    });
-    ebayAccessTokenCache = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
-    return sendHtml(res, "<p>eBayとの連携が完了しました。このタブは閉じて構いません。</p>");
-  } catch (e) {
-    return sendHtml(res, "<p>連携に失敗しました: " + String((e && e.message) || e) + "</p>");
-  }
-}
-
-async function handleEbayInventory(req, res) {
-  try {
-    const items = await fetchAllEbayInventoryItems();
-    const rows = items.map((it) => ({
-      sku: it.sku,
-      title: it.product && it.product.title,
-      description: it.product && it.product.description,
-      condition: it.condition,
-      quantity: it.availability && it.availability.shipToLocationAvailability && it.availability.shipToLocationAvailability.quantity,
-    }));
-    sendJson(res, 200, { count: rows.length, items: rows });
-  } catch (e) {
-    sendJson(res, 502, { error: String((e && e.message) || e) });
-  }
-}
-
 function parseCsv(text) {
   const rows = [];
   let row = [], field = "", inQuotes = false;
@@ -290,25 +145,6 @@ function csvToObjects(text) {
     headers.forEach((h, i) => { obj[h] = r[i] !== undefined ? r[i] : ""; });
     return obj;
   });
-}
-
-function numOrNullCsv(v) {
-  const n = parseFloat(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function intOrNullCsv(v) {
-  const n = parseInt(v, 10);
-  return Number.isFinite(n) ? n : null;
-}
-
-function sendJson(res, status, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-  });
-  res.end(body);
 }
 
 function readRawBody(req, maxBytes) {
@@ -678,49 +514,6 @@ async function handleImportInventory(req, res) {
   sendJson(res, 200, { status: "ok", message: "取り込みが完了しました" });
 }
 
-const INV_HEADER_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F4E78" } };
-const INV_HEADER_FONT = { bold: true, color: { argb: "FFFFFFFF" } };
-const INV_FLAG_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
-const INV_REMOVED_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF2DCDB" } };
-
-function normText(s) {
-  return String(s || "").trim().replace(/\s+/g, " ");
-}
-
-const SHIPPING_NOTE_SUFFIXES = [
-  "【Extra Items Ship FREE】",
-  "【FlaExtra Items Ship FREE】",
-  "【Flat S/H】",
-  "(Flat rate after first)",
-];
-function stripShippingNote(title) {
-  let t = String(title || "").trim();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const suf of SHIPPING_NOTE_SUFFIXES) {
-      if (t.endsWith(suf)) {
-        t = t.slice(0, -suf.length).trim();
-        changed = true;
-      }
-    }
-  }
-  return t;
-}
-function nameKey(title, variation) {
-  return normText(stripShippingNote(title)) + " || " + normText(variation);
-}
-
-const MONTH_ABBR_EN = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
-function parseEbayStartDate(s) {
-  const m = /^([A-Za-z]{3})-(\d{1,2})-(\d{2})/.exec(String(s || ""));
-  if (!m) return null;
-  const mm = MONTH_ABBR_EN[m[1]];
-  if (!mm) return null;
-  const yyyy = 2000 + parseInt(m[3], 10);
-  return `${yyyy}-${String(mm).padStart(2, "0")}-${String(m[2]).padStart(2, "0")}`;
-}
-
 async function handleRebuildInventory(req, res) {
   const buf = await readRawBody(req, 30 * 1024 * 1024);
   const text = buf.toString("utf8").replace(/^﻿/, "");
@@ -732,194 +525,22 @@ async function handleRebuildInventory(req, res) {
     }
   }
 
-  const oldWb = await loadInventoryWorkbook();
-  const oldWs = oldWb.getWorksheet("在庫管理表") || oldWb.worksheets[0];
-  const saved = new Map();
-  let maxId = 0;
-  oldWs.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-    const pid = row.getCell(1).value;
-    if (!pid) return;
-    const idNum = parseInt(String(pid).slice(1), 10);
-    if (Number.isFinite(idNum)) maxId = Math.max(maxId, idNum);
-    const fullRow = [];
-    for (let c = 1; c <= INV_HEADERS.length; c++) fullRow.push(row.getCell(c).value);
-    const key = nameKey(fullRow[1], fullRow[2]);
-    saved.set(key, {
-      商品ID: pid,
-      fullRow,
-      wasRemoved: String(fullRow[18] || "").includes("見当たりません"),
-    });
-  });
-
-  const groups = new Map();
-  records.forEach((r) => {
-    const key = nameKey(r["Title"], r["Variation details"]);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(r);
-  });
-
-  const anomalous = [];
-  const mainKeys = [];
-  for (const [key, items] of groups) {
-    if (items.length > 3) anomalous.push(...items);
-    else mainKeys.push(key);
-  }
-
   const today = new Date().toISOString().slice(0, 10);
-  const rowsOut = [];
-  const newProducts = [];
-  const noUsSkipped = [];
-  let nextId = maxId + 1;
-  const newKeySet = new Set();
-
-  for (const key of mainKeys) {
-    const items = groups.get(key);
-    const qtys = new Set(items.map((it) => it["Available quantity"]));
-    const bySite = {};
-    items.forEach((it) => {
-      const site = it["Listing site"];
-      if (["US", "UK", "AU"].includes(site) && !bySite[site]) bySite[site] = it;
-    });
-
-    // USに出品していないものは商品リストに載せない(USを基準にUK/AUへ転送している運用のため)
-    if (!bySite.US) {
-      noUsSkipped.push(...items);
-      continue;
-    }
-    newKeySet.add(key);
-    const anchor = bySite.US;
-    const siteCount = Object.keys(bySite).length;
-
-    let pid;
-    let purchasePrice = null, purchaseDate = null, purchaseFrom = null, note = "";
-    if (saved.has(key)) {
-      const s = saved.get(key);
-      pid = s.商品ID;
-      purchasePrice = s.fullRow[15]; purchaseDate = s.fullRow[16]; purchaseFrom = s.fullRow[17];
-      note = s.wasRemoved ? "" : (s.fullRow[18] || "");
-    } else {
-      pid = "P" + String(nextId).padStart(4, "0");
-      nextId++;
-      newProducts.push([pid, anchor["Title"]]);
-    }
-    if (!purchaseDate) purchaseDate = parseEbayStartDate(anchor["Start date"]);
-
-    rowsOut.push({
-      row: [
-        pid, normText(stripShippingNote(anchor["Title"])), normText(anchor["Variation details"]) || null, intOrNullCsv(anchor["Available quantity"]),
-        siteCount, qtys.size > 1 ? "要確認" : "",
-        numOrNullCsv(bySite.US["Item number"]), numOrNullCsv(bySite.US["Current price"]), intOrNullCsv(bySite.US["Sold quantity"]),
-        bySite.UK ? numOrNullCsv(bySite.UK["Item number"]) : null, bySite.UK ? numOrNullCsv(bySite.UK["Current price"]) : null, bySite.UK ? intOrNullCsv(bySite.UK["Sold quantity"]) : null,
-        bySite.AU ? numOrNullCsv(bySite.AU["Item number"]) : null, bySite.AU ? numOrNullCsv(bySite.AU["Current price"]) : null, bySite.AU ? intOrNullCsv(bySite.AU["Sold quantity"]) : null,
-        purchasePrice, purchaseDate, purchaseFrom, note,
-      ],
-      status: "current",
-      flag: siteCount < 3 || qtys.size > 1,
-    });
-  }
-
-  let removedNewCount = 0;
-  let removedStillCount = 0;
-  for (const [key, s] of saved) {
-    if (newKeySet.has(key)) continue;
-    let note = s.fullRow[18] || "";
-    if (s.wasRemoved) {
-      removedStillCount++;
-    } else {
-      note = (note ? note + " / " : "") + `${today}時点のeBay出品CSVに見当たりません(削除/売り切れの可能性)`;
-      removedNewCount++;
-    }
-    const carried = s.fullRow.slice(0, 15);
-    rowsOut.push({ row: carried.concat([s.fullRow[15], s.fullRow[16], s.fullRow[17], note]), status: "removed" });
-  }
-
-  rowsOut.sort((a, b) => {
-    if ((a.status === "removed") !== (b.status === "removed")) return a.status === "removed" ? 1 : -1;
-    return String(a.row[0]).localeCompare(String(b.row[0]));
+  const summary = await rebuildInventoryFromRecords({
+    records,
+    sourceNote: `・eBayの『All active listings report』(${today}時点)を元に、サーバー上で自動更新しました。`,
+    removedNoteLabel: "eBay出品CSV",
+    INV_HEADERS,
+    INVENTORY_PATH,
+    loadInventoryWorkbook,
   });
-
-  const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet("在庫管理表");
-  ws.addRow(INV_HEADERS);
-  for (let c = 1; c <= INV_HEADERS.length; c++) {
-    const cell = ws.getRow(1).getCell(c);
-    cell.fill = INV_HEADER_FILL;
-    cell.font = INV_HEADER_FONT;
-    cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
-  }
-  ws.getRow(1).height = 30;
-  ws.views = [{ state: "frozen", ySplit: 1 }];
-
-  rowsOut.forEach((r) => {
-    const excelRow = ws.addRow(r.row);
-    if (r.status === "removed" || r.flag) {
-      const fill = r.status === "removed" ? INV_REMOVED_FILL : INV_FLAG_FILL;
-      for (let c = 1; c <= INV_HEADERS.length; c++) excelRow.getCell(c).fill = fill;
-    }
-  });
-  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30];
-  widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
-
-  const ws2 = wb.addWorksheet("要確認(重複出品)");
-  ws2.addRow(["名寄せキー", "出品ID", "商品名", "バリエーション詳細", "SKU", "在庫数", "出品国", "現在価格", "通貨"]);
-  for (let c = 1; c <= 9; c++) {
-    ws2.getRow(1).getCell(c).fill = INV_HEADER_FILL;
-    ws2.getRow(1).getCell(c).font = INV_HEADER_FONT;
-  }
-  ws2.views = [{ state: "frozen", ySplit: 1 }];
-  anomalous.forEach((it) => {
-    ws2.addRow([
-      (it["Title"] || "") + " || " + (it["Variation details"] || ""),
-      numOrNullCsv(it["Item number"]), it["Title"], it["Variation details"], it["Custom label (SKU)"],
-      intOrNullCsv(it["Available quantity"]), it["Listing site"], numOrNullCsv(it["Current price"]), it["Currency"],
-    ]);
-  });
-  [50, 14, 40, 30, 20, 10, 10, 12, 10].forEach((w, i) => { ws2.getColumn(i + 1).width = w; });
-
-  const ws3 = wb.addWorksheet("この表について");
-  ws3.getCell("A1").value = "在庫管理表について";
-  ws3.getCell("A1").font = { bold: true, size: 13 };
-  const notes = [
-    `・eBayの『All active listings report』(${today}時点)を元に、サーバー上で自動更新しました。`,
-    "・商品IDは前回から引き継いでいます(売上管理表の商品IDとの対応を保つため)。新しく出品された商品には新しいIDを振っています。",
-    "・黄色でハイライトした行は「3カ国揃っていない」または「在庫数が国ごとに違う」商品です。",
-    "・赤色でハイライトした行は、出品CSVに見当たらなかった商品です。削除されたか、売り切れて自動終了した可能性があります。",
-    "・「要確認(重複出品)」シートには、同じ名前の出品が3件を超えて存在した商品を出品ID単位でそのまま残しています。",
-    "・USに出品されていない商品(UK/AUのみ)は、転送漏れ・名称不一致とみなし商品リストには含めていません。",
-    "・仕入価格・仕入日・仕入先・備考は、前回入力済みだった内容をそのまま引き継いでいます。",
-  ];
-  notes.forEach((n, i) => {
-    const cell = ws3.getCell(`A${i + 3}`);
-    cell.value = n;
-    cell.font = { italic: true, color: { argb: "FF808080" }, size: 9 };
-  });
-  ws3.getColumn(1).width = 110;
-
-  const tmpPath = INVENTORY_PATH + ".tmp";
-  await wb.xlsx.writeFile(tmpPath);
-  fs.renameSync(tmpPath, INVENTORY_PATH);
-
-  sendJson(res, 200, {
-    status: "ok",
-    total: rowsOut.length,
-    new: newProducts.length,
-    removedNew: removedNewCount,
-    removedStill: removedStillCount,
-    anomalous: anomalous.length,
-    noUsSkipped: noUsSkipped.length,
-  });
-}
-
-function sendHtml(res, html) {
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(html);
+  sendJson(res, 200, { status: "ok", ...summary });
 }
 
 const DASHBOARD_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>物販事業ツール(サーバー版)</title>
+<title>Agate Trade Hub</title>
 <style>
   :root {
     color-scheme: light;
@@ -1007,6 +628,8 @@ const DASHBOARD_PAGE = `<!doctype html>
   .sticky-col { position: sticky; left: 0; background: var(--surface); z-index: 1; box-shadow: 2px 0 4px -2px var(--border); }
   tbody tr:hover td.sticky-col { background: var(--surface-2); }
   .site-chip { display: inline-block; padding: 2px 8px; border-radius: 100px; background: var(--accent-wash); color: var(--series-rev); font-size: 11.5px; font-weight: 600; }
+  .item-link { color: var(--series-rev); text-decoration: underline; }
+  .item-link:hover { text-decoration: none; }
   td.truncate { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .profit-cell { color: var(--good); font-weight: 600; }
   .profit-cell.bad { color: var(--series-cost); }
@@ -1064,7 +687,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 <div class="wrap">
   <div class="hdr">
     <div>
-      <h1>物販事業ツール(サーバー版)</h1>
+      <h1>Agate Trade Hub</h1>
       <p class="sub">株式会社アゲイト — eBay 注文・在庫・売上。注文タブは書き換えると即座にサーバーに保存されます</p>
     </div>
     <div class="auth-row">
@@ -1142,6 +765,10 @@ const DASHBOARD_PAGE = `<!doctype html>
       <div class="panel-body">
         <div class="kpis" id="inv-kpis" style="margin-bottom:16px;"></div>
         <div class="paste-parse">
+          <div class="browser-toolbar">
+            <button class="btn" id="ebay-rebuild-btn">eBay最新情報を取り込む</button>
+            <span id="ebay-rebuild-status" class="hint"></span>
+          </div>
           <div class="browser-toolbar">
             <input type="file" id="inv-csv-file" accept=".csv">
             <button class="btn" id="inv-csv-upload">CSVで在庫を更新</button>
@@ -1310,6 +937,7 @@ function renderKpis() {
     { label: "総注文数", value: orderRows.length.toLocaleString("ja-JP") + " 件" },
     { label: "総販売個数", value: qty.toLocaleString("ja-JP") + " 個" },
     { label: "在庫評価額(仕入ベース)", value: "¥" + fmt(Math.round(computeInventoryValue().total)) },
+    { label: "総在庫個数", value: computeTotalStock().toLocaleString("ja-JP") + " 個" },
   ];
   document.getElementById("kpis").innerHTML = tiles.map(t =>
     '<div class="kpi"><div class="label">' + t.label + '</div><div class="value' + (t.cls ? " " + t.cls : "") + '">' + t.value + '</div></div>'
@@ -1710,6 +1338,14 @@ function updateInvDeleteBtn() {
   document.getElementById("inv-delete-btn").disabled = invSelected.size === 0;
 }
 
+function computeTotalStock() {
+  if (!invHeaders.length) return 0;
+  const stockIdx = invHeaders.indexOf("在庫数(現物)");
+  let total = 0;
+  invRows.forEach((row) => { total += Number(row[stockIdx]) || 0; });
+  return total;
+}
+
 function computeInventoryValue() {
   if (!invHeaders.length) return { total: 0, priced: 0 };
   const priceIdx = invHeaders.indexOf("仕入価格(円)");
@@ -1796,6 +1432,14 @@ function renderInventory() {
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
         inp.addEventListener("change", () => saveInventoryField(tr, pid, h, inp.value));
         td.appendChild(inp);
+      } else if (h === "US_出品ID" && row[i] !== null && row[i] !== undefined && row[i] !== "") {
+        const a = document.createElement("a");
+        a.className = "item-link";
+        a.href = "https://www.ebay.com/itm/" + row[i];
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = row[i];
+        td.appendChild(a);
       } else {
         td.textContent = row[i] === null || row[i] === undefined ? "" : (isNum && typeof row[i] === "number" ? fmt(row[i]) : row[i]);
       }
@@ -1866,6 +1510,32 @@ async function saveInventoryField(tr, pid, header, value) {
 
 document.getElementById("ord-q").addEventListener("input", renderOrders);
 document.getElementById("inv-q").addEventListener("input", renderInventory);
+
+document.getElementById("ebay-rebuild-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("ebay-rebuild-btn");
+  const statusEl = document.getElementById("ebay-rebuild-status");
+  btn.disabled = true;
+  statusEl.className = "hint";
+  statusEl.textContent = "読み込み中...(30秒ほどかかります)";
+  const token = getToken();
+  try {
+    const r = await fetch("/api/ebay/inventory/rebuild", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token },
+    });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = "更新完了(USベース" + data.total + "件・新規" + data.new + "件・削除" + data.deletedCount + "件・要確認" + data.ambiguousMatches + "件・UK/AU保管" + data.ukAuOrphanCount + "件)";
+    statusEl.className = "hint ok";
+    await loadAll();
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 document.getElementById("inv-csv-upload").addEventListener("click", async () => {
   const fileInput = document.getElementById("inv-csv-file");
   const statusEl = document.getElementById("inv-csv-status");
@@ -2084,7 +1754,7 @@ const server = http.createServer(async (req, res) => {
     return sendHtml(res, DASHBOARD_PAGE);
   }
 
-  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary", "/ebay/connect", "/api/ebay/inventory"];
+  const protectedRoutes = ["/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary", "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild"];
   if (protectedRoutes.includes(pathname) && !isAuthorized(req)) {
     return sendJson(res, 401, { error: "認証に失敗しました(トークンを確認してください)" });
   }
@@ -2093,6 +1763,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/ebay/connect") return await handleEbayConnect(req, res);
     if (req.method === "GET" && pathname === "/ebay/callback") return await handleEbayCallback(req, res);
     if (req.method === "GET" && pathname === "/api/ebay/inventory") return await handleEbayInventory(req, res);
+    if (req.method === "POST" && pathname === "/api/ebay/inventory/rebuild") return await handleEbayInventoryRebuild(req, res);
     if (req.method === "POST" && pathname === "/api/orders") return await handleAddOrder(req, res);
     if (req.method === "PATCH" && pathname === "/api/orders") return await handlePatchOrder(req, res);
     if (req.method === "GET" && pathname === "/api/orders") return await handleListOrders(req, res);
