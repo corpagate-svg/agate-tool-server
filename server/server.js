@@ -840,6 +840,9 @@ const DASHBOARD_PAGE = `<!doctype html>
   .item-link { color: var(--series-rev); text-decoration: underline; }
   .item-link:hover { text-decoration: none; }
   td.truncate { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.stk-en-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  textarea.ja-name-input { font: inherit; font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; width: 260px; min-height: 40px; max-height: 78px; resize: vertical; line-height: 1.35; white-space: normal; overflow-wrap: break-word; }
+  textarea.ja-name-input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
   .profit-cell { color: var(--good); font-weight: 600; }
   .profit-cell.bad { color: var(--series-cost); }
   .stock-zero { color: var(--series-cost); font-weight: 600; }
@@ -1951,13 +1954,15 @@ function renderStocktake() {
     pidTd.textContent = pid;
     tr.appendChild(pidTd);
     const nameTd = document.createElement("td");
-    nameTd.className = "truncate";
+    nameTd.className = "stk-en-name";
     nameTd.textContent = name;
+    nameTd.title = name;
     tr.appendChild(nameTd);
 
     const jaTd = document.createElement("td");
-    const jaInp = document.createElement("input");
-    jaInp.type = "text"; jaInp.className = "wide-input";
+    const jaInp = document.createElement("textarea");
+    jaInp.className = "ja-name-input";
+    jaInp.rows = 2;
     jaInp.value = jaName;
     jaInp.addEventListener("change", () => saveInventoryTextField(tr, pid, "日本語商品名", jaInp.value));
     jaTd.appendChild(jaInp);
