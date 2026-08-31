@@ -849,6 +849,12 @@ const DASHBOARD_PAGE = `<!doctype html>
   .row-unconfirmed { background: rgba(255,196,0,0.12); }
   .mismatch-cell { color: var(--series-cost); font-weight: 700; }
   .row-abnormal { background: rgba(235,104,52,0.14); }
+  .pager { display: flex; align-items: center; gap: 6px; margin: 10px 0; flex-wrap: wrap; }
+  .pager button { font: inherit; font-size: 12.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; min-width: 32px; }
+  .pager button:hover:not(:disabled) { background: var(--accent-wash); }
+  .pager button:disabled { opacity: 0.4; cursor: default; }
+  .pager button.active { background: var(--series-rev); color: #fff; border-color: var(--series-rev); font-weight: 700; }
+  .pager .pager-info { font-size: 12px; color: var(--ink-muted); margin-left: 6px; }
   .thumb-btn { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); cursor: pointer; padding: 0; overflow: hidden; }
   .thumb-btn img { width: 100%; height: 100%; object-fit: cover; }
   .thumb-btn.no-image { font-size: 9px; color: var(--ink-muted); text-align: center; line-height: 1.2; }
@@ -1008,6 +1014,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           <button class="btn" id="inv-csv-export">CSVでダウンロード</button>
           <span class="result-count" id="inv-count"></span>
         </div>
+        <div class="pager" id="inv-pager-top"></div>
         <div class="scroll-mirror-top" id="inv-table-mirror"><div class="scroll-mirror-top-inner"></div></div>
         <div class="table-scroll" id="inv-table-scroll">
           <table>
@@ -1015,6 +1022,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             <tbody id="inv-tbody"></tbody>
           </table>
         </div>
+        <div class="pager" id="inv-pager-bottom"></div>
       </div>
     </div>
   </div>
@@ -1128,12 +1136,14 @@ const DASHBOARD_PAGE = `<!doctype html>
           <input type="text" class="search-input" id="stk-q" placeholder="英語商品名・日本語商品名・商品ID・SKUで検索…">
           <span class="result-count" id="stk-count"></span>
         </div>
+        <div class="pager" id="stk-pager-top"></div>
         <div class="table-scroll">
           <table>
             <thead><tr><th>商品ID</th><th>商品名(英語)</th><th>商品名(日本語)</th><th>画像</th><th class="num">リアル在庫</th><th class="num">棚卸入力数量</th><th>入力日時</th></tr></thead>
             <tbody id="stk-tbody"></tbody>
           </table>
         </div>
+        <div class="pager" id="stk-pager-bottom"></div>
       </div>
     </div>
 
@@ -1682,6 +1692,9 @@ const INV_HIDDEN = [
 ];
 let invSort = { idx: 0, dir: -1 };
 let invSelected = new Set();
+const INV_PAGE_SIZE = 500;
+let invPage = 1;
+let invPrevQ = "";
 
 function sortInvRows(rows) {
   const idx = invSort.idx, dir = invSort.dir;
@@ -1755,22 +1768,47 @@ function renderInventory() {
     th.addEventListener("click", () => {
       const idx = Number(th.dataset.idx);
       invSort = { idx, dir: invSort.idx === idx ? -invSort.dir : -1 };
+      invPage = 1;
       renderInventory();
     });
   });
 
   const q = document.getElementById("inv-q").value.trim().toLowerCase();
+  if (!q && invPrevQ) invPage = 1; // 検索を解除したら通常のページ表示(1ページ目)に戻す
+  invPrevQ = q;
+
   const tbody = document.getElementById("inv-tbody");
+  const pagerTop = document.getElementById("inv-pager-top");
+  const pagerBottom = document.getElementById("inv-pager-bottom");
   tbody.innerHTML = "";
-  let shown = 0;
   const stockIdx = invHeaders.indexOf("在庫数(現物)");
   const visible = [];
   const sortedInv = sortInvRows(invRows);
-  sortedInv.forEach(row => {
-    const pid = row[0];
+  const matched = sortedInv.filter((row) => {
     const searchable = ((row[0]||"") + " " + (row[1]||"")).toLowerCase();
-    if (q && searchable.indexOf(q) === -1) return;
-    shown++;
+    return !q || searchable.indexOf(q) !== -1;
+  });
+
+  let pageRows, totalPages;
+  if (q) {
+    // 検索時: 全商品を対象に絞り込み、ページ分けせずヒット件数だけ表示する
+    pageRows = matched;
+    totalPages = 1;
+    pagerTop.innerHTML = "";
+    pagerBottom.innerHTML = "";
+  } else {
+    totalPages = Math.max(1, Math.ceil(matched.length / INV_PAGE_SIZE));
+    if (invPage > totalPages) invPage = totalPages;
+    if (invPage < 1) invPage = 1;
+    const start = (invPage - 1) * INV_PAGE_SIZE;
+    pageRows = matched.slice(start, start + INV_PAGE_SIZE);
+    const goToInvPage = (p) => { invPage = p; renderInventory(); };
+    renderPager(pagerTop, invPage, totalPages, goToInvPage);
+    renderPager(pagerBottom, invPage, totalPages, goToInvPage);
+  }
+
+  pageRows.forEach(row => {
+    const pid = row[0];
     visible.push(pid);
     const tr = document.createElement("tr");
     const cbTd = document.createElement("td");
@@ -1819,7 +1857,14 @@ function renderInventory() {
     });
     tbody.appendChild(tr);
   });
-  document.getElementById("inv-count").textContent = shown.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + " 件";
+  if (q) {
+    document.getElementById("inv-count").textContent = matched.length.toLocaleString("ja-JP") + " 件ヒット(全" + invRows.length.toLocaleString("ja-JP") + "件中)";
+  } else {
+    const start = (invPage - 1) * INV_PAGE_SIZE;
+    document.getElementById("inv-count").textContent =
+      (matched.length ? (start + 1) : 0).toLocaleString("ja-JP") + "〜" + Math.min(start + INV_PAGE_SIZE, matched.length).toLocaleString("ja-JP") +
+      " / " + invRows.length.toLocaleString("ja-JP") + " 件(" + invPage + " / " + totalPages + " ページ)";
+  }
   const selectAllCb = document.getElementById("inv-select-all");
   selectAllCb.checked = visible.length > 0 && visible.every((id) => invSelected.has(id));
   selectAllCb.addEventListener("change", () => {
@@ -1935,7 +1980,104 @@ function renderDiscrepancies(rows) {
 document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscrepancies);
 
 // ---- 棚卸 ----
-function loadStocktakeList() { renderStocktake(); }
+const STK_PAGE_SIZE = 300;
+let stkPage = 1;
+let stkPrevQ = "";
+
+function loadStocktakeList() { stkPage = 1; renderStocktake(); }
+
+function stkRowMatches(row, idx, q) {
+  const pid = row[idx.pid];
+  const name = row[idx.name] || "";
+  const jaName = row[idx.jaName] || "";
+  const sku = row[idx.sku] || ""; // 検索対象のみ。一覧には表示しない
+  const searchable = (String(pid || "") + " " + name + " " + jaName + " " + sku).toLowerCase();
+  return !q || searchable.indexOf(q) !== -1;
+}
+
+function buildStocktakeRow(row, idx) {
+  const pid = row[idx.pid];
+  const name = row[idx.name] || "";
+  const jaName = row[idx.jaName] || "";
+  const tr = document.createElement("tr");
+  const pidTd = document.createElement("td");
+  pidTd.textContent = pid;
+  tr.appendChild(pidTd);
+  const nameTd = document.createElement("td");
+  nameTd.className = "stk-en-name";
+  nameTd.textContent = name;
+  nameTd.title = name;
+  tr.appendChild(nameTd);
+
+  const jaTd = document.createElement("td");
+  const jaInp = document.createElement("textarea");
+  jaInp.className = "ja-name-input";
+  jaInp.rows = 2;
+  jaInp.value = jaName;
+  jaInp.addEventListener("change", () => saveInventoryTextField(tr, pid, "日本語商品名", jaInp.value, () => { row[idx.jaName] = jaInp.value; }));
+  jaTd.appendChild(jaInp);
+  tr.appendChild(jaTd);
+
+  const imgTd = document.createElement("td");
+  const imageUrl = row[idx.image];
+  const thumbBtn = document.createElement("button");
+  if (imageUrl) {
+    thumbBtn.className = "thumb-btn";
+    const img = document.createElement("img");
+    img.src = imageUrl; img.loading = "lazy"; img.alt = name;
+    thumbBtn.appendChild(img);
+    thumbBtn.addEventListener("click", () => openImageModal(imageUrl, pid, name, jaName));
+  } else {
+    thumbBtn.className = "thumb-btn no-image";
+    thumbBtn.textContent = "画像なし";
+    thumbBtn.disabled = true;
+  }
+  imgTd.appendChild(thumbBtn);
+  tr.appendChild(imgTd);
+
+  const realTd = document.createElement("td");
+  realTd.className = "num";
+  realTd.textContent = row[idx.real] === null || row[idx.real] === undefined ? "(未設定)" : Number(row[idx.real]).toLocaleString("ja-JP");
+  tr.appendChild(realTd);
+
+  const stagedTd = document.createElement("td");
+  stagedTd.className = "num";
+  const inp = document.createElement("input");
+  inp.type = "number"; inp.step = "1";
+  inp.value = row[idx.staged] === null || row[idx.staged] === undefined ? "" : row[idx.staged];
+  inp.addEventListener("change", () => saveStocktakeQty(tr, pid, inp.value, (savedAt) => {
+    row[idx.staged] = inp.value === "" ? null : Number(inp.value);
+    row[idx.stagedAt] = savedAt;
+    atTd.textContent = savedAt ? savedAt.slice(0, 16).replace("T", " ") : "";
+  }));
+  stagedTd.appendChild(inp);
+  tr.appendChild(stagedTd);
+
+  const atTd = document.createElement("td");
+  atTd.textContent = row[idx.stagedAt] ? String(row[idx.stagedAt]).slice(0, 16).replace("T", " ") : "";
+  tr.appendChild(atTd);
+  return tr;
+}
+
+// 汎用ページャー描画。currentPageは現在ページ、onGoToPageはページ番号を受け取って移動する関数。
+function renderPager(container, currentPage, totalPages, onGoToPage) {
+  container.innerHTML = "";
+  if (totalPages <= 1) return;
+  const mkBtn = (label, page, opts) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (opts && opts.active) b.className = "active";
+    if (opts && opts.disabled) b.disabled = true;
+    b.addEventListener("click", () => onGoToPage(page));
+    return b;
+  };
+  container.appendChild(mkBtn("前へ", currentPage - 1, { disabled: currentPage <= 1 }));
+  for (let p = 1; p <= totalPages; p++) {
+    container.appendChild(mkBtn(String(p), p, { active: p === currentPage }));
+  }
+  container.appendChild(mkBtn("次へ", currentPage + 1, { disabled: currentPage >= totalPages }));
+}
+
 function renderStocktake() {
   if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='7'>在庫データが読み込まれていません</td></tr>"; return; }
   const idx = {
@@ -1944,73 +2086,39 @@ function renderStocktake() {
     real: invHeaders.indexOf("リアル在庫"), staged: invHeaders.indexOf("棚卸入力数量"), stagedAt: invHeaders.indexOf("棚卸入力日時"),
   };
   const q = document.getElementById("stk-q").value.trim().toLowerCase();
+  // 検索を解除したら通常のページ表示(1ページ目)に戻す
+  if (!q && stkPrevQ) stkPage = 1;
+  stkPrevQ = q;
+
   const tbody = document.getElementById("stk-tbody");
+  const pagerTop = document.getElementById("stk-pager-top");
+  const pagerBottom = document.getElementById("stk-pager-bottom");
   tbody.innerHTML = "";
-  let shown = 0;
-  invRows.forEach((row) => {
-    const pid = row[idx.pid];
-    const name = row[idx.name] || "";
-    const jaName = row[idx.jaName] || "";
-    const sku = row[idx.sku] || ""; // 検索対象のみ。一覧には表示しない
-    const searchable = (String(pid || "") + " " + name + " " + jaName + " " + sku).toLowerCase();
-    if (q && searchable.indexOf(q) === -1) return;
-    shown++;
-    const tr = document.createElement("tr");
-    const pidTd = document.createElement("td");
-    pidTd.textContent = pid;
-    tr.appendChild(pidTd);
-    const nameTd = document.createElement("td");
-    nameTd.className = "stk-en-name";
-    nameTd.textContent = name;
-    nameTd.title = name;
-    tr.appendChild(nameTd);
 
-    const jaTd = document.createElement("td");
-    const jaInp = document.createElement("textarea");
-    jaInp.className = "ja-name-input";
-    jaInp.rows = 2;
-    jaInp.value = jaName;
-    jaInp.addEventListener("change", () => saveInventoryTextField(tr, pid, "日本語商品名", jaInp.value));
-    jaTd.appendChild(jaInp);
-    tr.appendChild(jaTd);
+  if (q) {
+    // 検索時: 全1,192件を対象に絞り込み、ページ分けせずヒット件数だけ表示する
+    const matched = invRows.filter((row) => stkRowMatches(row, idx, q));
+    matched.forEach((row) => tbody.appendChild(buildStocktakeRow(row, idx)));
+    pagerTop.innerHTML = "";
+    pagerBottom.innerHTML = "";
+    document.getElementById("stk-count").textContent = matched.length.toLocaleString("ja-JP") + " 件ヒット(全" + invRows.length.toLocaleString("ja-JP") + "件中)";
+    return;
+  }
 
-    const imgTd = document.createElement("td");
-    const imageUrl = row[idx.image];
-    const thumbBtn = document.createElement("button");
-    if (imageUrl) {
-      thumbBtn.className = "thumb-btn";
-      const img = document.createElement("img");
-      img.src = imageUrl; img.loading = "lazy"; img.alt = name;
-      thumbBtn.appendChild(img);
-      thumbBtn.addEventListener("click", () => openImageModal(imageUrl, pid, name, jaName));
-    } else {
-      thumbBtn.className = "thumb-btn no-image";
-      thumbBtn.textContent = "画像なし";
-      thumbBtn.disabled = true;
-    }
-    imgTd.appendChild(thumbBtn);
-    tr.appendChild(imgTd);
+  // 通常時: 300件ごとにページ分けし、実際にDOMへ描画する行数もそのページ分だけに絞る
+  const totalPages = Math.max(1, Math.ceil(invRows.length / STK_PAGE_SIZE));
+  if (stkPage > totalPages) stkPage = totalPages;
+  if (stkPage < 1) stkPage = 1;
+  const start = (stkPage - 1) * STK_PAGE_SIZE;
+  const pageRows = invRows.slice(start, start + STK_PAGE_SIZE);
+  pageRows.forEach((row) => tbody.appendChild(buildStocktakeRow(row, idx)));
 
-    const realTd = document.createElement("td");
-    realTd.className = "num";
-    realTd.textContent = row[idx.real] === null || row[idx.real] === undefined ? "(未設定)" : Number(row[idx.real]).toLocaleString("ja-JP");
-    tr.appendChild(realTd);
-
-    const stagedTd = document.createElement("td");
-    stagedTd.className = "num";
-    const inp = document.createElement("input");
-    inp.type = "number"; inp.step = "1";
-    inp.value = row[idx.staged] === null || row[idx.staged] === undefined ? "" : row[idx.staged];
-    inp.addEventListener("change", () => saveStocktakeQty(tr, pid, inp.value));
-    stagedTd.appendChild(inp);
-    tr.appendChild(stagedTd);
-
-    const atTd = document.createElement("td");
-    atTd.textContent = row[idx.stagedAt] ? String(row[idx.stagedAt]).slice(0, 16).replace("T", " ") : "";
-    tr.appendChild(atTd);
-    tbody.appendChild(tr);
-  });
-  document.getElementById("stk-count").textContent = shown.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + " 件";
+  const goToStkPage = (p) => { stkPage = p; renderStocktake(); };
+  renderPager(pagerTop, stkPage, totalPages, goToStkPage);
+  renderPager(pagerBottom, stkPage, totalPages, goToStkPage);
+  document.getElementById("stk-count").textContent =
+    (invRows.length ? (start + 1) : 0).toLocaleString("ja-JP") + "〜" + Math.min(start + STK_PAGE_SIZE, invRows.length).toLocaleString("ja-JP") +
+    " / " + invRows.length.toLocaleString("ja-JP") + " 件(" + stkPage + " / " + totalPages + " ページ)";
 }
 document.getElementById("stk-q").addEventListener("input", renderStocktake);
 
@@ -2028,7 +2136,7 @@ document.getElementById("img-modal-overlay").addEventListener("click", (evt) => 
   if (evt.target.id === "img-modal-overlay") closeImageModal();
 });
 
-async function saveStocktakeQty(tr, pid, value) {
+async function saveStocktakeQty(tr, pid, value, onSuccess) {
   tr.className = "saving";
   const token = getToken();
   const body = { 商品ID: pid, 棚卸入力数量: value === "" ? "" : Number(value) };
@@ -2041,12 +2149,14 @@ async function saveStocktakeQty(tr, pid, value) {
     if (!r.ok) { tr.className = "error"; return; }
     tr.className = "saved";
     setTimeout(() => { tr.className = ""; }, 1500);
+    // ページ切り替え後も入力値が消えないよう、保存成功時にクライアント側のキャッシュ(invRows)も更新する
+    if (onSuccess) onSuccess(value === "" ? null : new Date().toISOString());
   } catch (e) {
     tr.className = "error";
   }
 }
 
-async function saveInventoryTextField(tr, pid, field, value) {
+async function saveInventoryTextField(tr, pid, field, value, onSuccess) {
   tr.className = "saving";
   const token = getToken();
   const body = { 商品ID: pid };
@@ -2060,6 +2170,7 @@ async function saveInventoryTextField(tr, pid, field, value) {
     if (!r.ok) { tr.className = "error"; return; }
     tr.className = "saved";
     setTimeout(() => { tr.className = ""; }, 1500);
+    if (onSuccess) onSuccess();
   } catch (e) {
     tr.className = "error";
   }
