@@ -29,10 +29,12 @@ const INV_HEADERS = [
   "US_出品ID", "US価格(USD)", "US累計売却数", "UK_出品ID", "UK価格(GBP)", "UK累計売却数",
   "AU_出品ID", "AU価格(AUD)", "AU累計売却数", "仕入価格(円)", "仕入日", "仕入先", "備考",
   "UK在庫数", "AU在庫数", "リアル在庫", "リアル在庫確認日", "棚卸入力数量", "棚卸入力日時",
+  "画像URL", "日本語商品名",
 ];
 const INV_COL = {
   商品ID: 1, 商品名: 2, バリエーション詳細: 3, 在庫数: 4, 出品国数: 5, 在庫数不一致: 6, 仕入価格: 16, 仕入日: 17, 仕入先: 18, 備考: 19,
   UK在庫数: 20, AU在庫数: 21, リアル在庫: 22, リアル在庫確認日: 23, 棚卸入力数量: 24, 棚卸入力日時: 25,
+  画像URL: 26, 日本語商品名: 27,
 };
 
 if (!API_TOKEN) {
@@ -562,6 +564,7 @@ async function handlePatchInventory(req, res) {
     if ("仕入日" in body) row.getCell(INV_COL.仕入日).value = body["仕入日"];
     if ("仕入先" in body) row.getCell(INV_COL.仕入先).value = body["仕入先"];
     if ("備考" in body) row.getCell(INV_COL.備考).value = body["備考"];
+    if ("日本語商品名" in body) row.getCell(INV_COL.日本語商品名).value = body["日本語商品名"];
     row.commit();
     updated = true;
   }
@@ -630,6 +633,21 @@ async function handleDiscrepancies(req, res) {
   const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
   const rows = realInv.computeDiscrepancies({ ws, INV_HEADERS, INV_COL });
   sendJson(res, 200, { count: rows.length, rows });
+}
+
+// eBay同期で「どのUS出品にも紐付かなかった」UK/AU出品の一覧(在庫管理表には反映されない未紐付け分)。
+// 無理な統合はせず、そのまま「要確認」として提示するためのエンドポイント。CSV取込時はこのシートが無いため空配列を返す。
+async function handleUnlinkedInventory(req, res) {
+  const wb = await loadInventoryWorkbook();
+  const ws = wb.getWorksheet("UK_AU保管(US未紐付け)");
+  if (!ws) return sendJson(res, 200, { count: 0, rows: [] });
+  const headers = ["サイト", "出品ID", "商品名", "在庫数", "累計売却数", "価格", "通貨", "出品開始日時"];
+  const rows = [];
+  ws.eachRow((row, r) => {
+    if (r === 1) return;
+    rows.push(headers.map((_, i) => row.getCell(i + 1).value));
+  });
+  sendJson(res, 200, { count: rows.length, headers, rows });
 }
 
 async function handleStocktakePreview(req, res) {
@@ -828,6 +846,15 @@ const DASHBOARD_PAGE = `<!doctype html>
   .row-unconfirmed { background: rgba(255,196,0,0.12); }
   .mismatch-cell { color: var(--series-cost); font-weight: 700; }
   .row-abnormal { background: rgba(235,104,52,0.14); }
+  .thumb-btn { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); cursor: pointer; padding: 0; overflow: hidden; }
+  .thumb-btn img { width: 100%; height: 100%; object-fit: cover; }
+  .thumb-btn.no-image { font-size: 9px; color: var(--ink-muted); text-align: center; line-height: 1.2; }
+  .img-modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100; align-items: center; justify-content: center; }
+  .img-modal-overlay.show { display: flex; }
+  .img-modal { background: var(--surface); border-radius: 10px; padding: 16px; max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; gap: 10px; align-items: center; }
+  .img-modal img { max-width: 80vw; max-height: 70vh; object-fit: contain; border-radius: 6px; }
+  .img-modal-caption { font-size: 13px; color: var(--ink-2); text-align: center; }
+  .img-modal-close { align-self: flex-end; }
 
   .row2 { display: grid; grid-template-columns: 1.3fr 1fr; gap: 20px; }
   @media (max-width: 860px) { .row2 { grid-template-columns: 1fr; } }
@@ -1065,8 +1092,24 @@ const DASHBOARD_PAGE = `<!doctype html>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>商品ID</th><th>商品名</th><th class="num">リアル在庫</th><th class="num">US</th><th class="num">UK</th><th class="num">AU</th><th>リアル在庫確認日</th></tr></thead>
+            <thead><tr><th>商品ID</th><th>商品名</th><th class="num">リアル在庫</th><th class="num">US在庫</th><th class="num">UK在庫</th><th class="num">AU在庫</th><th>リアル在庫確認日</th></tr></thead>
             <tbody id="disc-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>未紐付け(要確認)</h2>
+      <p class="desc">UK/AUの出品のうち、タイトルの一致でどのUS出品にも紐付けられなかったものです。<b>同一商品と確実に判断できないため、自動では統合していません。</b>実際には既存商品と同一の可能性があるので、手動でご確認ください。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar">
+          <span class="result-count" id="unlinked-count"></span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>サイト</th><th>出品ID</th><th>商品名</th><th class="num">在庫数</th><th class="num">価格</th><th>出品開始日時</th></tr></thead>
+            <tbody id="unlinked-tbody"></tbody>
           </table>
         </div>
       </div>
@@ -1076,15 +1119,15 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div class="tabpanel" id="tab-stocktake">
     <div class="panel">
       <h2>棚卸入力</h2>
-      <p class="desc">「棚卸入力数量」に実際に数えた個数を入力すると、その場で一時保存されます(この時点ではリアル在庫は変わりません)。入力が終わったら下の「一括確定」で内容を確認してからリアル在庫へ反映してください。</p>
+      <p class="desc">「棚卸入力数量」に実際に数えた個数を入力すると、その場で一時保存されます(この時点ではリアル在庫は変わりません)。入力が終わったら下の「一括確定」で内容を確認してからリアル在庫へ反映してください。日本語商品名はその場で編集・保存できます。「画像」をクリックすると商品画像を拡大表示します。</p>
       <div class="panel-body">
         <div class="browser-toolbar">
-          <input type="text" class="search-input" id="stk-q" placeholder="商品名・商品IDで検索…">
+          <input type="text" class="search-input" id="stk-q" placeholder="英語商品名・日本語商品名・商品IDで検索…">
           <span class="result-count" id="stk-count"></span>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>商品ID</th><th>商品名</th><th class="num">リアル在庫</th><th class="num">棚卸入力数量</th><th>入力日時</th></tr></thead>
+            <thead><tr><th>商品ID</th><th>商品名(英語)</th><th>商品名(日本語)</th><th>画像</th><th class="num">リアル在庫</th><th class="num">棚卸入力数量</th><th>入力日時</th></tr></thead>
             <tbody id="stk-tbody"></tbody>
           </table>
         </div>
@@ -1145,6 +1188,13 @@ const DASHBOARD_PAGE = `<!doctype html>
   </div>
 </div>
 <div class="viz-tooltip" id="tooltip"></div>
+<div class="img-modal-overlay" id="img-modal-overlay">
+  <div class="img-modal">
+    <button class="btn img-modal-close" id="img-modal-close">閉じる ×</button>
+    <img id="img-modal-img" src="" alt="商品画像">
+    <div class="img-modal-caption" id="img-modal-caption"></div>
+  </div>
+</div>
 <script>
 const ORD_HEADERS = ["注文番号","日付","サイト","商品メモ","数量","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
 const ORD_EDITABLE = ["収益USD","ドル円レート","数量","仕入原価(円)","送料(円)","梱包費(円)"];
@@ -1838,6 +1888,26 @@ async function loadDiscrepancies() {
   } catch (e) {
     tbody.innerHTML = "<tr><td colspan='7'>通信エラー: " + e.message + "</td></tr>";
   }
+  loadUnlinked();
+}
+
+async function loadUnlinked() {
+  const tbody = document.getElementById("unlinked-tbody");
+  tbody.innerHTML = "<tr><td colspan='6'>読み込み中...</td></tr>";
+  const token = getToken();
+  try {
+    const r = await fetch("/api/inventory/unlinked", { headers: { Authorization: "Bearer " + token } });
+    const data = await r.json();
+    if (!r.ok) { tbody.innerHTML = "<tr><td colspan='6'>エラー: " + (data.error || r.status) + "</td></tr>"; return; }
+    document.getElementById("unlinked-count").textContent = data.count.toLocaleString("ja-JP") + " 件";
+    if (!data.count) { tbody.innerHTML = "<tr><td colspan='6'>未紐付けの出品はありません</td></tr>"; return; }
+    tbody.innerHTML = data.rows.map((r) =>
+      "<tr><td><span class='site-chip'>" + (r[0] || "") + "</span></td><td>" + (r[1] || "") + "</td><td class='truncate'>" + (r[2] || "") +
+      "</td><td class='num'>" + fmt(r[3]) + "</td><td class='num'>" + fmt(r[5]) + "</td><td>" + (r[7] ? String(r[7]).slice(0, 10) : "") + "</td></tr>"
+    ).join("");
+  } catch (e) {
+    tbody.innerHTML = "<tr><td colspan='6'>通信エラー: " + e.message + "</td></tr>";
+  }
 }
 function renderDiscrepancies(rows) {
   document.getElementById("disc-count").textContent = rows.length.toLocaleString("ja-JP") + " 件";
@@ -1859,9 +1929,10 @@ document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscre
 // ---- 棚卸 ----
 function loadStocktakeList() { renderStocktake(); }
 function renderStocktake() {
-  if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='5'>在庫データが読み込まれていません</td></tr>"; return; }
+  if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='7'>在庫データが読み込まれていません</td></tr>"; return; }
   const idx = {
-    pid: invHeaders.indexOf("商品ID"), name: invHeaders.indexOf("商品名"),
+    pid: invHeaders.indexOf("商品ID"), name: invHeaders.indexOf("商品名"), jaName: invHeaders.indexOf("日本語商品名"),
+    image: invHeaders.indexOf("画像URL"),
     real: invHeaders.indexOf("リアル在庫"), staged: invHeaders.indexOf("棚卸入力数量"), stagedAt: invHeaders.indexOf("棚卸入力日時"),
   };
   const q = document.getElementById("stk-q").value.trim().toLowerCase();
@@ -1871,12 +1942,49 @@ function renderStocktake() {
   invRows.forEach((row) => {
     const pid = row[idx.pid];
     const name = row[idx.name] || "";
-    const searchable = (String(pid || "") + " " + name).toLowerCase();
+    const jaName = row[idx.jaName] || "";
+    const searchable = (String(pid || "") + " " + name + " " + jaName).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
     const tr = document.createElement("tr");
-    tr.innerHTML = "<td>" + pid + "</td><td class='truncate'>" + name + "</td><td class='num'>" +
-      (row[idx.real] === null || row[idx.real] === undefined ? "(未設定)" : Number(row[idx.real]).toLocaleString("ja-JP")) + "</td>";
+    const pidTd = document.createElement("td");
+    pidTd.textContent = pid;
+    tr.appendChild(pidTd);
+    const nameTd = document.createElement("td");
+    nameTd.className = "truncate";
+    nameTd.textContent = name;
+    tr.appendChild(nameTd);
+
+    const jaTd = document.createElement("td");
+    const jaInp = document.createElement("input");
+    jaInp.type = "text"; jaInp.className = "wide-input";
+    jaInp.value = jaName;
+    jaInp.addEventListener("change", () => saveInventoryTextField(tr, pid, "日本語商品名", jaInp.value));
+    jaTd.appendChild(jaInp);
+    tr.appendChild(jaTd);
+
+    const imgTd = document.createElement("td");
+    const imageUrl = row[idx.image];
+    const thumbBtn = document.createElement("button");
+    if (imageUrl) {
+      thumbBtn.className = "thumb-btn";
+      const img = document.createElement("img");
+      img.src = imageUrl; img.loading = "lazy"; img.alt = name;
+      thumbBtn.appendChild(img);
+      thumbBtn.addEventListener("click", () => openImageModal(imageUrl, pid, name, jaName));
+    } else {
+      thumbBtn.className = "thumb-btn no-image";
+      thumbBtn.textContent = "画像なし";
+      thumbBtn.disabled = true;
+    }
+    imgTd.appendChild(thumbBtn);
+    tr.appendChild(imgTd);
+
+    const realTd = document.createElement("td");
+    realTd.className = "num";
+    realTd.textContent = row[idx.real] === null || row[idx.real] === undefined ? "(未設定)" : Number(row[idx.real]).toLocaleString("ja-JP");
+    tr.appendChild(realTd);
+
     const stagedTd = document.createElement("td");
     stagedTd.className = "num";
     const inp = document.createElement("input");
@@ -1885,6 +1993,7 @@ function renderStocktake() {
     inp.addEventListener("change", () => saveStocktakeQty(tr, pid, inp.value));
     stagedTd.appendChild(inp);
     tr.appendChild(stagedTd);
+
     const atTd = document.createElement("td");
     atTd.textContent = row[idx.stagedAt] ? String(row[idx.stagedAt]).slice(0, 16).replace("T", " ") : "";
     tr.appendChild(atTd);
@@ -1894,10 +2003,43 @@ function renderStocktake() {
 }
 document.getElementById("stk-q").addEventListener("input", renderStocktake);
 
+function openImageModal(url, pid, name, jaName) {
+  document.getElementById("img-modal-img").src = url;
+  document.getElementById("img-modal-caption").textContent = pid + " / " + name + (jaName ? " / " + jaName : "");
+  document.getElementById("img-modal-overlay").classList.add("show");
+}
+function closeImageModal() {
+  document.getElementById("img-modal-overlay").classList.remove("show");
+  document.getElementById("img-modal-img").src = "";
+}
+document.getElementById("img-modal-close").addEventListener("click", closeImageModal);
+document.getElementById("img-modal-overlay").addEventListener("click", (evt) => {
+  if (evt.target.id === "img-modal-overlay") closeImageModal();
+});
+
 async function saveStocktakeQty(tr, pid, value) {
   tr.className = "saving";
   const token = getToken();
   const body = { 商品ID: pid, 棚卸入力数量: value === "" ? "" : Number(value) };
+  try {
+    const r = await fetch("/api/inventory", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { tr.className = "error"; return; }
+    tr.className = "saved";
+    setTimeout(() => { tr.className = ""; }, 1500);
+  } catch (e) {
+    tr.className = "error";
+  }
+}
+
+async function saveInventoryTextField(tr, pid, field, value) {
+  tr.className = "saving";
+  const token = getToken();
+  const body = { 商品ID: pid };
+  body[field] = value;
   try {
     const r = await fetch("/api/inventory", {
       method: "PATCH",
@@ -2314,7 +2456,7 @@ const server = http.createServer(async (req, res) => {
   const protectedRoutes = [
     "/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary",
     "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild",
-    "/api/inventory/discrepancies", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/history",
+    "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/history",
     "/api/closing/checklist", "/api/closing/export", "/api/closing/snapshot", "/api/closing/snapshots",
   ];
   const isProtected = protectedRoutes.includes(pathname) || pathname.startsWith("/download/snapshots/");
@@ -2340,6 +2482,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/import/inventory") return await handleImportInventory(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/rebuild") return await handleRebuildInventory(req, res);
     if (req.method === "GET" && pathname === "/api/inventory/discrepancies") return await handleDiscrepancies(req, res);
+    if (req.method === "GET" && pathname === "/api/inventory/unlinked") return await handleUnlinkedInventory(req, res);
     if (req.method === "GET" && pathname === "/api/inventory/stocktake/preview") return await handleStocktakePreview(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/stocktake/confirm") return await handleStocktakeConfirm(req, res);
     if (req.method === "GET" && pathname === "/api/inventory/history") return await handleInventoryHistory(req, res);

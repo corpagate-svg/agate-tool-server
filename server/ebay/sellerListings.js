@@ -52,6 +52,7 @@ function parseActiveItems(xmlText) {
       viewItemUrl: getTag(block, "ViewItemURL"),
       startTime: getTag(block, "StartTime"),
       hasVariations: block.includes("<Variations>"), // バリエーション(色・サイズ違い等)出品かどうか
+      galleryUrl: getTag(block, "GalleryURL"), // <PictureDetails><GalleryURL>...(追加スコープ不要、既存レスポンスに含まれる)
     };
   });
 }

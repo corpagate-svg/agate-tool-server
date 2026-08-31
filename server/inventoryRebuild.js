@@ -121,6 +121,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
     let pid;
     let purchasePrice = null, purchaseDate = null, purchaseFrom = null, note = "";
     let realStock = null, realStockConfirmedAt = null, stocktakeQty = null, stocktakeAt = null;
+    let imageUrl = null, jaName = null;
     if (saved.has(key)) {
       const s = saved.get(key);
       pid = s.商品ID;
@@ -130,6 +131,8 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
       realStockConfirmedAt = s.fullRow[22] ?? null;
       stocktakeQty = s.fullRow[23] ?? null;
       stocktakeAt = s.fullRow[24] ?? null;
+      imageUrl = s.fullRow[25] ?? null;
+      jaName = s.fullRow[26] ?? null;
     } else {
       pid = "P" + String(nextId).padStart(4, "0");
       nextId++;
@@ -151,6 +154,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
         purchasePrice, purchaseDate, purchaseFrom, note,
         bySite.UK ? intOrNullCsv(bySite.UK["Available quantity"]) : null, bySite.AU ? intOrNullCsv(bySite.AU["Available quantity"]) : null,
         realStock, realStockConfirmedAt, stocktakeQty, stocktakeAt,
+        imageUrl, jaName,
       ],
       status: "current",
       flag: siteCount < 3 || qtys.size > 1,
@@ -170,7 +174,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
     }
     const carried = s.fullRow.slice(0, 15);
     rowsOut.push({
-      row: carried.concat([s.fullRow[15], s.fullRow[16], s.fullRow[17], note]).concat(s.fullRow.slice(19, 25)),
+      row: carried.concat([s.fullRow[15], s.fullRow[16], s.fullRow[17], note]).concat(s.fullRow.slice(19, 27)),
       status: "removed",
     });
   }
@@ -199,7 +203,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
       for (let c = 1; c <= INV_HEADERS.length; c++) excelRow.getCell(c).fill = fill;
     }
   });
-  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30, 12, 12, 12, 16, 12, 18];
+  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30, 12, 12, 12, 16, 12, 18, 40, 30];
   widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
   const ws2 = wb.addWorksheet("要確認(重複出品)");
@@ -231,6 +235,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
     "・仕入価格・仕入日・仕入先・備考は、前回入力済みだった内容をそのまま引き継いでいます。",
     "・「リアル在庫」「リアル在庫確認日」「棚卸入力数量」「棚卸入力日時」は当社独自管理の値のため、このCSV再取込では一切上書きしません(前回の値をそのまま引き継ぎます)。",
     "・「UK在庫数」「AU在庫数」は、eBay自己申告のCSV上の在庫数をそのまま反映したものです(リアル在庫とは別物です)。",
+    "・「画像URL」「日本語商品名」も当社独自管理の値のため、このCSV再取込では一切上書きしません(前回の値をそのまま引き継ぎます。画像URLはeBay同期を実行した場合のみ更新されます)。",
   ];
   notes.forEach((n, i) => {
     const cell = ws3.getCell(`A${i + 3}`);
