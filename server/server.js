@@ -7,7 +7,8 @@ const { sendJson, sendHtml, contentDispositionAttachment } = require("./httpUtil
 const { handleEbayConnect, handleEbayCallback, handleEbayInventory, createInventoryRebuildHandler } = require("./ebay/routes");
 const { rebuildInventoryFromRecords } = require("./inventoryRebuild");
 const realInv = require("./realInventory");
-const { listHistory } = require("./inventoryHistory");
+const { listHistory, appendHistory } = require("./inventoryHistory");
+const { withInventoryLock, atomicWriteWorkbook, atomicWriteBuffer } = require("./inventoryLock");
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
@@ -29,12 +30,12 @@ const INV_HEADERS = [
   "US_出品ID", "US価格(USD)", "US累計売却数", "UK_出品ID", "UK価格(GBP)", "UK累計売却数",
   "AU_出品ID", "AU価格(AUD)", "AU累計売却数", "仕入価格(円)", "仕入日", "仕入先", "備考",
   "UK在庫数", "AU在庫数", "リアル在庫", "リアル在庫確認日", "棚卸入力数量", "棚卸入力日時",
-  "画像URL", "日本語商品名", "SKU",
+  "画像URL", "日本語商品名", "SKU", "棚卸チェック",
 ];
 const INV_COL = {
   商品ID: 1, 商品名: 2, バリエーション詳細: 3, 在庫数: 4, 出品国数: 5, 在庫数不一致: 6, 仕入価格: 16, 仕入日: 17, 仕入先: 18, 備考: 19,
   UK在庫数: 20, AU在庫数: 21, リアル在庫: 22, リアル在庫確認日: 23, 棚卸入力数量: 24, 棚卸入力日時: 25,
-  画像URL: 26, 日本語商品名: 27, SKU: 28,
+  画像URL: 26, 日本語商品名: 27, SKU: 28, 棚卸チェック: 29,
 };
 
 if (!API_TOKEN) {
@@ -375,17 +376,21 @@ async function handleDeleteInventory(req, res) {
   const targets = new Set((body["商品ID"] || []).map(String));
   if (!targets.size) return sendJson(res, 400, { error: "削除する商品IDを指定してください" });
 
-  const wb = await loadInventoryWorkbook();
-  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
-  const toRemove = [];
-  for (let r = 2; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
-    if (targets.has(String(row.getCell(INV_COL.商品ID).value || ""))) toRemove.push(r);
-  }
-  for (let i = toRemove.length - 1; i >= 0; i--) ws.spliceRows(toRemove[i], 1);
-  if (!toRemove.length) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
-  await wb.xlsx.writeFile(INVENTORY_PATH);
-  sendJson(res, 200, { status: "ok", deleted: toRemove.length });
+  const deletedCount = await withInventoryLock(async () => {
+    const wb = await loadInventoryWorkbook();
+    const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+    const toRemove = [];
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const row = ws.getRow(r);
+      if (targets.has(String(row.getCell(INV_COL.商品ID).value || ""))) toRemove.push(r);
+    }
+    for (let i = toRemove.length - 1; i >= 0; i--) ws.spliceRows(toRemove[i], 1);
+    if (!toRemove.length) return 0;
+    await atomicWriteWorkbook(wb, INVENTORY_PATH);
+    return toRemove.length;
+  });
+  if (!deletedCount) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
+  sendJson(res, 200, { status: "ok", deleted: deletedCount });
 }
 
 function isOrderRow(row) {
@@ -551,12 +556,28 @@ async function handlePatchInventory(req, res) {
   const pid = body["商品ID"];
   if (!pid) return sendJson(res, 400, { error: "商品ID は必須です" });
 
-  const wb = await loadInventoryWorkbook();
-  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
-  let updated = false;
-  for (let r = 2; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
-    if (String(row.getCell(INV_COL.商品ID).value || "") !== String(pid)) continue;
+  // ロック取得前に弾けるバリデーションは先に済ませる(不正な値でロックを無駄に占有しない)。
+  let stagedQty; // undefined = 対象外, null = クリア, それ以外 = 0以上の整数
+  if ("棚卸入力数量" in body) {
+    const v = realInv.validateStocktakeQty(body["棚卸入力数量"]);
+    if (!v.ok) return sendJson(res, 400, { error: v.error });
+    stagedQty = v.value;
+  }
+  let realStockValue; // undefined = 対象外
+  if ("リアル在庫" in body) {
+    realStockValue = numOrNull(body["リアル在庫"]);
+    if (realStockValue === null) return sendJson(res, 400, { error: "リアル在庫 は数値で指定してください" });
+  }
+
+  // 在庫管理表.xlsxへの読み込み→変更→書き込みは1リクエストにつき1回だけ行う
+  // (以前は汎用フィールド・リアル在庫・棚卸入力数量でそれぞれ個別に読み書きしており、
+  //  Excel全体への書き込みが最大3回発生していた。同時更新の競合リスクを減らすため統合する)。
+  const outcome = await withInventoryLock(async () => {
+    const wb = await loadInventoryWorkbook();
+    const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+    const row = realInv.findInventoryRow(ws, INV_COL, pid);
+    if (!row) return { found: false };
+
     if ("仕入価格円" in body) {
       const v = numOrNull(body["仕入価格円"]);
       row.getCell(INV_COL.仕入価格).value = v === null ? "" : v;
@@ -565,27 +586,28 @@ async function handlePatchInventory(req, res) {
     if ("仕入先" in body) row.getCell(INV_COL.仕入先).value = body["仕入先"];
     if ("備考" in body) row.getCell(INV_COL.備考).value = body["備考"];
     if ("日本語商品名" in body) row.getCell(INV_COL.日本語商品名).value = body["日本語商品名"];
+
+    // リアル在庫・棚卸入力数量は当社独自管理の値のため、専用の変更ロジック(realInventory.js)を
+    // 同じトランザクション内で(読み込み・書き込みを増やさずに)適用する。
+    let realStockChange = null;
+    if (realStockValue !== undefined) {
+      realStockChange = realInv.applyRealStockToRow(row, INV_COL, realStockValue, body["リアル在庫確認日"] || null);
+    }
+    if (stagedQty !== undefined) {
+      realInv.applyStagedQtyToRow(row, INV_COL, stagedQty);
+    }
+
     row.commit();
-    updated = true;
-  }
+    await atomicWriteWorkbook(wb, INVENTORY_PATH);
+    return { found: true, name: row.getCell(INV_COL.商品名).value, realStockChange };
+  });
 
-  if (!updated) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
-  await wb.xlsx.writeFile(INVENTORY_PATH);
+  if (!outcome.found) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
 
-  // リアル在庫・棚卸入力数量は当社独自管理の値のため、履歴記録を伴う専用ロジック(realInventory.js)へ委譲する。
-  if ("リアル在庫" in body) {
-    const v = numOrNull(body["リアル在庫"]);
-    if (v === null) return sendJson(res, 400, { error: "リアル在庫 は数値で指定してください" });
-    const r = await realInv.setRealStock({
-      loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL,
-      pid, value: v, confirmedAt: body["リアル在庫確認日"] || null,
+  if (outcome.realStockChange) {
+    await appendHistory(HISTORY_PATH, {
+      pid, name: outcome.name, before: outcome.realStockChange.before, after: outcome.realStockChange.after, reason: "手動変更",
     });
-    if (!r.ok) return sendJson(res, 404, { error: r.error });
-  }
-  if ("棚卸入力数量" in body) {
-    const v = body["棚卸入力数量"] === "" || body["棚卸入力数量"] === null ? null : numOrNull(body["棚卸入力数量"]);
-    const r = await realInv.stageStocktakeQty({ loadInventoryWorkbook, INVENTORY_PATH, INV_COL, pid, qty: v });
-    if (!r.ok) return sendJson(res, 404, { error: r.error });
   }
 
   sendJson(res, 200, { status: "ok", 商品ID: pid });
@@ -599,9 +621,9 @@ async function handleImportInventory(req, res) {
   } catch (e) {
     return sendJson(res, 400, { error: "有効なxlsxファイルではありません" });
   }
-  const tmpPath = INVENTORY_PATH + ".tmp";
-  fs.writeFileSync(tmpPath, buf);
-  fs.renameSync(tmpPath, INVENTORY_PATH);
+  await withInventoryLock(async () => {
+    atomicWriteBuffer(buf, INVENTORY_PATH);
+  });
   sendJson(res, 200, { status: "ok", message: "取り込みが完了しました" });
 }
 
@@ -668,6 +690,12 @@ async function handleStocktakeConfirm(req, res) {
     loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_HEADERS, INV_COL,
     targetPids: Array.isArray(body["商品ID"]) ? body["商品ID"] : null,
   });
+  sendJson(res, 200, { status: "ok", ...result });
+}
+
+// 棚卸チェックの一括解除。リアル在庫・棚卸入力数量・日本語商品名などは一切変更しない。
+async function handleStocktakeResetChecks(req, res) {
+  const result = await realInv.resetStocktakeChecks({ loadInventoryWorkbook, INVENTORY_PATH, INV_COL });
   sendJson(res, 200, { status: "ok", ...result });
 }
 
@@ -840,8 +868,6 @@ const DASHBOARD_PAGE = `<!doctype html>
   .item-link { color: var(--series-rev); text-decoration: underline; }
   .item-link:hover { text-decoration: none; }
   td.truncate { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  td.truncate.copyable-name { cursor: pointer; }
-  td.truncate.copyable-name:hover { text-decoration: underline dotted; color: var(--series-rev); }
   td.stk-en-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   textarea.ja-name-input { font: inherit; font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; width: 260px; min-height: 40px; max-height: 78px; resize: vertical; line-height: 1.35; white-space: normal; overflow-wrap: break-word; }
   textarea.ja-name-input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
@@ -851,6 +877,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   .row-unconfirmed { background: rgba(255,196,0,0.12); }
   .mismatch-cell { color: var(--series-cost); font-weight: 700; }
   .row-abnormal { background: rgba(235,104,52,0.14); }
+  .stk-check-badge { display: none; align-items: center; justify-content: center; width: 16px; height: 16px; margin-left: 6px; border-radius: 50%; background: rgba(27,175,122,0.16); color: var(--good); font-size: 10px; font-weight: 700; vertical-align: middle; }
   .pager { display: flex; align-items: center; gap: 6px; margin: 10px 0; flex-wrap: wrap; }
   .pager button { font: inherit; font-size: 12.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; min-width: 32px; }
   .pager button:hover:not(:disabled) { background: var(--accent-wash); }
@@ -1135,13 +1162,18 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p class="desc">「棚卸入力数量」に実際に数えた個数を入力すると、その場で一時保存されます(この時点ではリアル在庫は変わりません)。入力が終わったら下の「一括確定」で内容を確認してからリアル在庫へ反映してください。日本語商品名はその場で編集・保存できます。「画像」をクリックすると商品画像を拡大表示します。</p>
       <div class="panel-body">
         <div class="browser-toolbar">
+          <span class="result-count" id="stk-progress"></span>
+          <button class="btn" id="stk-reset-checks-btn">棚卸チェックをすべて解除</button>
+          <span id="stk-reset-status" class="hint"></span>
+        </div>
+        <div class="browser-toolbar">
           <input type="text" class="search-input" id="stk-q" placeholder="英語商品名・日本語商品名・商品ID・SKUで検索…">
           <span class="result-count" id="stk-count"></span>
         </div>
         <div class="pager" id="stk-pager-top"></div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>商品ID</th><th>商品名(英語)</th><th>商品名(日本語)</th><th>画像</th><th class="num">リアル在庫</th><th class="num">棚卸入力数量</th><th>入力日時</th></tr></thead>
+            <thead><tr><th>商品ID</th><th>商品名(英語)</th><th>商品名(日本語)</th><th>画像</th><th class="num">仕入価格(円)</th><th class="num">リアル在庫</th><th class="num">棚卸入力数量</th><th>入力日時</th></tr></thead>
             <tbody id="stk-tbody"></tbody>
           </table>
         </div>
@@ -1690,7 +1722,7 @@ const INV_HIDDEN = [
   "UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致", "バリエーション詳細", "仕入先",
   // リアル在庫機能の追加列。通常の「在庫」タブ(eBayのCSVをそのまま反映する場所)の見た目は変更しないため非表示にする。
   // 各値は「相違」「棚卸」「決算」タブや検索(SKU)から個別に利用する。
-  "UK在庫数", "AU在庫数", "リアル在庫", "リアル在庫確認日", "棚卸入力数量", "棚卸入力日時", "画像URL", "日本語商品名", "SKU",
+  "UK在庫数", "AU在庫数", "リアル在庫", "リアル在庫確認日", "棚卸入力数量", "棚卸入力日時", "画像URL", "日本語商品名", "SKU", "棚卸チェック",
 ];
 let invSort = { idx: 0, dir: -1 };
 let invSelected = new Set();
@@ -1835,14 +1867,14 @@ function renderInventory() {
         const inp = document.createElement("input");
         inp.type = "number"; inp.step = "any";
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
-        inp.addEventListener("change", () => saveInventoryField(tr, pid, h, inp.value));
+        inp.addEventListener("change", () => saveInventoryField(tr, pid, h, inp.value, row));
         td.appendChild(inp);
       } else if (INV_EDITABLE_TEXT.includes(h)) {
         const inp = document.createElement("input");
         inp.type = "text";
         inp.className = h === "備考" ? "wide-input wider" : "wide-input";
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
-        inp.addEventListener("change", () => saveInventoryField(tr, pid, h, inp.value));
+        inp.addEventListener("change", () => saveInventoryField(tr, pid, h, inp.value, row));
         td.appendChild(inp);
       } else if (h === "US_出品ID" && row[i] !== null && row[i] !== undefined && row[i] !== "") {
         const a = document.createElement("a");
@@ -1908,11 +1940,15 @@ document.getElementById("inv-csv-export").addEventListener("click", () => {
   downloadCsv("在庫一覧_" + new Date().toISOString().slice(0, 10) + ".csv", displayOrder.map((i) => invHeaders[i]), rows);
 });
 
-async function saveInventoryField(tr, pid, header, value) {
+// row(invRows内の該当行オブジェクト、任意)を渡すと保存成功時にそのままキャッシュへ反映する。
+// 在庫タブ・棚卸タブは同じ invRows 配列を参照して描画しているため、これだけで両タブが
+// リロードなしに最新値を表示できる(仕入価格(円)はどちらのタブから編集しても同じ列を更新する)。
+async function saveInventoryField(tr, pid, header, value, row) {
   tr.className = "saving";
   const token = getToken();
+  const isNum = INV_EDITABLE_NUM.includes(header);
   const body = { 商品ID: pid };
-  body[INV_FIELD_KEY[header]] = INV_EDITABLE_NUM.includes(header) ? (value === "" ? "" : Number(value)) : value;
+  body[INV_FIELD_KEY[header]] = isNum ? (value === "" ? "" : Number(value)) : value;
   try {
     const r = await fetch("/api/inventory", {
       method: "PATCH",
@@ -1922,6 +1958,10 @@ async function saveInventoryField(tr, pid, header, value) {
     if (!r.ok) { tr.className = "error"; return; }
     tr.className = "saved";
     setTimeout(() => { tr.className = ""; }, 1500);
+    if (row) {
+      const idx = invHeaders.indexOf(header);
+      if (idx !== -1) row[idx] = isNum ? (value === "" ? null : Number(value)) : value;
+    }
   } catch (e) {
     tr.className = "error";
   }
@@ -1956,45 +1996,10 @@ async function loadUnlinked() {
     if (!r.ok) { tbody.innerHTML = "<tr><td colspan='6'>エラー: " + (data.error || r.status) + "</td></tr>"; return; }
     document.getElementById("unlinked-count").textContent = data.count.toLocaleString("ja-JP") + " 件";
     if (!data.count) { tbody.innerHTML = "<tr><td colspan='6'>未紐付けの出品はありません</td></tr>"; return; }
-    tbody.innerHTML = "";
-    data.rows.forEach((r) => {
-      const fullName = r[2] || "";
-      const tr = document.createElement("tr");
-
-      const siteTd = document.createElement("td");
-      const chip = document.createElement("span");
-      chip.className = "site-chip";
-      chip.textContent = r[0] || "";
-      siteTd.appendChild(chip);
-      tr.appendChild(siteTd);
-
-      const idTd = document.createElement("td");
-      idTd.textContent = r[1] || "";
-      tr.appendChild(idTd);
-
-      const nameTd = document.createElement("td");
-      nameTd.className = "truncate copyable-name";
-      nameTd.textContent = fullName; // 画面上は省略表示(CSS)だが、テキスト自体は常に全文を保持している
-      nameTd.title = fullName + "\n(クリックで商品名をコピー)";
-      nameTd.addEventListener("click", (evt) => copyUnlinkedName(evt, fullName));
-      tr.appendChild(nameTd);
-
-      const qtyTd = document.createElement("td");
-      qtyTd.className = "num";
-      qtyTd.textContent = fmt(r[3]);
-      tr.appendChild(qtyTd);
-
-      const priceTd = document.createElement("td");
-      priceTd.className = "num";
-      priceTd.textContent = fmt(r[5]);
-      tr.appendChild(priceTd);
-
-      const dateTd = document.createElement("td");
-      dateTd.textContent = r[7] ? String(r[7]).slice(0, 10) : "";
-      tr.appendChild(dateTd);
-
-      tbody.appendChild(tr);
-    });
+    tbody.innerHTML = data.rows.map((r) =>
+      "<tr><td><span class='site-chip'>" + (r[0] || "") + "</span></td><td>" + (r[1] || "") + "</td><td class='truncate'>" + (r[2] || "") +
+      "</td><td class='num'>" + fmt(r[3]) + "</td><td class='num'>" + fmt(r[5]) + "</td><td>" + (r[7] ? String(r[7]).slice(0, 10) : "") + "</td></tr>"
+    ).join("");
   } catch (e) {
     tbody.innerHTML = "<tr><td colspan='6'>通信エラー: " + e.message + "</td></tr>";
   }
@@ -2015,17 +2020,6 @@ function renderDiscrepancies(rows) {
   }).join("");
 }
 document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscrepancies);
-
-// 未紐付け一覧の商品名クリックで全文をクリップボードへコピーする(画面上は省略表示のままでよい)
-async function copyUnlinkedName(evt, fullName) {
-  try {
-    await navigator.clipboard.writeText(fullName);
-    showTooltip(evt, "コピーしました");
-  } catch (e) {
-    showTooltip(evt, "コピーに失敗しました");
-  }
-  setTimeout(hideTooltip, 1200);
-}
 
 // ---- 棚卸 ----
 const STK_PAGE_SIZE = 300;
@@ -2083,6 +2077,15 @@ function buildStocktakeRow(row, idx) {
   imgTd.appendChild(thumbBtn);
   tr.appendChild(imgTd);
 
+  const priceTd = document.createElement("td");
+  priceTd.className = "num";
+  const priceInp = document.createElement("input");
+  priceInp.type = "number"; priceInp.step = "any";
+  priceInp.value = row[idx.price] === null || row[idx.price] === undefined ? "" : row[idx.price];
+  priceInp.addEventListener("change", () => saveInventoryField(tr, pid, "仕入価格(円)", priceInp.value, row));
+  priceTd.appendChild(priceInp);
+  tr.appendChild(priceTd);
+
   const realTd = document.createElement("td");
   realTd.className = "num";
   realTd.textContent = row[idx.real] === null || row[idx.real] === undefined ? "(未設定)" : Number(row[idx.real]).toLocaleString("ja-JP");
@@ -2093,12 +2096,24 @@ function buildStocktakeRow(row, idx) {
   const inp = document.createElement("input");
   inp.type = "number"; inp.step = "1";
   inp.value = row[idx.staged] === null || row[idx.staged] === undefined ? "" : row[idx.staged];
+  const checkBadge = document.createElement("span");
+  checkBadge.className = "stk-check-badge";
+  checkBadge.title = "棚卸済み";
+  checkBadge.textContent = "✓";
+  checkBadge.style.display = row[idx.checked] ? "inline-flex" : "none";
   inp.addEventListener("change", () => saveStocktakeQty(tr, pid, inp.value, (savedAt) => {
     row[idx.staged] = inp.value === "" ? null : Number(inp.value);
     row[idx.stagedAt] = savedAt;
     atTd.textContent = savedAt ? savedAt.slice(0, 16).replace("T", " ") : "";
+    // 0を含め、数量が正常保存されたら棚卸済みチェックを立てる(未入力に戻しても自動では解除しない)
+    if (inp.value !== "" && !row[idx.checked]) {
+      row[idx.checked] = true;
+      checkBadge.style.display = "inline-flex";
+      renderStocktakeProgress();
+    }
   }));
   stagedTd.appendChild(inp);
+  stagedTd.appendChild(checkBadge);
   tr.appendChild(stagedTd);
 
   const atTd = document.createElement("td");
@@ -2127,12 +2142,15 @@ function renderPager(container, currentPage, totalPages, onGoToPage) {
 }
 
 function renderStocktake() {
-  if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='7'>在庫データが読み込まれていません</td></tr>"; return; }
+  if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='8'>在庫データが読み込まれていません</td></tr>"; return; }
   const idx = {
     pid: invHeaders.indexOf("商品ID"), name: invHeaders.indexOf("商品名"), jaName: invHeaders.indexOf("日本語商品名"),
     image: invHeaders.indexOf("画像URL"), sku: invHeaders.indexOf("SKU"),
+    price: invHeaders.indexOf("仕入価格(円)"),
     real: invHeaders.indexOf("リアル在庫"), staged: invHeaders.indexOf("棚卸入力数量"), stagedAt: invHeaders.indexOf("棚卸入力日時"),
+    checked: invHeaders.indexOf("棚卸チェック"),
   };
+  renderStocktakeProgress(idx);
   const q = document.getElementById("stk-q").value.trim().toLowerCase();
   // 検索を解除したら通常のページ表示(1ページ目)に戻す
   if (!q && stkPrevQ) stkPage = 1;
@@ -2169,6 +2187,40 @@ function renderStocktake() {
     " / " + invRows.length.toLocaleString("ja-JP") + " 件(" + stkPage + " / " + totalPages + " ページ)";
 }
 document.getElementById("stk-q").addEventListener("input", renderStocktake);
+
+// 検索条件やページに関わらず、全商品を対象に棚卸チェックの進捗を集計する
+function renderStocktakeProgress(idx) {
+  const checkedIdx = idx ? idx.checked : invHeaders.indexOf("棚卸チェック");
+  const total = invRows.length;
+  const checked = checkedIdx === -1 ? 0 : invRows.filter((row) => Boolean(row[checkedIdx])).length;
+  const pct = total ? (checked / total * 100).toFixed(1) : "0.0";
+  document.getElementById("stk-progress").textContent =
+    "棚卸進捗　" + checked.toLocaleString("ja-JP") + " / " + total.toLocaleString("ja-JP") + "件(" + pct + "%)";
+}
+
+document.getElementById("stk-reset-checks-btn").addEventListener("click", async () => {
+  if (!confirm("棚卸済みチェックをすべて解除しますか?\\n棚卸入力数量やリアル在庫は変更されません。")) return;
+  const statusEl = document.getElementById("stk-reset-status");
+  statusEl.textContent = "解除中...";
+  statusEl.className = "hint";
+  const token = getToken();
+  try {
+    const r = await fetch("/api/inventory/stocktake/reset-checks", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token },
+    });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    const checkedIdx = invHeaders.indexOf("棚卸チェック");
+    if (checkedIdx !== -1) invRows.forEach((row) => { row[checkedIdx] = null; });
+    renderStocktake();
+    statusEl.textContent = data.reset.toLocaleString("ja-JP") + "件のチェックを解除しました";
+    statusEl.className = "hint ok";
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
 
 function openImageModal(url, pid, name, jaName) {
   document.getElementById("img-modal-img").src = url;
@@ -2626,7 +2678,7 @@ const server = http.createServer(async (req, res) => {
   const protectedRoutes = [
     "/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary",
     "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild",
-    "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/history",
+    "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/stocktake/reset-checks", "/api/inventory/history",
     "/api/closing/checklist", "/api/closing/export", "/api/closing/snapshot", "/api/closing/snapshots",
   ];
   const isProtected = protectedRoutes.includes(pathname) || pathname.startsWith("/download/snapshots/");
@@ -2655,6 +2707,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/inventory/unlinked") return await handleUnlinkedInventory(req, res);
     if (req.method === "GET" && pathname === "/api/inventory/stocktake/preview") return await handleStocktakePreview(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/stocktake/confirm") return await handleStocktakeConfirm(req, res);
+    if (req.method === "POST" && pathname === "/api/inventory/stocktake/reset-checks") return await handleStocktakeResetChecks(req, res);
     if (req.method === "GET" && pathname === "/api/inventory/history") return await handleInventoryHistory(req, res);
     if (req.method === "GET" && pathname === "/api/closing/checklist") return await handleClosingChecklist(req, res);
     if (req.method === "GET" && pathname === "/api/closing/export") return await handleClosingExport(req, res);

@@ -6,6 +6,7 @@
 const fs = require("fs");
 const ExcelJS = require("exceljs");
 const { appendHistory } = require("./inventoryHistory");
+const { withInventoryLock, atomicWriteWorkbook } = require("./inventoryLock");
 
 // 棚卸確定時、この基準を超える差異は「異常値の可能性あり」として警告する。
 // 絶対値5個以上、または現在のリアル在庫の50%以上の変動のどちらか。
@@ -37,49 +38,80 @@ function todayStr() {
 // 該当商品IDが見つからない場合はエラーにせず、warningのみを返す(注文処理は継続させる)。
 async function adjustRealStock({ loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL, pid, delta, reason, orderNo }) {
   if (!pid || !delta) return { ok: true, warning: null };
-  const wb = await loadInventoryWorkbook();
-  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
-  const row = findInventoryRow(ws, INV_COL, pid);
-  if (!row) {
-    return { ok: false, warning: `商品ID「${pid}」が在庫管理表に見つからないため、リアル在庫は変更されていません(${reason})` };
-  }
-  const before = Number(row.getCell(INV_COL.リアル在庫).value) || 0;
-  const after = before + delta;
-  row.getCell(INV_COL.リアル在庫).value = after;
-  row.commit();
-  await wb.xlsx.writeFile(INVENTORY_PATH);
-  await appendHistory(HISTORY_PATH, {
-    pid, name: row.getCell(INV_COL.商品名).value, before, after, reason, orderNo,
+  const result = await withInventoryLock(async () => {
+    const wb = await loadInventoryWorkbook();
+    const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+    const row = findInventoryRow(ws, INV_COL, pid);
+    if (!row) {
+      return { ok: false, warning: `商品ID「${pid}」が在庫管理表に見つからないため、リアル在庫は変更されていません(${reason})` };
+    }
+    const before = Number(row.getCell(INV_COL.リアル在庫).value) || 0;
+    const after = before + delta;
+    row.getCell(INV_COL.リアル在庫).value = after;
+    row.commit();
+    await atomicWriteWorkbook(wb, INVENTORY_PATH);
+    return { ok: true, warning: null, before, after, name: row.getCell(INV_COL.商品名).value };
   });
-  return { ok: true, warning: null, before, after };
+  if (result.ok) {
+    await appendHistory(HISTORY_PATH, {
+      pid, name: result.name, before: result.before, after: result.after, reason, orderNo,
+    });
+  }
+  return result;
 }
 
-// 手動編集による絶対値でのリアル在庫更新。確認日は自動的に今日にする(明示指定があればそちらを優先)。
-async function setRealStock({ loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL, pid, value, confirmedAt }) {
-  const wb = await loadInventoryWorkbook();
-  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
-  const row = findInventoryRow(ws, INV_COL, pid);
-  if (!row) return { ok: false, error: "該当する商品IDが見つかりません" };
+// 棚卸入力数量の検証。JSON number型で0以上の整数のみ許可し、空文字/null/undefinedは
+// 「クリア」として扱う。それ以外(数字の文字列・空白文字列・真偽値・配列・NaN・Infinity・
+// 負数・小数)は不正として拒否する(既存値を消さないため)。
+// Number()による強制変換より前にtypeofで弾くことで、"0"や"10"、true/false、[]、[5]のような
+// 「Number()に通せば数値になってしまう」値を確実に拒否する。
+function validateStocktakeQty(raw) {
+  if (raw === "" || raw === null || raw === undefined) return { ok: true, value: null };
+  if (typeof raw !== "number") return { ok: false, error: "棚卸入力数量は数値で指定してください" };
+  if (!Number.isFinite(raw)) return { ok: false, error: "棚卸入力数量は数値で指定してください" };
+  if (!Number.isInteger(raw)) return { ok: false, error: "棚卸入力数量は整数で指定してください" };
+  if (raw < 0) return { ok: false, error: "棚卸入力数量は0以上の整数で指定してください" };
+  return { ok: true, value: raw };
+}
+
+// リアル在庫を絶対値で更新する純粋な変更処理(読み込み・書き込みは呼び出し側のトランザクションで行う)。
+// 確認日は自動的に今日にする(明示指定があればそちらを優先)。
+function applyRealStockToRow(row, INV_COL, value, confirmedAt) {
   const before = Number(row.getCell(INV_COL.リアル在庫).value) || 0;
   row.getCell(INV_COL.リアル在庫).value = value;
   row.getCell(INV_COL.リアル在庫確認日).value = confirmedAt || todayStr();
-  row.commit();
-  await wb.xlsx.writeFile(INVENTORY_PATH);
-  await appendHistory(HISTORY_PATH, { pid, name: row.getCell(INV_COL.商品名).value, before, after: value, reason: "手動変更" });
-  return { ok: true, before, after: value };
+  return { before, after: value };
 }
 
-// 棚卸入力数量の一時保存(段階1)。リアル在庫そのものは変更しない。
-async function stageStocktakeQty({ loadInventoryWorkbook, INVENTORY_PATH, INV_COL, pid, qty }) {
-  const wb = await loadInventoryWorkbook();
-  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
-  const row = findInventoryRow(ws, INV_COL, pid);
-  if (!row) return { ok: false, error: "該当する商品IDが見つかりません" };
-  row.getCell(INV_COL.棚卸入力数量).value = qty === null || qty === "" ? null : qty;
-  row.getCell(INV_COL.棚卸入力日時).value = qty === null || qty === "" ? null : new Date().toISOString();
-  row.commit();
-  await wb.xlsx.writeFile(INVENTORY_PATH);
-  return { ok: true };
+// 棚卸入力数量を反映する純粋な変更処理(読み込み・書き込みは呼び出し側のトランザクションで行う)。
+// value は validateStocktakeQty() で検証済みの値(null=クリア、それ以外は0以上の整数)。
+// 数量が正常に(0を含めて)保存された場合のみ「棚卸チェック」を自動的に立てる。
+// このチェックは「実際にその商品を数えたか」を管理する独立フラグのため、
+// 未入力に戻しても自動では解除しない(解除は棚卸チェックの一括解除操作のみで行う)。
+function applyStagedQtyToRow(row, INV_COL, value) {
+  const cleared = value === null;
+  row.getCell(INV_COL.棚卸入力数量).value = cleared ? null : value;
+  row.getCell(INV_COL.棚卸入力日時).value = cleared ? null : new Date().toISOString();
+  if (!cleared) row.getCell(INV_COL.棚卸チェック).value = true;
+}
+
+// 棚卸チェックの一括解除(手動運用のみ)。リアル在庫・棚卸入力数量・日本語商品名など
+// 他の列は一切変更しない。
+async function resetStocktakeChecks({ loadInventoryWorkbook, INVENTORY_PATH, INV_COL }) {
+  return withInventoryLock(async () => {
+    const wb = await loadInventoryWorkbook();
+    const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+    let reset = 0;
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const row = ws.getRow(r);
+      if (!row.getCell(INV_COL.棚卸チェック).value) continue;
+      row.getCell(INV_COL.棚卸チェック).value = null;
+      row.commit();
+      reset++;
+    }
+    await atomicWriteWorkbook(wb, INVENTORY_PATH);
+    return { reset };
+  });
 }
 
 function rowValues(row, INV_HEADERS) {
@@ -173,27 +205,30 @@ function previewStocktake({ ws, INV_HEADERS }) {
 // 棚卸一括確定(段階2): 棚卸入力数量をリアル在庫へ反映し、確認日を更新、履歴に記録、staging列をクリアする。
 // targetPids未指定の場合は「棚卸入力数量が入っている全行」が対象。
 async function confirmStocktake({ loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_HEADERS, INV_COL, targetPids, confirmedAt }) {
-  const wb = await loadInventoryWorkbook();
-  const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
-  const targetSet = targetPids && targetPids.length ? new Set(targetPids.map(String)) : null;
-  const applied = [];
-  const date = confirmedAt || todayStr();
-  for (let r = 2; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
-    const pid = String(row.getCell(INV_COL.商品ID).value || "");
-    const staged = row.getCell(INV_COL.棚卸入力数量).value;
-    if (staged === null || staged === undefined || staged === "") continue;
-    if (targetSet && !targetSet.has(pid)) continue;
-    const before = Number(row.getCell(INV_COL.リアル在庫).value) || 0;
-    const after = Number(staged) || 0;
-    row.getCell(INV_COL.リアル在庫).value = after;
-    row.getCell(INV_COL.リアル在庫確認日).value = date;
-    row.getCell(INV_COL.棚卸入力数量).value = null;
-    row.getCell(INV_COL.棚卸入力日時).value = null;
-    row.commit();
-    applied.push({ pid, name: row.getCell(INV_COL.商品名).value, before, after });
-  }
-  await wb.xlsx.writeFile(INVENTORY_PATH);
+  const applied = await withInventoryLock(async () => {
+    const wb = await loadInventoryWorkbook();
+    const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+    const targetSet = targetPids && targetPids.length ? new Set(targetPids.map(String)) : null;
+    const rows = [];
+    const date = confirmedAt || todayStr();
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const row = ws.getRow(r);
+      const pid = String(row.getCell(INV_COL.商品ID).value || "");
+      const staged = row.getCell(INV_COL.棚卸入力数量).value;
+      if (staged === null || staged === undefined || staged === "") continue;
+      if (targetSet && !targetSet.has(pid)) continue;
+      const before = Number(row.getCell(INV_COL.リアル在庫).value) || 0;
+      const after = Number(staged) || 0;
+      row.getCell(INV_COL.リアル在庫).value = after;
+      row.getCell(INV_COL.リアル在庫確認日).value = date;
+      row.getCell(INV_COL.棚卸入力数量).value = null;
+      row.getCell(INV_COL.棚卸入力日時).value = null;
+      row.commit();
+      rows.push({ pid, name: row.getCell(INV_COL.商品名).value, before, after });
+    }
+    await atomicWriteWorkbook(wb, INVENTORY_PATH);
+    return rows;
+  });
   for (const a of applied) {
     await appendHistory(HISTORY_PATH, { pid: a.pid, name: a.name, before: a.before, after: a.after, reason: "棚卸確定" });
   }
@@ -264,8 +299,10 @@ async function exportClosingXlsx({ ws, INV_HEADERS, asOf }) {
 module.exports = {
   findInventoryRow,
   adjustRealStock,
-  setRealStock,
-  stageStocktakeQty,
+  validateStocktakeQty,
+  applyRealStockToRow,
+  applyStagedQtyToRow,
+  resetStocktakeChecks,
   computeDiscrepancies,
   previewStocktake,
   confirmStocktake,

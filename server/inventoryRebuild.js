@@ -1,8 +1,8 @@
 // 在庫管理表(在庫数(現物)・US/UK/AU出品ID・累計売却数など)の再構築エンジン。
 // server.jsのhandleRebuildInventory(CSVアップロード)から移設したロジックで、動作は変更していません。
 // eBay Trading API経由の再構築(ebay/inventorySync.js)からも共通で利用します。
-const fs = require("fs");
 const ExcelJS = require("exceljs");
+const { withInventoryLock, atomicWriteWorkbook } = require("./inventoryLock");
 
 const INV_HEADER_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F4E78" } };
 const INV_HEADER_FONT = { bold: true, color: { argb: "FFFFFFFF" } };
@@ -58,7 +58,13 @@ function parseEbayStartDate(s) {
 }
 
 // records: [{ Title, "Listing site"(US/UK/AU), "Item number", "Variation details", "Available quantity", "Current price", "Sold quantity", "Custom label (SKU)", "Start date"(MMM-DD-YY), Currency }]
-async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLabel, INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook }) {
+// 最初の読み込みから最後の書き込みまでの間に他の更新が割り込むと、その更新が黙って
+// 消えてしまう(lost update)ため、この関数全体を在庫管理表.xlsxの共有ロックで直列化する。
+function rebuildInventoryFromRecords(args) {
+  return withInventoryLock(() => rebuildInventoryFromRecordsLocked(args));
+}
+
+async function rebuildInventoryFromRecordsLocked({ records, sourceNote, removedNoteLabel, INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook }) {
   const oldWb = await loadInventoryWorkbook();
   const oldWs = oldWb.getWorksheet("在庫管理表") || oldWb.worksheets[0];
   const saved = new Map();
@@ -121,7 +127,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
     let pid;
     let purchasePrice = null, purchaseDate = null, purchaseFrom = null, note = "";
     let realStock = null, realStockConfirmedAt = null, stocktakeQty = null, stocktakeAt = null;
-    let imageUrl = null, jaName = null;
+    let imageUrl = null, jaName = null, stocktakeChecked = null;
     if (saved.has(key)) {
       const s = saved.get(key);
       pid = s.商品ID;
@@ -133,6 +139,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
       stocktakeAt = s.fullRow[24] ?? null;
       imageUrl = s.fullRow[25] ?? null;
       jaName = s.fullRow[26] ?? null;
+      stocktakeChecked = s.fullRow[28] ?? null;
     } else {
       pid = "P" + String(nextId).padStart(4, "0");
       nextId++;
@@ -154,7 +161,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
         purchasePrice, purchaseDate, purchaseFrom, note,
         bySite.UK ? intOrNullCsv(bySite.UK["Available quantity"]) : null, bySite.AU ? intOrNullCsv(bySite.AU["Available quantity"]) : null,
         realStock, realStockConfirmedAt, stocktakeQty, stocktakeAt,
-        imageUrl, jaName, anchor["Custom label (SKU)"] || null,
+        imageUrl, jaName, anchor["Custom label (SKU)"] || null, stocktakeChecked,
       ],
       status: "current",
       flag: siteCount < 3 || qtys.size > 1,
@@ -174,7 +181,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
     }
     const carried = s.fullRow.slice(0, 15);
     rowsOut.push({
-      row: carried.concat([s.fullRow[15], s.fullRow[16], s.fullRow[17], note]).concat(s.fullRow.slice(19, 28)),
+      row: carried.concat([s.fullRow[15], s.fullRow[16], s.fullRow[17], note]).concat(s.fullRow.slice(19, 29)),
       status: "removed",
     });
   }
@@ -203,7 +210,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
       for (let c = 1; c <= INV_HEADERS.length; c++) excelRow.getCell(c).fill = fill;
     }
   });
-  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30, 12, 12, 12, 16, 12, 18, 40, 30, 16];
+  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30, 12, 12, 12, 16, 12, 18, 40, 30, 16, 12];
   widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
   const ws2 = wb.addWorksheet("要確認(重複出品)");
@@ -237,6 +244,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
     "・「UK在庫数」「AU在庫数」は、eBay自己申告のCSV上の在庫数をそのまま反映したものです(リアル在庫とは別物です)。",
     "・「画像URL」「日本語商品名」も当社独自管理の値のため、このCSV再取込では一切上書きしません(前回の値をそのまま引き継ぎます。画像URLはeBay同期を実行した場合のみ更新されます)。",
     "・「SKU」はCSV上のUS出品のCustom label(SKU)をそのまま反映したものです(検索用の補助情報で、画面には表示していません)。",
+    "・「棚卸チェック」は棚卸で実際に数えたかどうかを管理する当社独自のフラグです(このCSV再取込では一切上書きしません。解除は棚卸画面の「棚卸チェックをすべて解除」ボタンでのみ行います)。",
   ];
   notes.forEach((n, i) => {
     const cell = ws3.getCell(`A${i + 3}`);
@@ -245,9 +253,7 @@ async function rebuildInventoryFromRecords({ records, sourceNote, removedNoteLab
   });
   ws3.getColumn(1).width = 110;
 
-  const tmpPath = INVENTORY_PATH + ".tmp";
-  await wb.xlsx.writeFile(tmpPath);
-  fs.renameSync(tmpPath, INVENTORY_PATH);
+  await atomicWriteWorkbook(wb, INVENTORY_PATH);
 
   return {
     total: rowsOut.length,

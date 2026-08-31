@@ -7,9 +7,9 @@
 // 削除せず「UK_AU保管(US未紐付け)」シートに保管し、次回実行時に改めて評価し直す
 // (毎回eBayから取得した最新の生データだけを元に保管シートを作り直すため、
 //  紐付いた/削除されたUK・AU出品は自然に保管シートから消える)。
-const fs = require("fs");
 const ExcelJS = require("exceljs");
 const { fetchAllActiveListings } = require("./sellerListings");
+const { withInventoryLock, atomicWriteWorkbook } = require("../inventoryLock");
 const {
   normText,
   stripShippingNote,
@@ -75,6 +75,10 @@ function takeMatch(pool, key, anchorStartTime) {
   return { match, ambiguous };
 }
 
+// eBay APIへの通信(数秒〜数十秒かかり得る)はロックの外で行い、他の保存操作を
+// 不必要に待たせない。ロックを取るのは「在庫管理表.xlsxの読み込み→マージ→書き込み」
+// の間だけにし、しかもロック取得後に改めて最新のxlsxを読み込む(eBay通信中に行われた
+// 棚卸数量・仕入価格・日本語商品名・リアル在庫の変更を、古い状態で上書きして消さないため)。
 async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook }) {
   const allItems = await fetchAllActiveListings();
 
@@ -99,8 +103,11 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
   const ukPool = buildPool(ukItems);
   const auPool = buildPool(auItems);
 
+  // ---- ここから在庫管理表.xlsxへの読み込み→マージ→書き込み。ここだけ排他ロックする ----
+  return withInventoryLock(async () => {
   // 既存シートを読み込み、US_出品ID(最優先)またはタイトル(予備)で
-  // 商品ID・仕入情報を引き継ぐ
+  // 商品ID・仕入情報を引き継ぐ。ロック取得後に改めて読み込むことで、eBay通信中に
+  // 保存された最新の変更を土台にできる。
   const oldWb = await loadInventoryWorkbook();
   const oldWs = oldWb.getWorksheet("在庫管理表") || oldWb.worksheets[0];
   const savedByUsId = new Map();
@@ -154,7 +161,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     let pid;
     let purchasePrice = null, purchaseDate = null, purchaseFrom = null, note = "";
     let realStock = null, realStockConfirmedAt = null, stocktakeQty = null, stocktakeAt = null;
-    let jaName = null;
+    let jaName = null, stocktakeChecked = null;
     if (savedRow) {
       claimedSaved.add(savedRow);
       pid = savedRow.商品ID;
@@ -167,6 +174,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
       stocktakeQty = savedRow.fullRow[23] ?? null;
       stocktakeAt = savedRow.fullRow[24] ?? null;
       jaName = savedRow.fullRow[26] ?? null;
+      stocktakeChecked = savedRow.fullRow[28] ?? null;
     } else {
       pid = "P" + String(nextId).padStart(4, "0");
       nextId++;
@@ -198,7 +206,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
         ukResult.match ? ukResult.match.quantityAvailable : null,
         auResult.match ? auResult.match.quantityAvailable : null,
         realStock, realStockConfirmedAt, stocktakeQty, stocktakeAt,
-        usItem.galleryUrl || null, jaName, usItem.sku || null,
+        usItem.galleryUrl || null, jaName, usItem.sku || null, stocktakeChecked,
       ],
       flag: Boolean(flag),
     });
@@ -241,7 +249,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
       for (let c = 1; c <= INV_HEADERS.length; c++) excelRow.getCell(c).fill = INV_FLAG_FILL;
     }
   });
-  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30, 12, 12, 12, 16, 12, 18, 40, 30, 16];
+  const widths = [10, 40, 30, 12, 10, 12, 14, 12, 12, 14, 12, 12, 14, 12, 12, 14, 12, 16, 30, 12, 12, 12, 16, 12, 18, 40, 30, 16, 12];
   widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
   const ws2 = wb.addWorksheet("UK_AU保管(US未紐付け)");
@@ -271,6 +279,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     "・「UK在庫数」「AU在庫数」は、eBay自己申告の在庫数をそのまま反映したものです(リアル在庫とは別物です)。",
     "・注意: US出品が削除・終了してメインシートから消えた商品は、その時点のリアル在庫の記録もこの表からは消えます(削除自体は行われず単に一覧から除外されるため、現物在庫が残っている場合は「相違」ページや在庫変更履歴で確認してください)。",
     "・「画像URL」「SKU」はeBayの最新値をそのまま反映したものです(毎回更新されます)。「日本語商品名」は当社独自入力のため、このeBay同期では一切上書きしません。",
+    "・「棚卸チェック」は棚卸で実際に数えたかどうかを管理する当社独自のフラグです(このeBay同期では一切上書きしません。解除は棚卸画面の「棚卸チェックをすべて解除」ボタンでのみ行います)。",
   ];
   notes.forEach((n, i) => {
     const cell = ws3.getCell(`A${i + 3}`);
@@ -279,9 +288,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
   });
   ws3.getColumn(1).width = 110;
 
-  const tmpPath = INVENTORY_PATH + ".tmp";
-  await wb.xlsx.writeFile(tmpPath);
-  fs.renameSync(tmpPath, INVENTORY_PATH);
+  await atomicWriteWorkbook(wb, INVENTORY_PATH);
 
   return {
     usActiveListingsTotal: usRawAll.length,
@@ -297,6 +304,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     variationsExcludedTotal: usVariationCount + ukVariationCount + auVariationCount,
     unknownSiteSkipped: unknownSiteCount,
   };
+  }); // withInventoryLock ここまで
 }
 
 module.exports = { rebuildInventoryFromEbay, siteFromViewItemUrl };
