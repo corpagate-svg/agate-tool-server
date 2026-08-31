@@ -1946,7 +1946,7 @@ function renderStocktakePreview(data) {
   ).join("");
 
   document.getElementById("stk-confirm-row").style.display = data.targetCount > 0 ? "flex" : "none";
-});
+}
 
 document.getElementById("stk-confirm-btn").addEventListener("click", async () => {
   if (!stocktakePreviewRows.length) return;
