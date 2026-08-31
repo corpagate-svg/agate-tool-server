@@ -840,6 +840,8 @@ const DASHBOARD_PAGE = `<!doctype html>
   .item-link { color: var(--series-rev); text-decoration: underline; }
   .item-link:hover { text-decoration: none; }
   td.truncate { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.truncate.copyable-name { cursor: pointer; }
+  td.truncate.copyable-name:hover { text-decoration: underline dotted; color: var(--series-rev); }
   td.stk-en-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   textarea.ja-name-input { font: inherit; font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; width: 260px; min-height: 40px; max-height: 78px; resize: vertical; line-height: 1.35; white-space: normal; overflow-wrap: break-word; }
   textarea.ja-name-input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
@@ -1954,10 +1956,45 @@ async function loadUnlinked() {
     if (!r.ok) { tbody.innerHTML = "<tr><td colspan='6'>エラー: " + (data.error || r.status) + "</td></tr>"; return; }
     document.getElementById("unlinked-count").textContent = data.count.toLocaleString("ja-JP") + " 件";
     if (!data.count) { tbody.innerHTML = "<tr><td colspan='6'>未紐付けの出品はありません</td></tr>"; return; }
-    tbody.innerHTML = data.rows.map((r) =>
-      "<tr><td><span class='site-chip'>" + (r[0] || "") + "</span></td><td>" + (r[1] || "") + "</td><td class='truncate'>" + (r[2] || "") +
-      "</td><td class='num'>" + fmt(r[3]) + "</td><td class='num'>" + fmt(r[5]) + "</td><td>" + (r[7] ? String(r[7]).slice(0, 10) : "") + "</td></tr>"
-    ).join("");
+    tbody.innerHTML = "";
+    data.rows.forEach((r) => {
+      const fullName = r[2] || "";
+      const tr = document.createElement("tr");
+
+      const siteTd = document.createElement("td");
+      const chip = document.createElement("span");
+      chip.className = "site-chip";
+      chip.textContent = r[0] || "";
+      siteTd.appendChild(chip);
+      tr.appendChild(siteTd);
+
+      const idTd = document.createElement("td");
+      idTd.textContent = r[1] || "";
+      tr.appendChild(idTd);
+
+      const nameTd = document.createElement("td");
+      nameTd.className = "truncate copyable-name";
+      nameTd.textContent = fullName; // 画面上は省略表示(CSS)だが、テキスト自体は常に全文を保持している
+      nameTd.title = fullName + "\n(クリックで商品名をコピー)";
+      nameTd.addEventListener("click", (evt) => copyUnlinkedName(evt, fullName));
+      tr.appendChild(nameTd);
+
+      const qtyTd = document.createElement("td");
+      qtyTd.className = "num";
+      qtyTd.textContent = fmt(r[3]);
+      tr.appendChild(qtyTd);
+
+      const priceTd = document.createElement("td");
+      priceTd.className = "num";
+      priceTd.textContent = fmt(r[5]);
+      tr.appendChild(priceTd);
+
+      const dateTd = document.createElement("td");
+      dateTd.textContent = r[7] ? String(r[7]).slice(0, 10) : "";
+      tr.appendChild(dateTd);
+
+      tbody.appendChild(tr);
+    });
   } catch (e) {
     tbody.innerHTML = "<tr><td colspan='6'>通信エラー: " + e.message + "</td></tr>";
   }
@@ -1978,6 +2015,17 @@ function renderDiscrepancies(rows) {
   }).join("");
 }
 document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscrepancies);
+
+// 未紐付け一覧の商品名クリックで全文をクリップボードへコピーする(画面上は省略表示のままでよい)
+async function copyUnlinkedName(evt, fullName) {
+  try {
+    await navigator.clipboard.writeText(fullName);
+    showTooltip(evt, "コピーしました");
+  } catch (e) {
+    showTooltip(evt, "コピーに失敗しました");
+  }
+  setTimeout(hideTooltip, 1200);
+}
 
 // ---- 棚卸 ----
 const STK_PAGE_SIZE = 300;
