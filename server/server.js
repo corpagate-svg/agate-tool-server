@@ -825,6 +825,9 @@ const DASHBOARD_PAGE = `<!doctype html>
   .profit-cell { color: var(--good); font-weight: 600; }
   .profit-cell.bad { color: var(--series-cost); }
   .stock-zero { color: var(--series-cost); font-weight: 600; }
+  .row-unconfirmed { background: rgba(255,196,0,0.12); }
+  .mismatch-cell { color: var(--series-cost); font-weight: 700; }
+  .row-abnormal { background: rgba(235,104,52,0.14); }
 
   .row2 { display: grid; grid-template-columns: 1.3fr 1fr; gap: 20px; }
   @media (max-width: 860px) { .row2 { grid-template-columns: 1fr; } }
@@ -893,6 +896,9 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tabbtn active" data-tab="sales">売上分析</button>
     <button class="tabbtn" data-tab="inventory">在庫</button>
     <button class="tabbtn" data-tab="orders">注文</button>
+    <button class="tabbtn" data-tab="discrepancy">相違</button>
+    <button class="tabbtn" data-tab="stocktake">棚卸</button>
+    <button class="tabbtn" data-tab="closing">決算</button>
   </div>
 
   <div class="tabpanel active" id="tab-sales">
@@ -1005,6 +1011,10 @@ const DASHBOARD_PAGE = `<!doctype html>
             <label>梱包費(円)<input id="ne-packing" type="number" step="any" placeholder="わかれば入力" value="50"></label>
             <label>数量<input id="ne-qty" type="number" step="1"></label>
             <label style="grid-column:span 2;">商品メモ<input id="ne-note" type="text"></label>
+            <label style="grid-column:span 3;">商品ID(リアル在庫と連動させたい場合は指定。商品名で検索できます)
+              <input id="ne-pid" type="text" list="ne-pid-list" placeholder="例: P0001、または商品名で検索">
+              <datalist id="ne-pid-list"></datalist>
+            </label>
           </div>
           <div class="browser-toolbar" id="ne-submit-row" style="display:none;">
             <button class="btn" id="ne-submit-btn">この内容で登録する</button>
@@ -1032,6 +1042,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           <button class="btn" id="ord-csv-export">CSVでダウンロード</button>
           <span class="result-count" id="ord-count"></span>
         </div>
+        <datalist id="ord-pid-list"></datalist>
         <div class="scroll-mirror-top" id="ord-table-mirror"><div class="scroll-mirror-top-inner"></div></div>
         <div class="table-scroll" id="ord-table-scroll">
           <table>
@@ -1042,14 +1053,104 @@ const DASHBOARD_PAGE = `<!doctype html>
       </div>
     </div>
   </div>
+
+  <div class="tabpanel" id="tab-discrepancy">
+    <div class="panel">
+      <h2>相違一覧</h2>
+      <p class="desc">「リアル在庫」(当社独自管理の実在庫)と、eBay各国(US/UK/AU)の在庫数を比較します。出品されている国だけを比較し、<b>一致しない商品だけ</b>を表示します。まだ実地棚卸で確認していない行(リアル在庫確認日が空欄)は黄色で表示します。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar">
+          <button class="btn" id="disc-refresh-btn">再読み込み</button>
+          <span class="result-count" id="disc-count"></span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>商品ID</th><th>商品名</th><th class="num">リアル在庫</th><th class="num">US</th><th class="num">UK</th><th class="num">AU</th><th>リアル在庫確認日</th></tr></thead>
+            <tbody id="disc-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabpanel" id="tab-stocktake">
+    <div class="panel">
+      <h2>棚卸入力</h2>
+      <p class="desc">「棚卸入力数量」に実際に数えた個数を入力すると、その場で一時保存されます(この時点ではリアル在庫は変わりません)。入力が終わったら下の「一括確定」で内容を確認してからリアル在庫へ反映してください。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar">
+          <input type="text" class="search-input" id="stk-q" placeholder="商品名・商品IDで検索…">
+          <span class="result-count" id="stk-count"></span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>商品ID</th><th>商品名</th><th class="num">リアル在庫</th><th class="num">棚卸入力数量</th><th>入力日時</th></tr></thead>
+            <tbody id="stk-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>棚卸の一括確定</h2>
+      <p class="desc">「棚卸入力数量」を入力した商品だけが対象です。内容を確認してから確定してください(確定するとリアル在庫が書き換わります)。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar">
+          <button class="btn" id="stk-preview-btn">確定前に内容を確認する</button>
+          <span id="stk-preview-status" class="hint"></span>
+        </div>
+        <div id="stk-preview-summary" class="kpis" style="display:none; margin-bottom:16px;"></div>
+        <div class="table-scroll" id="stk-preview-table-wrap" style="display:none;">
+          <table>
+            <thead><tr><th>商品ID</th><th>商品名</th><th class="num">リアル在庫(現在)</th><th class="num">棚卸入力数量</th><th class="num">差異</th><th>異常値</th></tr></thead>
+            <tbody id="stk-preview-tbody"></tbody>
+          </table>
+        </div>
+        <div class="browser-toolbar" id="stk-confirm-row" style="display:none;">
+          <button class="btn" id="stk-confirm-btn">この内容で一括確定する</button>
+          <span id="stk-confirm-status" class="hint"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabpanel" id="tab-closing">
+    <div class="panel">
+      <h2>決算棚卸資産</h2>
+      <p class="desc">「リアル在庫」を基準に棚卸資産(商品ID・商品名・リアル在庫・仕入価格・評価額)をまとめます。決算日(基準日)を指定してください。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar">
+          <label class="hint">基準日 <input type="date" id="cls-asof"></label>
+          <button class="btn" id="cls-checklist-btn">未確認商品をチェック</button>
+          <button class="btn" id="cls-export-btn">棚卸資産をエクスポート(xlsx)</button>
+          <button class="btn" id="cls-snapshot-btn">この基準日でスナップショット保存</button>
+          <span id="cls-status" class="hint"></span>
+        </div>
+        <p class="hint">「未確認商品をチェック」は、基準日より前に実地棚卸(リアル在庫確認日)が済んでいない商品を一覧化します。「スナップショット保存」は、後から見返しても数字が変わらない確定記録として基準日ごとに1回だけ保存できます。</p>
+        <div class="table-scroll" id="cls-checklist-wrap" style="display:none;">
+          <table>
+            <thead><tr><th>商品ID</th><th>商品名</th><th class="num">リアル在庫</th><th>リアル在庫確認日</th></tr></thead>
+            <tbody id="cls-checklist-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>保存済みスナップショット</h2>
+      <div class="panel-body">
+        <ul id="cls-snapshot-list" class="hint"></ul>
+      </div>
+    </div>
+  </div>
 </div>
 <div class="viz-tooltip" id="tooltip"></div>
 <script>
 const ORD_HEADERS = ["注文番号","日付","サイト","商品メモ","数量","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
 const ORD_EDITABLE = ["収益USD","ドル円レート","数量","仕入原価(円)","送料(円)","梱包費(円)"];
-const ORD_EDITABLE_TEXT = ["商品メモ"];
+const ORD_EDITABLE_TEXT = ["商品メモ", "商品ID"];
 const ORD_NUM_COLS = ["収益USD","ドル円レート","数量","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
-const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円", "商品メモ": "商品メモ", "数量": "数量" };
+const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円", "商品メモ": "商品メモ", "数量": "数量", "商品ID": "商品ID" };
 const INV_NUM_COLS = ["在庫数(現物)","出品国数","US価格(USD)","US累計売却数","UK価格(GBP)","UK累計売却数","AU価格(AUD)","AU累計売却数","仕入価格(円)"];
 const INV_EDITABLE_TEXT = ["仕入日","備考"];
 const INV_EDITABLE_NUM = ["仕入価格(円)"];
@@ -1073,6 +1174,9 @@ document.querySelectorAll(".tabbtn").forEach(btn => {
     document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "orders") setupScrollMirror("ord-table-mirror", "ord-table-scroll");
     if (btn.dataset.tab === "inventory") setupScrollMirror("inv-table-mirror", "inv-table-scroll");
+    if (btn.dataset.tab === "discrepancy") loadDiscrepancies();
+    if (btn.dataset.tab === "stocktake") loadStocktakeList();
+    if (btn.dataset.tab === "closing") loadSnapshotList();
   });
 });
 
@@ -1331,7 +1435,7 @@ function setupScrollMirror(mirrorId, scrollId) {
   scrollEl.onscroll = () => { if (syncing) return; syncing = true; mirror.scrollLeft = scrollEl.scrollLeft; syncing = false; };
 }
 
-const ORD_HIDDEN = ["商品ID"];
+const ORD_HIDDEN = [];
 let ordSort = { idx: 1, dir: -1 };
 let ordSelected = new Set();
 
@@ -1427,6 +1531,7 @@ function renderOrders() {
         const inp = document.createElement("input");
         inp.type = "text";
         inp.className = "wide-input";
+        if (h === "商品ID") { inp.setAttribute("list", "ord-pid-list"); inp.placeholder = "商品名で検索…"; }
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
         inp.addEventListener("change", () => saveOrderField(tr, orderNo, h, inp.value));
         td.appendChild(inp);
@@ -1470,8 +1575,10 @@ document.getElementById("ord-delete-btn").addEventListener("click", async () => 
       body: JSON.stringify({ 注文番号: Array.from(ordSelected) }),
     });
     if (!r.ok) { alert("削除に失敗しました"); return; }
+    const data = await r.json().catch(() => ({}));
     ordSelected.clear();
     await loadAll();
+    if (data.warning) alert(data.warning);
   } catch (e) {
     alert("通信エラー: " + e.message);
   }
@@ -1500,8 +1607,10 @@ async function saveOrderField(tr, orderNo, header, value) {
       body: JSON.stringify(body),
     });
     if (!r.ok) { tr.className = "error"; return; }
+    const data = await r.json().catch(() => ({}));
     tr.className = "saved";
     setTimeout(() => { tr.className = ""; }, 1500);
+    if (data.warning) alert(data.warning);
   } catch (e) {
     tr.className = "error";
   }
@@ -1559,9 +1668,18 @@ function renderInvKpis() {
     '<div class="kpi"><div class="label">仕入価格が入っている商品数</div><div class="value">' + priced.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + '</div></div>';
 }
 
+function renderPidDatalist() {
+  const pidIdx = invHeaders.indexOf("商品ID"), nameIdx = invHeaders.indexOf("商品名");
+  if (pidIdx === -1) return;
+  const options = invRows.map((row) => '<option value="' + row[pidIdx] + '">' + (row[nameIdx] || "").replace(/"/g, "&quot;") + '</option>').join("");
+  document.getElementById("ne-pid-list").innerHTML = options;
+  document.getElementById("ord-pid-list").innerHTML = options;
+}
+
 function renderInventory() {
   if (!invHeaders.length) return;
   renderInvKpis();
+  renderPidDatalist();
   const displayOrder = invHeaders.map((h, i) => i).filter((i) => !INV_HIDDEN.includes(invHeaders[i]));
   const thead = document.getElementById("inv-thead");
   const checkAllTh = '<th class="checkbox-col"><input type="checkbox" id="inv-select-all"></th>';
@@ -1701,6 +1819,244 @@ async function saveInventoryField(tr, pid, header, value) {
 
 document.getElementById("ord-q").addEventListener("input", renderOrders);
 document.getElementById("inv-q").addEventListener("input", renderInventory);
+
+// ---- 相違 ----
+async function loadDiscrepancies() {
+  const tbody = document.getElementById("disc-tbody");
+  tbody.innerHTML = "<tr><td colspan='7'>読み込み中...</td></tr>";
+  const token = getToken();
+  try {
+    const r = await fetch("/api/inventory/discrepancies", { headers: { Authorization: "Bearer " + token } });
+    const data = await r.json();
+    if (!r.ok) { tbody.innerHTML = "<tr><td colspan='7'>エラー: " + (data.error || r.status) + "</td></tr>"; return; }
+    renderDiscrepancies(data.rows);
+  } catch (e) {
+    tbody.innerHTML = "<tr><td colspan='7'>通信エラー: " + e.message + "</td></tr>";
+  }
+}
+function renderDiscrepancies(rows) {
+  document.getElementById("disc-count").textContent = rows.length.toLocaleString("ja-JP") + " 件";
+  const tbody = document.getElementById("disc-tbody");
+  if (!rows.length) { tbody.innerHTML = "<tr><td colspan='7'>相違はありません</td></tr>"; return; }
+  const bySite = (row, site) => row.countries.find((c) => c.site === site);
+  tbody.innerHTML = rows.map((row) => {
+    const cell = (site) => {
+      const c = bySite(row, site);
+      if (!c) return "<td class='num'>-</td>";
+      return "<td class='num" + (c.mismatch ? " mismatch-cell" : "") + "'>" + c.value.toLocaleString("ja-JP") + "</td>";
+    };
+    return "<tr class='" + (row.unconfirmed ? "row-unconfirmed" : "") + "'><td>" + row.商品ID + "</td><td class='truncate'>" + (row.商品名 || "") + "</td><td class='num'>" +
+      row.リアル在庫.toLocaleString("ja-JP") + "</td>" + cell("US") + cell("UK") + cell("AU") + "<td>" + (row.リアル在庫確認日 || "(未確認)") + "</td></tr>";
+  }).join("");
+}
+document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscrepancies);
+
+// ---- 棚卸 ----
+function loadStocktakeList() { renderStocktake(); }
+function renderStocktake() {
+  if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='5'>在庫データが読み込まれていません</td></tr>"; return; }
+  const idx = {
+    pid: invHeaders.indexOf("商品ID"), name: invHeaders.indexOf("商品名"),
+    real: invHeaders.indexOf("リアル在庫"), staged: invHeaders.indexOf("棚卸入力数量"), stagedAt: invHeaders.indexOf("棚卸入力日時"),
+  };
+  const q = document.getElementById("stk-q").value.trim().toLowerCase();
+  const tbody = document.getElementById("stk-tbody");
+  tbody.innerHTML = "";
+  let shown = 0;
+  invRows.forEach((row) => {
+    const pid = row[idx.pid];
+    const name = row[idx.name] || "";
+    const searchable = (String(pid || "") + " " + name).toLowerCase();
+    if (q && searchable.indexOf(q) === -1) return;
+    shown++;
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + pid + "</td><td class='truncate'>" + name + "</td><td class='num'>" +
+      (row[idx.real] === null || row[idx.real] === undefined ? "(未設定)" : Number(row[idx.real]).toLocaleString("ja-JP")) + "</td>";
+    const stagedTd = document.createElement("td");
+    stagedTd.className = "num";
+    const inp = document.createElement("input");
+    inp.type = "number"; inp.step = "1";
+    inp.value = row[idx.staged] === null || row[idx.staged] === undefined ? "" : row[idx.staged];
+    inp.addEventListener("change", () => saveStocktakeQty(tr, pid, inp.value));
+    stagedTd.appendChild(inp);
+    tr.appendChild(stagedTd);
+    const atTd = document.createElement("td");
+    atTd.textContent = row[idx.stagedAt] ? String(row[idx.stagedAt]).slice(0, 16).replace("T", " ") : "";
+    tr.appendChild(atTd);
+    tbody.appendChild(tr);
+  });
+  document.getElementById("stk-count").textContent = shown.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + " 件";
+}
+document.getElementById("stk-q").addEventListener("input", renderStocktake);
+
+async function saveStocktakeQty(tr, pid, value) {
+  tr.className = "saving";
+  const token = getToken();
+  const body = { 商品ID: pid, 棚卸入力数量: value === "" ? "" : Number(value) };
+  try {
+    const r = await fetch("/api/inventory", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { tr.className = "error"; return; }
+    tr.className = "saved";
+    setTimeout(() => { tr.className = ""; }, 1500);
+  } catch (e) {
+    tr.className = "error";
+  }
+}
+
+document.getElementById("stk-preview-btn").addEventListener("click", async () => {
+  const statusEl = document.getElementById("stk-preview-status");
+  statusEl.textContent = "読み込み中...";
+  statusEl.className = "hint";
+  const token = getToken();
+  try {
+    const r = await fetch("/api/inventory/stocktake/preview", { headers: { Authorization: "Bearer " + token } });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = "";
+    renderStocktakePreview(data);
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
+
+let stocktakePreviewRows = [];
+function renderStocktakePreview(data) {
+  stocktakePreviewRows = data.rows;
+  const summaryEl = document.getElementById("stk-preview-summary");
+  summaryEl.style.display = "grid";
+  summaryEl.innerHTML = [
+    { label: "対象件数", value: data.targetCount },
+    { label: "差異あり", value: data.diffCount },
+    { label: "増加", value: data.increased },
+    { label: "減少", value: data.decreased },
+    { label: "異常値の疑い", value: data.abnormalCount, cls: data.abnormalCount > 0 ? "bad" : "" },
+  ].map((t) => '<div class="kpi"><div class="label">' + t.label + '</div><div class="value' + (t.cls ? " " + t.cls : "") + '">' + t.value + '</div></div>').join("");
+
+  const wrap = document.getElementById("stk-preview-table-wrap");
+  wrap.style.display = "block";
+  document.getElementById("stk-preview-tbody").innerHTML = data.rows.map((r) =>
+    "<tr class='" + (r.異常値 ? "row-abnormal" : "") + "'><td>" + r.商品ID + "</td><td class='truncate'>" + (r.商品名 || "") + "</td><td class='num'>" +
+    r.リアル在庫.toLocaleString("ja-JP") + "</td><td class='num'>" + r.棚卸入力数量.toLocaleString("ja-JP") + "</td><td class='num" + (r.差異 < 0 ? " mismatch-cell" : "") + "'>" +
+    (r.差異 > 0 ? "+" : "") + r.差異.toLocaleString("ja-JP") + "</td><td>" + (r.異常値 ? "⚠ 要確認" : "") + "</td></tr>"
+  ).join("");
+
+  document.getElementById("stk-confirm-row").style.display = data.targetCount > 0 ? "flex" : "none";
+});
+
+document.getElementById("stk-confirm-btn").addEventListener("click", async () => {
+  if (!stocktakePreviewRows.length) return;
+  const abnormal = stocktakePreviewRows.filter((r) => r.異常値).length;
+  const msg = "対象" + stocktakePreviewRows.length + "件をリアル在庫へ反映します。" +
+    (abnormal > 0 ? "うち異常値の疑いがある行が" + abnormal + "件あります。" : "") + "よろしいですか?(元に戻せません)";
+  if (!confirm(msg)) return;
+  const statusEl = document.getElementById("stk-confirm-status");
+  statusEl.textContent = "確定中...";
+  statusEl.className = "hint";
+  const token = getToken();
+  try {
+    const r = await fetch("/api/inventory/stocktake/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ 商品ID: stocktakePreviewRows.map((r) => r.商品ID) }),
+    });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = data.confirmed + "件を確定しました";
+    statusEl.className = "hint ok";
+    document.getElementById("stk-preview-summary").style.display = "none";
+    document.getElementById("stk-preview-table-wrap").style.display = "none";
+    document.getElementById("stk-confirm-row").style.display = "none";
+    stocktakePreviewRows = [];
+    await loadAll();
+    renderStocktake();
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
+
+// ---- 決算 ----
+document.getElementById("cls-asof").value = new Date().toISOString().slice(0, 10);
+
+document.getElementById("cls-checklist-btn").addEventListener("click", async () => {
+  const asOf = document.getElementById("cls-asof").value;
+  const statusEl = document.getElementById("cls-status");
+  statusEl.textContent = "読み込み中...";
+  statusEl.className = "hint";
+  const token = getToken();
+  try {
+    const r = await fetch("/api/closing/checklist?asOf=" + encodeURIComponent(asOf), { headers: { Authorization: "Bearer " + token } });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = data.count + "件が未確認です";
+    statusEl.className = "hint";
+    document.getElementById("cls-checklist-wrap").style.display = "block";
+    document.getElementById("cls-checklist-tbody").innerHTML = data.rows.map((row) =>
+      "<tr><td>" + row.商品ID + "</td><td class='truncate'>" + (row.商品名 || "") + "</td><td class='num'>" +
+      (row.リアル在庫 === null || row.リアル在庫 === undefined ? "" : Number(row.リアル在庫).toLocaleString("ja-JP")) + "</td><td>" + (row.リアル在庫確認日 || "(未確認)") + "</td></tr>"
+    ).join("");
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
+
+document.getElementById("cls-export-btn").addEventListener("click", () => {
+  const asOf = document.getElementById("cls-asof").value;
+  const token = getToken();
+  window.location.href = "/api/closing/export?asOf=" + encodeURIComponent(asOf) + "&token=" + encodeURIComponent(token);
+});
+
+document.getElementById("cls-snapshot-btn").addEventListener("click", async () => {
+  const asOf = document.getElementById("cls-asof").value;
+  if (!confirm("基準日「" + asOf + "」の棚卸資産スナップショットを保存します。同じ基準日では1回しか保存できません。よろしいですか?")) return;
+  const statusEl = document.getElementById("cls-status");
+  statusEl.textContent = "保存中...";
+  statusEl.className = "hint";
+  const token = getToken();
+  try {
+    const r = await fetch("/api/closing/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ asOf }),
+    });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = "保存しました(合計評価額 ¥" + Math.round(data.totalValue).toLocaleString("ja-JP") + ")";
+    statusEl.className = "hint ok";
+    loadSnapshotList();
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
+
+async function loadSnapshotList() {
+  const listEl = document.getElementById("cls-snapshot-list");
+  const token = getToken();
+  try {
+    const r = await fetch("/api/closing/snapshots", { headers: { Authorization: "Bearer " + token } });
+    const data = await r.json();
+    if (!r.ok) { listEl.innerHTML = "<li>エラー: " + (data.error || r.status) + "</li>"; return; }
+    if (!data.files.length) { listEl.innerHTML = "<li>保存済みのスナップショットはありません</li>"; return; }
+    listEl.innerHTML = data.files.map((f) =>
+      "<li><a href='#' data-file='" + f + "' class='snapshot-link'>" + f + "</a></li>"
+    ).join("");
+    listEl.querySelectorAll(".snapshot-link").forEach((a) => {
+      a.addEventListener("click", (evt) => {
+        evt.preventDefault();
+        window.location.href = "/download/snapshots/" + encodeURIComponent(a.dataset.file) + "?token=" + encodeURIComponent(getToken());
+      });
+    });
+  } catch (e) {
+    listEl.innerHTML = "<li>通信エラー: " + e.message + "</li>";
+  }
+}
 
 document.getElementById("ebay-rebuild-btn").addEventListener("click", async () => {
   const btn = document.getElementById("ebay-rebuild-btn");
@@ -1863,6 +2219,7 @@ document.getElementById("ne-parse-btn").addEventListener("click", () => {
   document.getElementById("ne-cost").value = "";
   document.getElementById("ne-shipping").value = "";
   document.getElementById("ne-packing").value = "50";
+  document.getElementById("ne-pid").value = "";
   updateFeePreview();
   document.getElementById("ne-review").style.display = "grid";
   document.getElementById("ne-submit-row").style.display = "flex";
@@ -1888,6 +2245,8 @@ document.getElementById("ne-submit-btn").addEventListener("click", async () => {
   if (shipping !== "") body.送料円 = shipping;
   if (packing !== "") body.梱包費円 = packing;
   if (qty !== "") body.数量 = qty;
+  const pid = document.getElementById("ne-pid").value.trim();
+  if (pid !== "") body.商品ID = pid;
   if (!body.注文番号 || !body.日付 || !body.収益USD || !body.ドル円レート) {
     statusEl.textContent = "注文番号・日付・収益USD・ドル円レートは必須です";
     statusEl.className = "hint ng";
@@ -1904,8 +2263,8 @@ document.getElementById("ne-submit-btn").addEventListener("click", async () => {
     });
     const data = await r.json();
     if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
-    statusEl.textContent = "登録しました(収益円: " + data.収益円 + "・手数料: " + data.手数料円 + ")";
-    statusEl.className = "hint ok";
+    statusEl.textContent = "登録しました(収益円: " + data.収益円 + "・手数料: " + data.手数料円 + ")" + (data.warning ? " ※" + data.warning : "");
+    statusEl.className = "hint " + (data.warning ? "ng" : "ok");
     document.getElementById("ne-paste").value = "";
     document.getElementById("ne-review").style.display = "none";
     document.getElementById("ne-submit-row").style.display = "none";
@@ -1932,7 +2291,9 @@ const server = http.createServer(async (req, res) => {
 
   let pathname = req.url;
   try {
-    pathname = new URL(req.url, "http://localhost").pathname;
+    // URLのpathnameはパーセントエンコードされたまま返る(自動デコードされない)ため、
+    // 日本語などを含むルート("/download/売上管理表.xlsx"等)と比較できるよう明示的にデコードする。
+    pathname = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
   } catch (e) {
     // フォールバック: req.urlをそのまま使う
   }
