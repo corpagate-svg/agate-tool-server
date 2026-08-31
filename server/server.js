@@ -1057,7 +1057,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div class="tabpanel" id="tab-discrepancy">
     <div class="panel">
       <h2>相違一覧</h2>
-      <p class="desc">「リアル在庫」(当社独自管理の実在庫)と、eBay各国(US/UK/AU)の在庫数を比較します。出品されている国だけを比較し、<b>一致しない商品だけ</b>を表示します。まだ実地棚卸で確認していない行(リアル在庫確認日が空欄)は黄色で表示します。</p>
+      <p class="desc">2種類の比較のうち<b>どちらか一方でもズレていれば</b>表示します: ①「リアル在庫」(当社独自管理の実在庫)と「US在庫」の比較、②「US在庫」を基準にした「UK/AU在庫」との比較(eBaymagの国間同期が壊れていないかのチェック)。出品されている国だけを比較します。まだ実地棚卸で確認していない行(リアル在庫確認日が空欄)は黄色で表示します。</p>
       <div class="panel-body">
         <div class="browser-toolbar">
           <button class="btn" id="disc-refresh-btn">再読み込み</button>
@@ -1160,6 +1160,11 @@ let invRows = [];
 let invHeaders = [];
 
 function getToken() { return localStorage.getItem("agate_token") || ""; }
+(() => {
+  // URLに ?token=... が付いていれば自動的に記憶する(手入力不要でブラウザ確認できるようにするため)
+  const urlToken = new URLSearchParams(window.location.search).get("token");
+  if (urlToken) localStorage.setItem("agate_token", urlToken);
+})();
 document.getElementById("token").value = getToken();
 document.getElementById("saveToken").addEventListener("click", () => {
   localStorage.setItem("agate_token", document.getElementById("token").value.trim());

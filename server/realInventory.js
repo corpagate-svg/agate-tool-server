@@ -88,8 +88,11 @@ function rowValues(row, INV_HEADERS) {
   return vals;
 }
 
-// 「相違」ページ用: US/UK/AU在庫とリアル在庫が一致しない商品のみを返す。
-// 出品されていない国はその国の比較を除外する。
+// 「相違」ページ用: 2系統の比較のどちらかにズレがある商品のみを返す。
+//   (1) リアル在庫 ↔ US在庫 (実地棚卸とeBayの申告値がズレていないか)
+//   (2) US在庫 ↔ UK/AU在庫 (eBaymagの国間同期が壊れていないか。USを基準とする)
+// 出品されていない国はその国の比較を除外する。UK/AUの判定はリアル在庫とではなく、
+// 必ずUS在庫を基準に行う(リアル在庫が一致していてもUS↔UK/AUがズレていれば相違として扱う)。
 function computeDiscrepancies({ ws, INV_HEADERS, INV_COL }) {
   const results = [];
   for (let r = 2; r <= ws.rowCount; r++) {
@@ -97,26 +100,37 @@ function computeDiscrepancies({ ws, INV_HEADERS, INV_COL }) {
     const v = rowValues(row, INV_HEADERS);
     const real = v["リアル在庫"];
     if (real === null || real === undefined || real === "") continue;
-    const compares = [];
-    if (v["US_出品ID"] !== null && v["US_出品ID"] !== undefined && v["US_出品ID"] !== "") {
-      compares.push({ site: "US", value: Number(v["在庫数(現物)"]) || 0 });
-    }
-    if (v["UK_出品ID"] !== null && v["UK_出品ID"] !== undefined && v["UK_出品ID"] !== "") {
-      compares.push({ site: "UK", value: Number(v["UK在庫数"]) || 0 });
-    }
-    if (v["AU_出品ID"] !== null && v["AU_出品ID"] !== undefined && v["AU_出品ID"] !== "") {
-      compares.push({ site: "AU", value: Number(v["AU在庫数"]) || 0 });
-    }
     const realNum = Number(real) || 0;
-    const mismatches = compares.filter((c) => c.value !== realNum);
-    if (mismatches.length === 0) continue;
+
+    const hasSite = (idKey) => v[idKey] !== null && v[idKey] !== undefined && v[idKey] !== "";
+    const hasUS = hasSite("US_出品ID");
+    const usNum = hasUS ? (Number(v["在庫数(現物)"]) || 0) : null;
+
+    const countries = [];
+    let anyMismatch = false;
+
+    if (hasUS) {
+      const mismatch = realNum !== usNum;
+      if (mismatch) anyMismatch = true;
+      countries.push({ site: "US", value: usNum, mismatch });
+    }
+    for (const [site, idKey, valKey] of [["UK", "UK_出品ID", "UK在庫数"], ["AU", "AU_出品ID", "AU在庫数"]]) {
+      if (!hasSite(idKey)) continue;
+      const val = Number(v[valKey]) || 0;
+      // US↔UK/AUの比較。US自体が未出品(通常あり得ない)の場合は判定不能として不一致扱いにしない。
+      const mismatch = hasUS ? usNum !== val : false;
+      if (mismatch) anyMismatch = true;
+      countries.push({ site, value: val, mismatch });
+    }
+
+    if (!anyMismatch) continue;
     results.push({
       商品ID: v["商品ID"],
       商品名: v["商品名"],
       リアル在庫: realNum,
       リアル在庫確認日: v["リアル在庫確認日"] || null,
       unconfirmed: !v["リアル在庫確認日"],
-      countries: compares.map((c) => ({ site: c.site, value: c.value, mismatch: c.value !== realNum })),
+      countries,
     });
   }
   return results;
