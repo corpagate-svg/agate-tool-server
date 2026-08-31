@@ -29,12 +29,12 @@ const INV_HEADERS = [
   "US_出品ID", "US価格(USD)", "US累計売却数", "UK_出品ID", "UK価格(GBP)", "UK累計売却数",
   "AU_出品ID", "AU価格(AUD)", "AU累計売却数", "仕入価格(円)", "仕入日", "仕入先", "備考",
   "UK在庫数", "AU在庫数", "リアル在庫", "リアル在庫確認日", "棚卸入力数量", "棚卸入力日時",
-  "画像URL", "日本語商品名",
+  "画像URL", "日本語商品名", "SKU",
 ];
 const INV_COL = {
   商品ID: 1, 商品名: 2, バリエーション詳細: 3, 在庫数: 4, 出品国数: 5, 在庫数不一致: 6, 仕入価格: 16, 仕入日: 17, 仕入先: 18, 備考: 19,
   UK在庫数: 20, AU在庫数: 21, リアル在庫: 22, リアル在庫確認日: 23, 棚卸入力数量: 24, 棚卸入力日時: 25,
-  画像URL: 26, 日本語商品名: 27,
+  画像URL: 26, 日本語商品名: 27, SKU: 28,
 };
 
 if (!API_TOKEN) {
@@ -1125,7 +1125,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p class="desc">「棚卸入力数量」に実際に数えた個数を入力すると、その場で一時保存されます(この時点ではリアル在庫は変わりません)。入力が終わったら下の「一括確定」で内容を確認してからリアル在庫へ反映してください。日本語商品名はその場で編集・保存できます。「画像」をクリックすると商品画像を拡大表示します。</p>
       <div class="panel-body">
         <div class="browser-toolbar">
-          <input type="text" class="search-input" id="stk-q" placeholder="英語商品名・日本語商品名・商品IDで検索…">
+          <input type="text" class="search-input" id="stk-q" placeholder="英語商品名・日本語商品名・商品ID・SKUで検索…">
           <span class="result-count" id="stk-count"></span>
         </div>
         <div class="table-scroll">
@@ -1674,7 +1674,12 @@ async function saveOrderField(tr, orderNo, header, value) {
   }
 }
 
-const INV_HIDDEN = ["UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致", "バリエーション詳細", "仕入先"];
+const INV_HIDDEN = [
+  "UK_出品ID", "UK価格(GBP)", "AU_出品ID", "AU価格(AUD)", "在庫数不一致", "バリエーション詳細", "仕入先",
+  // リアル在庫機能の追加列。通常の「在庫」タブ(eBayのCSVをそのまま反映する場所)の見た目は変更しないため非表示にする。
+  // 各値は「相違」「棚卸」「決算」タブや検索(SKU)から個別に利用する。
+  "UK在庫数", "AU在庫数", "リアル在庫", "リアル在庫確認日", "棚卸入力数量", "棚卸入力日時", "画像URL", "日本語商品名", "SKU",
+];
 let invSort = { idx: 0, dir: -1 };
 let invSelected = new Set();
 
@@ -1935,7 +1940,7 @@ function renderStocktake() {
   if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='7'>在庫データが読み込まれていません</td></tr>"; return; }
   const idx = {
     pid: invHeaders.indexOf("商品ID"), name: invHeaders.indexOf("商品名"), jaName: invHeaders.indexOf("日本語商品名"),
-    image: invHeaders.indexOf("画像URL"),
+    image: invHeaders.indexOf("画像URL"), sku: invHeaders.indexOf("SKU"),
     real: invHeaders.indexOf("リアル在庫"), staged: invHeaders.indexOf("棚卸入力数量"), stagedAt: invHeaders.indexOf("棚卸入力日時"),
   };
   const q = document.getElementById("stk-q").value.trim().toLowerCase();
@@ -1946,7 +1951,8 @@ function renderStocktake() {
     const pid = row[idx.pid];
     const name = row[idx.name] || "";
     const jaName = row[idx.jaName] || "";
-    const searchable = (String(pid || "") + " " + name + " " + jaName).toLowerCase();
+    const sku = row[idx.sku] || ""; // 検索対象のみ。一覧には表示しない
+    const searchable = (String(pid || "") + " " + name + " " + jaName + " " + sku).toLowerCase();
     if (q && searchable.indexOf(q) === -1) return;
     shown++;
     const tr = document.createElement("tr");
