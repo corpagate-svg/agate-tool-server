@@ -95,6 +95,40 @@ function applyStagedQtyToRow(row, INV_COL, value) {
   if (!cleared) row.getCell(INV_COL.棚卸チェック).value = true;
 }
 
+// ある商品が「今回の棚卸で既に一括確定済みか」を判定する。
+// confirmStocktake()は確定時に棚卸入力数量だけをnullにし棚卸入力日時は保持する(棚卸チェックも不変)ため、
+// 「棚卸入力数量が空 かつ 棚卸入力日時が入っている」の組み合わせは一括確定を経由した場合にしか起こり得ない。
+// (数量を空欄に戻して保存した場合はapplyStagedQtyToRowが数量・日時を同時にnullにするため、この組み合わせにはならない)
+function isStocktakeConfirmed(row, INV_COL) {
+  const staged = row.getCell(INV_COL.棚卸入力数量).value;
+  const stagedAt = row.getCell(INV_COL.棚卸入力日時).value;
+  const stagedEmpty = staged === null || staged === undefined || staged === "";
+  const hasStagedAt = stagedAt !== null && stagedAt !== undefined && stagedAt !== "";
+  return stagedEmpty && hasStagedAt;
+}
+
+// 1商品だけ「今回の棚卸をしていない状態」へ戻す(一括確定前の商品のみが対象)。
+// 棚卸入力数量・棚卸チェック・棚卸入力日時の3列だけをクリアし、リアル在庫・リアル在庫確認日・
+// 仕入価格・商品情報など他の列は一切変更しない(リアル在庫の自動復元・逆算は行わない)。
+// 既に一括確定済み(isStocktakeConfirmed)の場合は、呼び出し側がHTTP 409を返せるようエラーで拒否する。
+async function undoStocktakeEntry({ loadInventoryWorkbook, INVENTORY_PATH, INV_COL, pid }) {
+  return withInventoryLock(async () => {
+    const wb = await loadInventoryWorkbook();
+    const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
+    const row = findInventoryRow(ws, INV_COL, pid);
+    if (!row) return { ok: false, status: 404, error: "該当する商品IDが見つかりません" };
+    if (isStocktakeConfirmed(row, INV_COL)) {
+      return { ok: false, status: 409, error: "この商品は既に一括確定済みのため、未確認に戻せません" };
+    }
+    row.getCell(INV_COL.棚卸入力数量).value = null;
+    row.getCell(INV_COL.棚卸入力日時).value = null;
+    row.getCell(INV_COL.棚卸チェック).value = null;
+    row.commit();
+    await atomicWriteWorkbook(wb, INVENTORY_PATH);
+    return { ok: true };
+  });
+}
+
 // 棚卸チェックの一括解除(手動運用のみ、次回棚卸サイクル開始時の明示的リセット)。
 // 棚卸チェックと棚卸入力日時をあわせてクリアする(両方とも「今回の棚卸で確認済みか」を表す
 // 対の情報のため)。リアル在庫・棚卸入力数量・日本語商品名など他の列は一切変更しない。
@@ -307,6 +341,8 @@ module.exports = {
   validateStocktakeQty,
   applyRealStockToRow,
   applyStagedQtyToRow,
+  isStocktakeConfirmed,
+  undoStocktakeEntry,
   resetStocktakeChecks,
   computeDiscrepancies,
   previewStocktake,

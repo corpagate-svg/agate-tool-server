@@ -790,6 +790,23 @@ async function handleStocktakeResetChecks(req, res) {
   sendJson(res, 200, { status: "ok", ...result });
 }
 
+// 1商品だけ「今回の棚卸をしていない状態」へ戻す(一括確定前の商品のみ)。
+// 既に一括確定済みの場合はrealInv.undoStocktakeEntryが409を返すのでそのまま伝える
+// (フロント側の表示制御が漏れていても、サーバー側で必ず再判定してリアル在庫を守る)。
+async function handleStocktakeUndo(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readRawBody(req, 1024 * 1024)).toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  const pid = body["商品ID"];
+  if (!pid) return sendJson(res, 400, { error: "商品ID は必須です" });
+  const result = await realInv.undoStocktakeEntry({ loadInventoryWorkbook: loadInventoryWorkbookLocked, INVENTORY_PATH, INV_COL, pid });
+  if (!result.ok) return sendJson(res, result.status || 400, { error: result.error });
+  sendJson(res, 200, { status: "ok", 商品ID: pid });
+}
+
 async function handleInventoryHistory(req, res) {
   const url = new URL(req.url, "http://localhost");
   const pid = url.searchParams.get("商品ID") || undefined;
@@ -1010,6 +1027,10 @@ const DASHBOARD_PAGE = `<!doctype html>
   .mismatch-cell { color: var(--series-cost); font-weight: 700; }
   .row-abnormal { background: rgba(235,104,52,0.14); }
   .stk-check-badge { display: none; align-items: center; justify-content: center; width: 16px; height: 16px; margin-left: 6px; border-radius: 50%; background: rgba(27,175,122,0.16); color: var(--good); font-size: 10px; font-weight: 700; vertical-align: middle; }
+  /* 1商品だけ「未確認に戻す」ボタン。1000件超の一覧なので小さいアイコンのみ、棚卸チェックが立っている行にだけ表示する。 */
+  .stk-undo-btn { display: none; align-items: center; justify-content: center; width: 18px; height: 18px; margin-left: 4px; padding: 0; border-radius: 5px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink); font-size: 11px; line-height: 1; cursor: pointer; vertical-align: middle; }
+  .stk-undo-btn:hover:not(:disabled) { background: var(--accent-wash); }
+  .stk-undo-btn:disabled { opacity: 0.35; cursor: not-allowed; }
   .pager { display: flex; align-items: center; gap: 6px; margin: 10px 0; flex-wrap: wrap; }
   .pager button { font: inherit; font-size: 12.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; min-width: 32px; }
   .pager button:hover:not(:disabled) { background: var(--accent-wash); }
@@ -2493,6 +2514,56 @@ function buildStocktakeRow(row, idx) {
   checkBadge.title = "棚卸済み";
   checkBadge.textContent = "✓";
   checkBadge.style.display = row[idx.checked] ? "inline-flex" : "none";
+  // 1商品だけ「今回の棚卸をしていない状態」へ戻すボタン。棚卸チェックが立っている行にのみ表示する。
+  // 棚卸入力数量が空 かつ 棚卸入力日時が入っている = 一括確定済み(isStocktakeUndoBlocked)の場合は無効化する。
+  const isStocktakeUndoBlocked = () => {
+    const stagedEmpty = row[idx.staged] === null || row[idx.staged] === undefined || row[idx.staged] === "";
+    const hasStagedAt = row[idx.stagedAt] !== null && row[idx.stagedAt] !== undefined && row[idx.stagedAt] !== "";
+    return stagedEmpty && hasStagedAt;
+  };
+  const undoBtn = document.createElement("button");
+  undoBtn.type = "button";
+  undoBtn.className = "stk-undo-btn";
+  undoBtn.textContent = "↺";
+  const refreshUndoBtn = () => {
+    undoBtn.style.display = row[idx.checked] ? "inline-flex" : "none";
+    if (isStocktakeUndoBlocked()) {
+      undoBtn.disabled = true;
+      undoBtn.title = "確定済みのため戻せません";
+    } else {
+      undoBtn.disabled = false;
+      undoBtn.title = "未確認に戻す(この商品の今回の棚卸入力を取り消します)";
+    }
+  };
+  refreshUndoBtn();
+  undoBtn.addEventListener("click", async () => {
+    if (undoBtn.disabled) return;
+    if (!confirm("この商品の今回の棚卸入力を取り消して未確認に戻します。よろしいですか?(リアル在庫は変更されません)")) return;
+    tr.className = "saving";
+    const token = getToken();
+    try {
+      const r = await fetch("/api/inventory/stocktake/undo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+        body: JSON.stringify({ 商品ID: pid }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) { tr.className = "error"; alert("取り消しに失敗しました: " + (data.error || r.status)); return; }
+      tr.className = "saved";
+      setTimeout(() => { tr.className = ""; }, 1500);
+      row[idx.staged] = null;
+      row[idx.stagedAt] = null;
+      row[idx.checked] = null;
+      inp.value = "";
+      atTd.textContent = "";
+      checkBadge.style.display = "none";
+      refreshUndoBtn();
+      renderStocktakeProgress();
+    } catch (e) {
+      tr.className = "error";
+      alert("通信エラー: " + e.message);
+    }
+  });
   inp.addEventListener("change", () => saveStocktakeQty(tr, pid, inp.value, (savedAt) => {
     row[idx.staged] = inp.value === "" ? null : Number(inp.value);
     row[idx.stagedAt] = savedAt;
@@ -2503,9 +2574,11 @@ function buildStocktakeRow(row, idx) {
       checkBadge.style.display = "inline-flex";
       renderStocktakeProgress();
     }
+    refreshUndoBtn();
   }));
   stagedTd.appendChild(inp);
   stagedTd.appendChild(checkBadge);
+  stagedTd.appendChild(undoBtn);
   tr.appendChild(stagedTd);
 
   const atTd = document.createElement("td");
@@ -3076,7 +3149,7 @@ const server = http.createServer(async (req, res) => {
   const protectedRoutes = [
     "/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary",
     "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild",
-    "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/stocktake/reset-checks", "/api/inventory/history",
+    "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/stocktake/reset-checks", "/api/inventory/stocktake/undo", "/api/inventory/history",
     "/api/order-lines/unresolved", "/api/order-lines/resolve",
     "/api/closing/checklist", "/api/closing/export", "/api/closing/snapshot", "/api/closing/snapshots",
   ];
@@ -3107,6 +3180,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/inventory/stocktake/preview") return await handleStocktakePreview(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/stocktake/confirm") return await handleStocktakeConfirm(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/stocktake/reset-checks") return await handleStocktakeResetChecks(req, res);
+    if (req.method === "POST" && pathname === "/api/inventory/stocktake/undo") return await handleStocktakeUndo(req, res);
     if (req.method === "GET" && pathname === "/api/inventory/history") return await handleInventoryHistory(req, res);
     if (req.method === "GET" && pathname === "/api/order-lines/unresolved") return await handleListUnresolvedOrderLines(req, res);
     if (req.method === "POST" && pathname === "/api/order-lines/resolve") return await handleResolveOrderLine(req, res);
