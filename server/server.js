@@ -25,7 +25,10 @@ const { createSalesWorkbookLoaders } = require("./salesWorkbookStore");
 const { resolveOrderLineTransaction } = require("./manualOrderResolution");
 const { editManagedOrderTransaction, deleteManagedOrdersTransaction } = require("./managedOrderMutation");
 const { fetchMonthlyAverageRate, BOJ_SOURCE_LABEL } = require("./exchangeRateFetcher");
-const { getRate: getExchangeRate, saveProvisionalRate: saveProvisionalExchangeRate, confirmRate: confirmExchangeRate } = require("./exchangeRateStore");
+const {
+  getRate: getExchangeRate, saveProvisionalRate: saveProvisionalExchangeRate, confirmRate: confirmExchangeRate,
+  getNoDataCheckLog, recordNoDataCheck,
+} = require("./exchangeRateStore");
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
@@ -696,6 +699,12 @@ async function handleRefreshExchangeRate(req, res) {
     if (existing && isSameJstDate(existing["取得日時"], new Date().toISOString())) {
       return sendJson(res, 200, { status: "skipped", reason: "already_fetched_today", record: existing });
     }
+    // 自動更新は「本日すでにno_dataを確認済み」の月へも再アクセスしない(1日1回まで)。
+    // 手動更新(force)はこの制限の対象外(下のelse if節はforce時のみ通る)。
+    const noDataLog = await getNoDataCheckLog({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
+    if (noDataLog && isSameJstDate(noDataLog["最終自動確認日時"], new Date().toISOString())) {
+      return sendJson(res, 200, { status: "skipped", reason: "no_data_checked_today", record: existing || null });
+    }
   } else if (existing && existing["状態"] === "確定") {
     // 強制更新であっても確定済みの月は絶対に上書きしない。
     return sendJson(res, 409, { status: "error", error: `${yearMonth}は既に確定済みのため更新できません` });
@@ -707,6 +716,9 @@ async function handleRefreshExchangeRate(req, res) {
       // 実日銀API疎通確認で判明したとおり、進行中の当月データが0件になるのは正常に起こり得る状態。
       // システム障害のような強いエラーにはせず、既存の保存値(前月確定レート代替の判定材料)を
       // 一切変更せずにそのまま返す(このyearMonthのレコードは絶対に作らない)。
+      // 「本日確認したがno_dataだった」事実だけを別ログに記録し、以後の自動更新を今日は抑制する
+      // (手動更新でここに来た場合も記録して構わない。記録自体は自動更新のスキップ判定にのみ使う)。
+      await recordNoDataCheck({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
       return sendJson(res, 200, { status: "no_data", record: existing || null });
     }
     return sendJson(res, 502, { status: "error", error: result.error, errorType: result.errorType });

@@ -17,6 +17,14 @@ const COL = {
 const STATUS = { PROVISIONAL: "暫定", CONFIRMED: "確定" };
 const CURRENCY_PAIR = "USD/JPY";
 
+// 「日銀APIをその日に自動確認したが、まだ当月データが無かった(no_data)」という事実だけを
+// 記録する軽量ログ。正式な月次為替レート(為替レートシート)とは別シートに保持し、
+// no_data確認そのものが正式なレートレコードとして保存されることは絶対にない。
+// 自動更新(force無し)の「1日1回まで」判定にのみ使う。手動更新(force)はこの制限の対象外。
+const LOG_SHEET_NAME = "自動確認ログ";
+const LOG_HEADERS = ["対象年月", "最終自動確認日時", "最終自動確認結果"];
+const LOG_COL = { 対象年月: 1, 最終自動確認日時: 2, 最終自動確認結果: 3 };
+
 // 在庫管理表.xlsxとは無関係の独立ファイルのため、専用のキューで直列化する
 // (inventoryLock.jsのwithInventoryLockとは別キュー。atomicWriteWorkbookのみ共用する)。
 let tail = Promise.resolve();
@@ -27,26 +35,30 @@ function withExchangeRateLock(fn) {
 }
 
 // 正式ファイルが存在しない場合のみ、ヘッダー行だけの新規ワークブックを安全に作成する。
+// 「為替レート」シート(正式なレート)と「自動確認ログ」シート(no_data確認の記録専用)は
+// 常に両方揃っていることを保証する(どちらか一方だけ欠けている場合も補う)。
 async function loadExchangeRateWorkbook(RATE_PATH) {
   const wb = new ExcelJS.Workbook();
-  if (fs.existsSync(RATE_PATH)) {
+  const isNewFile = !fs.existsSync(RATE_PATH);
+  if (!isNewFile) {
     await wb.xlsx.readFile(RATE_PATH);
-    if (!wb.getWorksheet(SHEET_NAME)) {
-      const ws = wb.addWorksheet(SHEET_NAME);
-      ws.addRow(HEADERS);
-      ws.getRow(1).font = { bold: true };
-    }
-    return wb;
   }
-  const ws = wb.addWorksheet(SHEET_NAME);
-  ws.addRow(HEADERS);
-  ws.getRow(1).font = { bold: true };
-  ws.views = [{ state: "frozen", ySplit: 1 }];
-  ws.getColumn(1).width = 10;
-  ws.getColumn(9).width = 12;
-  ws.getColumn(10).width = 22;
-  ws.getColumn(11).width = 22;
-  ws.getColumn(12).width = 22;
+  if (!wb.getWorksheet(SHEET_NAME)) {
+    const ws = wb.addWorksheet(SHEET_NAME);
+    ws.addRow(HEADERS);
+    ws.getRow(1).font = { bold: true };
+    ws.views = [{ state: "frozen", ySplit: 1 }];
+    ws.getColumn(1).width = 10;
+    ws.getColumn(9).width = 12;
+    ws.getColumn(10).width = 22;
+    ws.getColumn(11).width = 22;
+    ws.getColumn(12).width = 22;
+  }
+  if (!wb.getWorksheet(LOG_SHEET_NAME)) {
+    const logWs = wb.addWorksheet(LOG_SHEET_NAME);
+    logWs.addRow(LOG_HEADERS);
+    logWs.getRow(1).font = { bold: true };
+  }
   return wb;
 }
 
@@ -117,6 +129,46 @@ async function saveProvisionalRate({ RATE_PATH, yearMonth, rate, count, startDat
   });
 }
 
+function findLogRow(ws, yearMonth) {
+  for (let r = 2; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    if (String(row.getCell(LOG_COL.対象年月).value || "") === yearMonth) return row;
+  }
+  return null;
+}
+
+// その年月について、直近の自動確認(no_data)がいつ・どうだったかを読む(なければnull)。
+// 正式なレートレコードとは完全に別物であることに注意(getRate()とは別関数)。
+async function getNoDataCheckLog({ RATE_PATH, yearMonth }) {
+  if (!fs.existsSync(RATE_PATH)) return null;
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(RATE_PATH);
+  const ws = wb.getWorksheet(LOG_SHEET_NAME);
+  if (!ws) return null;
+  const row = findLogRow(ws, yearMonth);
+  if (!row) return null;
+  return {
+    対象年月: row.getCell(LOG_COL.対象年月).value,
+    最終自動確認日時: row.getCell(LOG_COL.最終自動確認日時).value,
+    最終自動確認結果: row.getCell(LOG_COL.最終自動確認結果).value,
+  };
+}
+
+// 「自動更新でno_dataを確認した」事実だけを記録する。正式なレートシートには一切触れない
+// (為替レート管理.xlsxに「2026-09・レート空欄・状態=暫定」のような誤解を招くレコードは作らない)。
+async function recordNoDataCheck({ RATE_PATH, yearMonth }) {
+  return withExchangeRateLock(async () => {
+    const wb = await loadExchangeRateWorkbook(RATE_PATH);
+    const ws = wb.getWorksheet(LOG_SHEET_NAME);
+    const row = findLogRow(ws, yearMonth) || ws.addRow([]);
+    row.getCell(LOG_COL.対象年月).value = yearMonth;
+    row.getCell(LOG_COL.最終自動確認日時).value = new Date().toISOString();
+    row.getCell(LOG_COL.最終自動確認結果).value = "no_data";
+    row.commit();
+    await atomicWriteWorkbook(wb, RATE_PATH);
+  });
+}
+
 // 確定レートを保存する。既に確定済みの月への再確定は拒否する(再確定は別の明示操作が必要)。
 async function confirmRate({ RATE_PATH, yearMonth, rate, count, startDate, endDate, seriesCode, source, inputMethod }) {
   return withExchangeRateLock(async () => {
@@ -141,5 +193,7 @@ async function confirmRate({ RATE_PATH, yearMonth, rate, count, startDate, endDa
 
 module.exports = {
   SHEET_NAME, HEADERS, COL, STATUS, CURRENCY_PAIR,
+  LOG_SHEET_NAME, LOG_HEADERS, LOG_COL,
   loadExchangeRateWorkbook, getRate, saveProvisionalRate, confirmRate,
+  getNoDataCheckLog, recordNoDataCheck,
 };
