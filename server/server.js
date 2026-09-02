@@ -1063,6 +1063,8 @@ const DASHBOARD_PAGE = `<!doctype html>
   input.qty-input::-webkit-outer-spin-button,
   input.qty-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
   input.qty-input { -moz-appearance: textfield; appearance: textfield; }
+  /* 棚卸ページ: 仕入価格が未入力(空欄/null/undefined)の商品を見つけやすくする。0は入力済み扱いのため対象外。 */
+  input.price-input-missing { background: #fde8e8; border-color: #e08585; }
   tr.saving td { background: #fff7e0 !important; }
   tr.saved td { background: #e9f7ec !important; }
   tr.error td { background: #fde8e8 !important; }
@@ -2242,7 +2244,7 @@ document.getElementById("inv-csv-export").addEventListener("click", () => {
 // row(invRows内の該当行オブジェクト、任意)を渡すと保存成功時にそのままキャッシュへ反映する。
 // 在庫タブ・棚卸タブは同じ invRows 配列を参照して描画しているため、これだけで両タブが
 // リロードなしに最新値を表示できる(仕入価格(円)はどちらのタブから編集しても同じ列を更新する)。
-async function saveInventoryField(tr, pid, header, value, row) {
+async function saveInventoryField(tr, pid, header, value, row, onSuccess) {
   tr.className = "saving";
   const token = getToken();
   const isNum = INV_EDITABLE_NUM.includes(header);
@@ -2261,6 +2263,7 @@ async function saveInventoryField(tr, pid, header, value, row) {
       const idx = invHeaders.indexOf(header);
       if (idx !== -1) row[idx] = isNum ? (value === "" ? null : Number(value)) : value;
     }
+    if (onSuccess) onSuccess();
   } catch (e) {
     tr.className = "error";
   }
@@ -2465,8 +2468,12 @@ function buildStocktakeRow(row, idx) {
   priceTd.className = "num";
   const priceInp = document.createElement("input");
   priceInp.type = "number"; priceInp.step = "any";
-  priceInp.value = row[idx.price] === null || row[idx.price] === undefined ? "" : row[idx.price];
-  priceInp.addEventListener("change", () => saveInventoryField(tr, pid, "仕入価格(円)", priceInp.value, row));
+  const priceUnset = (v) => v === null || v === undefined || v === "";
+  priceInp.value = priceUnset(row[idx.price]) ? "" : row[idx.price];
+  priceInp.classList.toggle("price-input-missing", priceUnset(row[idx.price]));
+  priceInp.addEventListener("change", () => saveInventoryField(tr, pid, "仕入価格(円)", priceInp.value, row, () => {
+    priceInp.classList.toggle("price-input-missing", priceUnset(priceInp.value));
+  }));
   priceTd.appendChild(priceInp);
   tr.appendChild(priceTd);
 
