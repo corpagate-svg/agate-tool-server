@@ -2671,20 +2671,45 @@ async function loadDiscrepancies() {
 
 async function loadUnlinked() {
   const tbody = document.getElementById("unlinked-tbody");
-  tbody.innerHTML = "<tr><td colspan='6'>読み込み中...</td></tr>";
+  const showMessage = (message) => {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.textContent = message;
+    tr.appendChild(td);
+    tbody.replaceChildren(tr);
+  };
+  showMessage("読み込み中...");
   const token = getToken();
   try {
     const r = await fetch("/api/inventory/unlinked", { headers: { Authorization: "Bearer " + token } });
     const data = await r.json();
-    if (!r.ok) { tbody.innerHTML = "<tr><td colspan='6'>エラー: " + (data.error || r.status) + "</td></tr>"; return; }
+    if (!r.ok) { showMessage("エラー: " + (data.error || r.status)); return; }
     document.getElementById("unlinked-count").textContent = data.count.toLocaleString("ja-JP") + " 件";
-    if (!data.count) { tbody.innerHTML = "<tr><td colspan='6'>未紐付けの出品はありません</td></tr>"; return; }
-    tbody.innerHTML = data.rows.map((r) =>
-      "<tr><td><span class='site-chip'>" + (r[0] || "") + "</span></td><td>" + (r[1] || "") + "</td><td class='truncate'>" + (r[2] || "") +
-      "</td><td class='num'>" + fmt(r[3]) + "</td><td class='num'>" + fmt(r[5]) + "</td><td>" + (r[7] ? String(r[7]).slice(0, 10) : "") + "</td></tr>"
-    ).join("");
+    if (!data.count) { showMessage("未紐付けの出品はありません"); return; }
+    tbody.replaceChildren();
+    data.rows.forEach((r) => {
+      const tr = document.createElement("tr");
+      const siteTd = document.createElement("td");
+      const siteChip = document.createElement("span");
+      siteChip.className = "site-chip";
+      siteChip.textContent = r[0] || "";
+      siteTd.appendChild(siteChip);
+      tr.appendChild(siteTd);
+      const values = [
+        [r[1] || "", ""], [r[2] || "", "truncate"], [fmt(r[3]), "num"],
+        [fmt(r[5]), "num"], [r[7] ? String(r[7]).slice(0, 10) : "", ""],
+      ];
+      values.forEach(([value, className]) => {
+        const td = document.createElement("td");
+        if (className) td.className = className;
+        td.textContent = value;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
   } catch (e) {
-    tbody.innerHTML = "<tr><td colspan='6'>通信エラー: " + e.message + "</td></tr>";
+    showMessage("通信エラー: " + e.message);
   }
 }
 // US_出品IDが有効な値の場合のみUS eBay商品ページのURLを返す(なければnull)。
@@ -3223,11 +3248,26 @@ function renderStocktakePreview(data) {
 
   const wrap = document.getElementById("stk-preview-table-wrap");
   wrap.style.display = "block";
-  document.getElementById("stk-preview-tbody").innerHTML = data.rows.map((r) =>
-    "<tr class='" + (r.異常値 ? "row-abnormal" : "") + "'><td>" + r.商品ID + "</td><td class='truncate'>" + (r.商品名 || "") + "</td><td class='num'>" +
-    r.リアル在庫.toLocaleString("ja-JP") + "</td><td class='num'>" + r.棚卸入力数量.toLocaleString("ja-JP") + "</td><td class='num" + (r.差異 < 0 ? " mismatch-cell" : "") + "'>" +
-    (r.差異 > 0 ? "+" : "") + r.差異.toLocaleString("ja-JP") + "</td><td>" + (r.異常値 ? "⚠ 要確認" : "") + "</td></tr>"
-  ).join("");
+  const previewBody = document.getElementById("stk-preview-tbody");
+  previewBody.replaceChildren();
+  data.rows.forEach((r) => {
+    const tr = document.createElement("tr");
+    if (r.異常値) tr.className = "row-abnormal";
+    const values = [
+      [r.商品ID, ""], [r.商品名 || "", "truncate"],
+      [r.リアル在庫.toLocaleString("ja-JP"), "num"],
+      [r.棚卸入力数量.toLocaleString("ja-JP"), "num"],
+      [(r.差異 > 0 ? "+" : "") + r.差異.toLocaleString("ja-JP"), "num" + (r.差異 < 0 ? " mismatch-cell" : "")],
+      [r.異常値 ? "⚠ 要確認" : "", ""],
+    ];
+    values.forEach(([value, className]) => {
+      const td = document.createElement("td");
+      if (className) td.className = className;
+      td.textContent = value;
+      tr.appendChild(td);
+    });
+    previewBody.appendChild(tr);
+  });
 
   document.getElementById("stk-confirm-row").style.display = data.targetCount > 0 ? "flex" : "none";
 }
@@ -3267,6 +3307,27 @@ document.getElementById("stk-confirm-btn").addEventListener("click", async () =>
 // ---- 決算 ----
 document.getElementById("cls-asof").value = new Date().toISOString().slice(0, 10);
 
+function renderClosingChecklist(data) {
+  document.getElementById("cls-checklist-wrap").style.display = "block";
+  const checklistBody = document.getElementById("cls-checklist-tbody");
+  checklistBody.replaceChildren();
+  data.rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    const values = [
+      [row.商品ID, ""], [row.商品名 || "", "truncate"],
+      [row.リアル在庫 === null || row.リアル在庫 === undefined ? "" : Number(row.リアル在庫).toLocaleString("ja-JP"), "num"],
+      [row.リアル在庫確認日 || "(未確認)", ""],
+    ];
+    values.forEach(([value, className]) => {
+      const td = document.createElement("td");
+      if (className) td.className = className;
+      td.textContent = value;
+      tr.appendChild(td);
+    });
+    checklistBody.appendChild(tr);
+  });
+}
+
 document.getElementById("cls-checklist-btn").addEventListener("click", async () => {
   const asOf = document.getElementById("cls-asof").value;
   const statusEl = document.getElementById("cls-status");
@@ -3279,11 +3340,7 @@ document.getElementById("cls-checklist-btn").addEventListener("click", async () 
     if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
     statusEl.textContent = data.count + "件が未確認です";
     statusEl.className = "hint";
-    document.getElementById("cls-checklist-wrap").style.display = "block";
-    document.getElementById("cls-checklist-tbody").innerHTML = data.rows.map((row) =>
-      "<tr><td>" + row.商品ID + "</td><td class='truncate'>" + (row.商品名 || "") + "</td><td class='num'>" +
-      (row.リアル在庫 === null || row.リアル在庫 === undefined ? "" : Number(row.リアル在庫).toLocaleString("ja-JP")) + "</td><td>" + (row.リアル在庫確認日 || "(未確認)") + "</td></tr>"
-    ).join("");
+    renderClosingChecklist(data);
   } catch (e) {
     statusEl.textContent = "通信エラー: " + e.message;
     statusEl.className = "hint ng";
