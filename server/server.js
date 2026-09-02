@@ -1818,7 +1818,10 @@ function setupScrollMirror(mirrorId, scrollId) {
   scrollEl.onscroll = () => { if (syncing) return; syncing = true; mirror.scrollLeft = scrollEl.scrollLeft; syncing = false; };
 }
 
-const ORD_HIDDEN = [];
+// 商品IDはリアル在庫連動・注文登録処理では引き続き使用するが、日常確認では
+// 商品メモの方が重要なため画面表示(一覧・CSV)からのみ外す。Excel・API・
+// orderRows自体からは削除しない(在庫タブのINV_HIDDENと同じ仕組み)。
+const ORD_HIDDEN = ["商品ID"];
 let ordSort = { idx: 1, dir: -1 };
 let ordSelected = new Set();
 
