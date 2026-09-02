@@ -1058,6 +1058,11 @@ const DASHBOARD_PAGE = `<!doctype html>
   td input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
   td input.wide-input { width: 160px; text-align: left; }
   td input.wide-input.wider { width: 280px; }
+  /* 数量入力欄の誤操作防止: 上下スピナーを非表示にする(WebKit系・Firefox両対応)。
+     価格・為替等の金額入力には適用しない(qty-inputクラスを付けた要素のみ対象)。 */
+  input.qty-input::-webkit-outer-spin-button,
+  input.qty-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input.qty-input { -moz-appearance: textfield; appearance: textfield; }
   tr.saving td { background: #fff7e0 !important; }
   tr.saved td { background: #e9f7ec !important; }
   tr.error td { background: #fde8e8 !important; }
@@ -1215,7 +1220,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             <label>仕入原価(円)<input id="ne-cost" type="number" step="any" placeholder="わかれば入力"></label>
             <label>送料(円)<input id="ne-shipping" type="number" step="any" placeholder="わかれば入力"></label>
             <label>梱包費(円)<input id="ne-packing" type="number" step="any" placeholder="わかれば入力" value="50"></label>
-            <label>数量<input id="ne-qty" type="number" step="1"></label>
+            <label>数量<input id="ne-qty" type="number" step="1" min="0" class="qty-input"></label>
             <label style="grid-column:span 2;">商品メモ<input id="ne-note" type="text"></label>
             <label style="grid-column:span 3;">商品ID(リアル在庫と連動させたい場合は指定。商品名で検索できます)
               <input id="ne-pid" type="text" list="ne-pid-list" placeholder="例: P0001、または商品名で検索">
@@ -1818,6 +1823,14 @@ function setupScrollMirror(mirrorId, scrollId) {
   scrollEl.onscroll = () => { if (syncing) return; syncing = true; mirror.scrollLeft = scrollEl.scrollLeft; syncing = false; };
 }
 
+// 数量入力欄の誤操作防止(棚卸のような連続入力でホイールによる意図しない増減を防ぐ)。
+// preventDefault()は呼ばない(呼ぶとページ・表のスクロールごと止まってしまうため)。
+// フォーカスを外すだけで、その回のホイールイベントによる値の増減は発生しなくなり、
+// ホイール自体はそのまま素通りしてページ/表は通常どおりスクロールする。
+function preventQtyWheelChange(inp) {
+  inp.addEventListener("wheel", () => inp.blur(), { passive: true });
+}
+
 // 商品IDはリアル在庫連動・注文登録処理では引き続き使用するが、日常確認では
 // 商品メモの方が重要なため画面表示(一覧・CSV)からのみ外す。Excel・API・
 // orderRows自体からは削除しない(在庫タブのINV_HIDDENと同じ仕組み)。
@@ -1909,7 +1922,9 @@ function renderOrders() {
       if (ORD_EDITABLE.includes(h)) {
         td.className = (td.className ? td.className + " " : "") + "num";
         const inp = document.createElement("input");
-        inp.type = "number"; inp.step = "any";
+        const isQty = h === "数量";
+        inp.type = "number"; inp.step = isQty ? "1" : "any";
+        if (isQty) { inp.min = "0"; inp.className = "qty-input"; preventQtyWheelChange(inp); }
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
         inp.addEventListener("change", () => saveOrderField(tr, orderNo, h, inp.value));
         td.appendChild(inp);
@@ -2397,7 +2412,8 @@ function buildStocktakeRow(row, idx) {
   const stagedTd = document.createElement("td");
   stagedTd.className = "num";
   const inp = document.createElement("input");
-  inp.type = "number"; inp.step = "1";
+  inp.type = "number"; inp.step = "1"; inp.min = "0"; inp.className = "qty-input";
+  preventQtyWheelChange(inp);
   inp.value = row[idx.staged] === null || row[idx.staged] === undefined ? "" : row[idx.staged];
   const checkBadge = document.createElement("span");
   checkBadge.className = "stk-check-badge";
@@ -2860,6 +2876,7 @@ function updateFeePreview() {
 }
 document.getElementById("ne-usd").addEventListener("input", updateFeePreview);
 document.getElementById("ne-rate").addEventListener("input", updateFeePreview);
+preventQtyWheelChange(document.getElementById("ne-qty"));
 
 document.getElementById("ne-parse-btn").addEventListener("click", () => {
   const parsed = parseOrderText(document.getElementById("ne-paste").value);
