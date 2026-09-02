@@ -636,12 +636,41 @@ function isSameJstDate(isoA, isoB) {
   return String(isoA).slice(0, 10) === String(isoB).slice(0, 10);
 }
 
+// 「実際に適用すべきレート」を解決する。過去月・未来月は自月のレコードのみを見る
+// (確定レートがなくても他の月へは絶対にフォールバックしない)。
+// 「進行中の当月」だけの特例として、自月のレコードがまだ無い場合に限り前月の確定レートを
+// 暫定代替として返す(実日銀API疎通確認で、当月データがしばらく0件になり得ると判明したため)。
+// 前月確定レートを当月の正式なレコードとして保存することは絶対にしない(表示専用の合成結果)。
+async function resolveApplicableExchangeRate(yearMonth, record) {
+  if (record) {
+    return {
+      rate: record["レート"], rateSourceType: "own", sourceYearMonth: yearMonth, status: record["状態"],
+      startDate: record["対象開始日"], endDate: record["対象終了日"], count: record["データ件数"],
+      fetchedAt: record["取得日時"], source: record["取得元"],
+    };
+  }
+  if (yearMonth !== currentYearMonth()) return null;
+  const prevYearMonth = previousYearMonthOf(yearMonth);
+  const prevRecord = await getExchangeRate({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth: prevYearMonth });
+  if (prevRecord && prevRecord["状態"] === "確定") {
+    return {
+      rate: prevRecord["レート"], rateSourceType: "previous_month_fallback", sourceYearMonth: prevYearMonth, status: "確定",
+      startDate: prevRecord["対象開始日"], endDate: prevRecord["対象終了日"], count: prevRecord["データ件数"],
+      fetchedAt: prevRecord["取得日時"], source: prevRecord["取得元"],
+    };
+  }
+  return null;
+}
+
 // GET /api/exchange-rate?yearMonth=YYYY-MM (省略時は当月)
+// record: その年月そのものの保存済みレコード(フォールバックなしの生値、なければnull)。
+// applicable: 実際に適用すべきレート(当月だけ前月確定レートへの代替を考慮した合成結果、なければnull)。
 async function handleGetExchangeRate(req, res) {
   const url = new URL(req.url, "http://localhost");
   const yearMonth = url.searchParams.get("yearMonth") || currentYearMonth();
   const record = await getExchangeRate({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
-  sendJson(res, 200, { yearMonth, record });
+  const applicable = await resolveApplicableExchangeRate(yearMonth, record);
+  sendJson(res, 200, { yearMonth, record, applicable });
 }
 
 // POST /api/exchange-rate/refresh  body: { yearMonth?, force? }
@@ -674,6 +703,12 @@ async function handleRefreshExchangeRate(req, res) {
 
   const result = await fetchMonthlyAverageRate(yearMonth);
   if (!result.ok) {
+    if (result.errorType === "no_data") {
+      // 実日銀API疎通確認で判明したとおり、進行中の当月データが0件になるのは正常に起こり得る状態。
+      // システム障害のような強いエラーにはせず、既存の保存値(前月確定レート代替の判定材料)を
+      // 一切変更せずにそのまま返す(このyearMonthのレコードは絶対に作らない)。
+      return sendJson(res, 200, { status: "no_data", record: existing || null });
+    }
     return sendJson(res, 502, { status: "error", error: result.error, errorType: result.errorType });
   }
   const saveResult = await saveProvisionalExchangeRate({
@@ -1637,6 +1672,8 @@ function fxPreviousYearMonth(yearMonth) {
   d.setUTCMonth(d.getUTCMonth() - 1);
   return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0");
 }
+// record: その年月そのものの生レコード(フォールバックなし)。前月確定/未確定の判定など、
+// 「この月自体がどういう状態か」を知りたい場合に使う。
 async function fetchExchangeRateRecord(yearMonth) {
   const token = getToken();
   if (!token) return null;
@@ -1649,21 +1686,44 @@ async function fetchExchangeRateRecord(yearMonth) {
     return null;
   }
 }
-function renderFxCard(yearMonth, record, prevYearMonth, prevRecord) {
+// applicable: 実際に適用すべきレート(当月だけ、自月データが無い間は前月確定レートへの
+// 代替を考慮した合成結果)。注文フォーム・為替カードの表示にはこちらを使う。
+async function fetchApplicableExchangeRate(yearMonth) {
+  const token = getToken();
+  if (!token) return null;
+  try {
+    const r = await fetch("/api/exchange-rate?yearMonth=" + encodeURIComponent(yearMonth), { headers: { Authorization: "Bearer " + token } });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data.applicable || null;
+  } catch (e) {
+    return null;
+  }
+}
+function renderFxCard(yearMonth, applicable, prevYearMonth, prevRecord) {
   document.getElementById("fx-yearmonth").textContent = yearMonth;
   const badge = document.getElementById("fx-status-badge");
-  if (record) {
-    document.getElementById("fx-rate").textContent = Number(record["レート"]).toFixed(2) + "円";
-    badge.textContent = "[" + record["状態"] + "]";
-    badge.className = "hint " + (record["状態"] === "確定" ? "ok" : "");
-    document.getElementById("fx-detail").textContent =
-      "対象期間: " + (record["対象開始日"] || "") + "〜" + (record["対象終了日"] || "") +
-      " ・データ" + (record["データ件数"] || 0) + "件 ・取得元: " + (record["取得元"] || "") +
-      " ・最終取得: " + (record["取得日時"] ? String(record["取得日時"]).slice(0, 16).replace("T", " ") : "");
-  } else {
+  const detailEl = document.getElementById("fx-detail");
+  if (!applicable) {
     document.getElementById("fx-rate").textContent = "未取得";
     badge.textContent = "";
-    document.getElementById("fx-detail").textContent = "この月の為替レートはまだ取得されていません(手動で「為替更新」を押してください)";
+    detailEl.textContent = "自動レートを取得できません(「為替更新」を押すか、注文登録時に手動でドル円レートを入力してください)";
+  } else {
+    document.getElementById("fx-rate").textContent = Number(applicable.rate).toFixed(2) + "円";
+    const periodText = "対象期間: " + (applicable.startDate || "") + "〜" + (applicable.endDate || "") +
+      " ・データ" + (applicable.count || 0) + "件 ・取得元: " + (applicable.source || "") +
+      " ・最終取得: " + (applicable.fetchedAt ? String(applicable.fetchedAt).slice(0, 16).replace("T", " ") : "");
+    if (applicable.rateSourceType === "previous_month_fallback") {
+      // 当月の日銀データそのものではないことが一目で分かるよう、通常の[暫定]/[確定]とは
+      // 明確に異なる文言・色にする(単に「暫定」とだけ表示すると当月の暫定平均と区別できないため)。
+      badge.textContent = "[前月レート代替使用中(" + applicable.sourceYearMonth + "確定)]";
+      badge.className = "hint ng";
+      detailEl.textContent = yearMonth + "の日銀データはまだ取得できていません。前月(" + applicable.sourceYearMonth + ")の確定レートを暫定使用しています。" + periodText;
+    } else {
+      badge.textContent = "[" + applicable.status + "]";
+      badge.className = "hint " + (applicable.status === "確定" ? "ok" : "");
+      detailEl.textContent = periodText;
+    }
   }
   const confirmArea = document.getElementById("fx-confirm-area");
   if (prevRecord && prevRecord["状態"] === "確定") {
@@ -1679,17 +1739,18 @@ async function loadFxCard() {
   const yearMonth = fxYearMonthNow();
   const prevYearMonth = fxPreviousYearMonth(yearMonth);
   // 当月分の自動取得を試みる(バックエンド側で当日取得済み・確定済みならAPI自体を呼ばずskipされる)。
-  // 失敗してもここでは無視し、以降のカード表示は保存済みデータだけで続行する(画面をブロックしない)。
+  // 当月の日銀データが0件の場合もエラーではなく正常な結果として扱われる。
+  // 失敗してもここでは無視し、以降のカード表示は保存済みデータ(前月確定レート代替含む)だけで続行する。
   try {
     await fetch("/api/exchange-rate/refresh", {
       method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
       body: JSON.stringify({ yearMonth }),
     });
   } catch (e) { /* 自動取得の失敗はここでは無視する */ }
-  const [record, prevRecord] = await Promise.all([
-    fetchExchangeRateRecord(yearMonth), fetchExchangeRateRecord(prevYearMonth),
+  const [applicable, prevRecord] = await Promise.all([
+    fetchApplicableExchangeRate(yearMonth), fetchExchangeRateRecord(prevYearMonth),
   ]);
-  renderFxCard(yearMonth, record, prevYearMonth, prevRecord);
+  renderFxCard(yearMonth, applicable, prevYearMonth, prevRecord);
 }
 document.getElementById("fx-refresh-btn").addEventListener("click", async () => {
   const statusEl = document.getElementById("fx-refresh-status");
@@ -1702,8 +1763,16 @@ document.getElementById("fx-refresh-btn").addEventListener("click", async () => 
     });
     const data = await r.json();
     if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
-    statusEl.textContent = data.status === "skipped" ? "確定済みのため更新不要です" : "更新しました";
-    statusEl.className = "hint ok";
+    if (data.status === "no_data") {
+      statusEl.textContent = "日銀の当月データはまだ取得できません(前月確定レートの代替使用を継続します)";
+      statusEl.className = "hint";
+    } else if (data.status === "skipped") {
+      statusEl.textContent = "確定済みのため更新不要です";
+      statusEl.className = "hint ok";
+    } else {
+      statusEl.textContent = "更新しました";
+      statusEl.className = "hint ok";
+    }
     await loadFxCard();
   } catch (e) {
     statusEl.textContent = "通信エラー: " + e.message;
@@ -3358,12 +3427,19 @@ async function applyOrderDateRate(dateStr) {
   const statusEl = document.getElementById("ne-rate-status");
   if (!dateStr) { statusEl.textContent = ""; neRateAutoValue = null; return; }
   const yearMonth = dateStr.slice(0, 7);
-  const record = await fetchExchangeRateRecord(yearMonth);
-  if (record && record["レート"]) {
-    neRateAutoValue = Number(record["レート"]);
+  // applicableは「過去月は自月の確定レートのみ・当月だけ前月確定レートへの代替を考慮」という
+  // 優先順位をサーバー側で解決済みの結果なので、フロント側で月の新旧を判定する必要はない。
+  const applicable = await fetchApplicableExchangeRate(yearMonth);
+  if (applicable) {
+    neRateAutoValue = Number(applicable.rate);
     document.getElementById("ne-rate").value = neRateAutoValue;
-    statusEl.textContent = "自動取得(" + record["状態"] + "、" + yearMonth + ")";
-    statusEl.className = "hint ok";
+    if (applicable.rateSourceType === "previous_month_fallback") {
+      statusEl.textContent = "前月確定レートを暫定使用中(" + applicable.sourceYearMonth + "確定)";
+      statusEl.className = "hint ng";
+    } else {
+      statusEl.textContent = "自動取得(" + applicable.status + "、" + yearMonth + ")";
+      statusEl.className = "hint ok";
+    }
   } else {
     neRateAutoValue = null;
     statusEl.textContent = yearMonth + "の自動レートが未取得です。手動でドル円レートを入力してください";

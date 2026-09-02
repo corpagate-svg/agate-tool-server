@@ -114,10 +114,14 @@ async function fetchDailyRates(yearMonth, { fetchImpl = fetch, timeoutMs = DEFAU
 }
 
 // 日次データの単純算術平均。空の場合は average=null。
+// 日次値は一切丸めずに合計・平均を計算し、最終的な月次平均だけを小数第2位に丸めて
+// 正式な適用レートとする(実日銀APIの確認結果を踏まえた仕様。丸め位置を誤ると
+// 収益円・Payoneer手数料・最終利益の計算結果がずれるため、丸めるのはここ1箇所だけにする)。
 function computeMonthlyAverage(dailyRates) {
   if (!dailyRates || !dailyRates.length) return { average: null, count: 0, startDate: null, endDate: null };
   const sum = dailyRates.reduce((acc, r) => acc + r.value, 0);
-  const average = sum / dailyRates.length; // 丸めない(呼び出し側・表示側で必要に応じて丸める)
+  const rawAverage = sum / dailyRates.length;
+  const average = Math.round(rawAverage * 100) / 100;
   return {
     average, count: dailyRates.length,
     startDate: dailyRates[0].date, endDate: dailyRates[dailyRates.length - 1].date,
