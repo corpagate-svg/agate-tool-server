@@ -26,6 +26,11 @@ function buildRequestUrl(yearMonth) {
 function normalizeDate(raw) {
   const s = String(raw);
   if (!/^\d{8}$/.test(s)) return null;
+  const year = Number(s.slice(0, 4));
+  const month = Number(s.slice(4, 6));
+  const day = Number(s.slice(6, 8));
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
 }
 
@@ -84,14 +89,24 @@ async function fetchDailyRates(yearMonth, { fetchImpl = fetch, timeoutMs = DEFAU
   }
 
   const resultSet = Array.isArray(json.RESULTSET) ? json.RESULTSET : [];
-  const series = resultSet.find((s) => s && s.SERIES_CODE === BOJ_SERIES_CODE) || resultSet[0];
-  if (!series || !series.VALUES) {
-    // 「正常に終了しましたが、該当データはありませんでした」(M181030I)等、系列は空でも200になる場合がある。
+  const series = resultSet.find((s) => s && s.SERIES_CODE === BOJ_SERIES_CODE);
+  if (!series) {
+    if (resultSet.length === 0) {
+      // 「正常に終了しましたが、該当データはありませんでした」(M181030I)等、系列は空でも200になる場合がある。
+      return { ok: true, dailyRates: [], excludedCount: 0, seriesCode: BOJ_SERIES_CODE, dbName: BOJ_DB };
+    }
+    return { ok: false, error: `日銀APIの応答に対象系列(${BOJ_SERIES_CODE})がありません`, errorType: "format" };
+  }
+  if (!series.VALUES) {
     return { ok: true, dailyRates: [], excludedCount: 0, seriesCode: BOJ_SERIES_CODE, dbName: BOJ_DB };
   }
 
   const dates = Array.isArray(series.VALUES.SURVEY_DATES) ? series.VALUES.SURVEY_DATES : [];
   const values = Array.isArray(series.VALUES.VALUES) ? series.VALUES.VALUES : [];
+  if (dates.length !== values.length) {
+    return { ok: false, error: "日銀APIの日付と値の件数が一致しません", errorType: "format" };
+  }
+  const expectedYearMonth = String(yearMonth || "");
 
   // 同一日付の重複は1件として扱う(後に出現した値で上書き。通常のAPI応答では発生しない想定)。
   const byDate = new Map();
@@ -100,6 +115,9 @@ async function fetchDailyRates(yearMonth, { fetchImpl = fetch, timeoutMs = DEFAU
     const dateStr = normalizeDate(dates[i]);
     const rawValue = values[i];
     if (!dateStr) { excludedCount++; continue; }
+    if (dateStr.slice(0, 7) !== expectedYearMonth) {
+      return { ok: false, error: `日銀APIに対象年月外の日付が含まれています(${dateStr})`, errorType: "format" };
+    }
     const num = typeof rawValue === "number" ? rawValue : null;
     // nullは欠測値(BOJ側の仕様どおり)。数値でも0以下・非有限は不正値として除外する。
     if (num === null || !Number.isFinite(num) || num <= 0) { excludedCount++; continue; }

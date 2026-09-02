@@ -89,6 +89,11 @@ function applyRealStockToRow(row, INV_COL, value, confirmedAt) {
 // このチェックは「実際にその商品を数えたか」を管理する独立フラグのため、
 // 未入力に戻しても自動では解除しない(解除は棚卸チェックの一括解除操作のみで行う)。
 function applyStagedQtyToRow(row, INV_COL, value) {
+  if (isStocktakeConfirmed(row, INV_COL)) {
+    const error = new Error("この商品は既に一括確定済みのため、棚卸数量を変更できません");
+    error.statusCode = 409;
+    throw error;
+  }
   const cleared = value === null;
   row.getCell(INV_COL.棚卸入力数量).value = cleared ? null : value;
   row.getCell(INV_COL.棚卸入力日時).value = cleared ? null : new Date().toISOString();
@@ -262,6 +267,12 @@ async function confirmStocktake({ loadInventoryWorkbook, INVENTORY_PATH, HISTORY
       row.getCell(INV_COL.リアル在庫).value = after;
       row.getCell(INV_COL.リアル在庫確認日).value = date;
       row.getCell(INV_COL.棚卸入力数量).value = null;
+      // 棚卸入力日時は一括確定済み状態の永続的な印として保持する。旧データ等で日時が
+      // 欠けていても確定時に補完し、以後の再入力・個別取消を確実に拒否できるようにする。
+      const stagedAtCell = row.getCell(INV_COL.棚卸入力日時);
+      if (stagedAtCell.value === null || stagedAtCell.value === undefined || stagedAtCell.value === "") {
+        stagedAtCell.value = new Date().toISOString();
+      }
       row.commit();
       rows.push({ pid, name: row.getCell(INV_COL.商品名).value, before, after });
     }

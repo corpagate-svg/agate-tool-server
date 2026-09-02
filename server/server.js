@@ -25,6 +25,7 @@ const { createSalesWorkbookLoaders } = require("./salesWorkbookStore");
 const { resolveOrderLineTransaction } = require("./manualOrderResolution");
 const { editManagedOrderTransaction, deleteManagedOrdersTransaction } = require("./managedOrderMutation");
 const { fetchMonthlyAverageRate, BOJ_SOURCE_LABEL } = require("./exchangeRateFetcher");
+const { jstYearMonth, isSameJstDate } = require("./jstDate");
 const {
   getRate: getExchangeRate, saveProvisionalRate: saveProvisionalExchangeRate, confirmRate: confirmExchangeRate,
   getNoDataCheckLog, recordNoDataCheck,
@@ -626,7 +627,7 @@ async function handleSummary(req, res) {
 // 注文登録・編集の既存トランザクション(recompute/orderRegistration等)は一切変更しない。
 // ここはあくまで「その年月の保存済みレートを参照する」独立した読み書きのみを担当する。
 function currentYearMonth() {
-  return new Date().toISOString().slice(0, 7);
+  return jstYearMonth();
 }
 function previousYearMonthOf(yearMonth) {
   const [y, m] = String(yearMonth).split("-").map(Number);
@@ -634,11 +635,6 @@ function previousYearMonthOf(yearMonth) {
   d.setUTCMonth(d.getUTCMonth() - 1);
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
-function isSameJstDate(isoA, isoB) {
-  if (!isoA || !isoB) return false;
-  return String(isoA).slice(0, 10) === String(isoB).slice(0, 10);
-}
-
 // 「実際に適用すべきレート」を解決する。過去月・未来月は自月のレコードのみを見る
 // (確定レートがなくても他の月へは絶対にフォールバックしない)。
 // 「進行中の当月」だけの特例として、自月のレコードがまだ無い場合に限り前月の確定レートを
@@ -815,6 +811,12 @@ async function handlePatchInventory(req, res) {
     const row = realInv.findInventoryRow(ws, INV_COL, pid);
     if (!row) return { found: false };
 
+    // 一括確定済みの状態を日時で判定できる間に必ず停止する。ここで再入力やクリアを許すと
+    // 棚卸入力日時が上書き/消去され、後続の個別取消が確定済み商品を未確認へ戻せてしまう。
+    if (stagedQty !== undefined && realInv.isStocktakeConfirmed(row, INV_COL)) {
+      return { found: true, blockedStocktakeEdit: true };
+    }
+
     if ("仕入価格円" in body) {
       const v = numOrNull(body["仕入価格円"]);
       row.getCell(INV_COL.仕入価格).value = v === null ? "" : v;
@@ -840,6 +842,9 @@ async function handlePatchInventory(req, res) {
   });
 
   if (!outcome.found) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
+  if (outcome.blockedStocktakeEdit) {
+    return sendJson(res, 409, { error: "この商品は既に一括確定済みのため、棚卸数量を変更できません" });
+  }
 
   if (outcome.realStockChange) {
     await appendHistory(HISTORY_PATH, {
@@ -1677,7 +1682,15 @@ document.querySelectorAll(".tabbtn").forEach(btn => {
 
 // ---- 為替(日銀・月次平均USD/JPY) ----
 // 注文一覧・棚卸・在庫など他タブの読み込みとは完全に独立しており、失敗してもそれらをブロックしない。
-function fxYearMonthNow() { return new Date().toISOString().slice(0, 7); }
+function fxYearMonthFor(value) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit",
+  }).formatToParts(new Date(value));
+  const year = parts.find((part) => part.type === "year").value;
+  const month = parts.find((part) => part.type === "month").value;
+  return year + "-" + month;
+}
+function fxYearMonthNow() { return fxYearMonthFor(new Date()); }
 function fxPreviousYearMonth(yearMonth) {
   const parts = yearMonth.split("-").map(Number);
   const d = new Date(Date.UTC(parts[0], parts[1] - 1, 1));
@@ -2436,12 +2449,23 @@ function renderInvKpis() {
     '<div class="kpi"><div class="label">仕入価格が入っている商品数</div><div class="value">' + priced.toLocaleString("ja-JP") + " / " + invRows.length.toLocaleString("ja-JP") + '</div></div>';
 }
 
+// 商品ID・商品名は在庫管理表.xlsxの外部データ(eBay同期・手入力)由来のため、innerHTML文字列結合ではなく
+// createElement/textContentで構築する(相違一覧と同じ対策。ここは見落とされていた別のXSS混入経路だった)。
+function buildPidOptions(pidIdx, nameIdx) {
+  const fragment = document.createDocumentFragment();
+  invRows.forEach((row) => {
+    const option = document.createElement("option");
+    option.value = row[pidIdx];
+    option.textContent = row[nameIdx] || "";
+    fragment.appendChild(option);
+  });
+  return fragment;
+}
 function renderPidDatalist() {
   const pidIdx = invHeaders.indexOf("商品ID"), nameIdx = invHeaders.indexOf("商品名");
   if (pidIdx === -1) return;
-  const options = invRows.map((row) => '<option value="' + row[pidIdx] + '">' + (row[nameIdx] || "").replace(/"/g, "&quot;") + '</option>').join("");
-  document.getElementById("ne-pid-list").innerHTML = options;
-  document.getElementById("ord-pid-list").innerHTML = options;
+  document.getElementById("ne-pid-list").replaceChildren(buildPidOptions(pidIdx, nameIdx));
+  document.getElementById("ord-pid-list").replaceChildren(buildPidOptions(pidIdx, nameIdx));
 }
 
 function renderInventory() {
@@ -2741,20 +2765,41 @@ function renderDiscrepancies(rows) {
   if (!rows.length) { tbody.innerHTML = "<tr><td colspan='7'>相違はありません</td></tr>"; return; }
   const displayRows = discHeaderSort ? sortDiscrepancyRowsByHeader(rows, discHeaderSort) : rows;
   const bySite = (row, site) => row.countries.find((c) => c.site === site);
-  tbody.innerHTML = displayRows.map((row) => {
-    const cell = (site) => {
-      const c = bySite(row, site);
-      if (!c) return "<td class='num'>-</td>";
-      return "<td class='num" + (c.mismatch ? " mismatch-cell" : "") + "'>" + c.value.toLocaleString("ja-JP") + "</td>";
+  tbody.replaceChildren();
+  displayRows.forEach((row) => {
+    const tr = document.createElement("tr");
+    if (row.unconfirmed) tr.className = "row-unconfirmed";
+    const appendTextCell = (value, className) => {
+      const td = document.createElement("td");
+      if (className) td.className = className;
+      td.textContent = value;
+      tr.appendChild(td);
+      return td;
     };
+    appendTextCell(row.商品ID || "");
     const name = row.商品名 || "";
     const usUrl = usEbayListingUrl(row.US_出品ID);
-    const nameCell = usUrl
-      ? "<td class='truncate'><a href='" + usUrl + "' target='_blank' rel='noopener noreferrer' title='US eBay商品ページを開く'>" + name + "</a></td>"
-      : "<td class='truncate'>" + name + "</td>";
-    return "<tr class='" + (row.unconfirmed ? "row-unconfirmed" : "") + "'><td>" + row.商品ID + "</td>" + nameCell + "<td class='num'>" +
-      row.リアル在庫.toLocaleString("ja-JP") + "</td>" + cell("US") + cell("UK") + cell("AU") + "<td>" + (row.リアル在庫確認日 || "(未確認)") + "</td></tr>";
-  }).join("");
+    const nameTd = appendTextCell("", "truncate");
+    if (usUrl) {
+      const link = document.createElement("a");
+      link.href = usUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.title = "US eBay商品ページを開く";
+      link.textContent = name;
+      nameTd.appendChild(link);
+    } else {
+      nameTd.textContent = name;
+    }
+    appendTextCell(Number(row.リアル在庫).toLocaleString("ja-JP"), "num");
+    for (const site of ["US", "UK", "AU"]) {
+      const country = bySite(row, site);
+      appendTextCell(country ? Number(country.value).toLocaleString("ja-JP") : "-",
+        "num" + (country && country.mismatch ? " mismatch-cell" : ""));
+    }
+    appendTextCell(row.リアル在庫確認日 || "(未確認)");
+    tbody.appendChild(tr);
+  });
 }
 renderDiscrepancyHead();
 document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscrepancies);
@@ -2929,6 +2974,8 @@ function buildStocktakeRow(row, idx) {
   undoBtn.className = "stk-undo-btn";
   undoBtn.textContent = "↺";
   const refreshUndoBtn = () => {
+    inp.disabled = isStocktakeUndoBlocked();
+    inp.title = inp.disabled ? "一括確定済みのため変更できません" : "";
     undoBtn.style.display = row[idx.checked] ? "inline-flex" : "none";
     if (isStocktakeUndoBlocked()) {
       undoBtn.disabled = true;
@@ -3435,16 +3482,42 @@ preventQtyWheelChange(document.getElementById("ne-qty"));
 // 注文日から対象年月の保存済み為替レートを自動取得してドル円レート欄へ反映する。
 // 取得できない場合はレートを空のままにし、手動入力を促す警告を表示する(155等への暗黙フォールバックは行わない)。
 let neRateAutoValue = null;
+let neRateRequestSequence = 0;
+let neRateManualRevision = 0;
+let neRateLoading = false;
+function setOrderRateLoading(loading) {
+  neRateLoading = loading;
+  document.getElementById("ne-submit-btn").disabled = loading;
+}
 async function applyOrderDateRate(dateStr) {
   const statusEl = document.getElementById("ne-rate-status");
-  if (!dateStr) { statusEl.textContent = ""; neRateAutoValue = null; return; }
+  const rateInput = document.getElementById("ne-rate");
+  const requestSequence = ++neRateRequestSequence;
+  neRateAutoValue = null;
+  rateInput.value = "";
+  updateFeePreview();
+  if (!dateStr) { statusEl.textContent = ""; setOrderRateLoading(false); return; }
   const yearMonth = dateStr.slice(0, 7);
+  const manualRevisionAtStart = neRateManualRevision;
+  statusEl.textContent = "自動レートを取得中...";
+  statusEl.className = "hint";
+  setOrderRateLoading(true);
   // applicableは「過去月は自月の確定レートのみ・当月だけ前月確定レートへの代替を考慮」という
   // 優先順位をサーバー側で解決済みの結果なので、フロント側で月の新旧を判定する必要はない。
   const applicable = await fetchApplicableExchangeRate(yearMonth);
+  // 後から開始された日付変更の結果だけを有効にする。古い通信は画面状態へ一切触れない。
+  if (requestSequence !== neRateRequestSequence || document.getElementById("ne-date").value.slice(0, 7) !== yearMonth) return;
+  setOrderRateLoading(false);
+  // 取得開始後に利用者が入力した値は、遅れて返った自動応答より常に優先する。
+  if (neRateManualRevision !== manualRevisionAtStart) {
+    statusEl.textContent = rateInput.value ? "手動入力(自動取得値より優先)" : "手動入力が空欄です";
+    statusEl.className = rateInput.value ? "hint" : "hint ng";
+    updateFeePreview();
+    return;
+  }
   if (applicable) {
     neRateAutoValue = Number(applicable.rate);
-    document.getElementById("ne-rate").value = neRateAutoValue;
+    rateInput.value = neRateAutoValue;
     if (applicable.rateSourceType === "previous_month_fallback") {
       statusEl.textContent = "前月確定レートを暫定使用中(" + applicable.sourceYearMonth + "確定)";
       statusEl.className = "hint ng";
@@ -3454,18 +3527,20 @@ async function applyOrderDateRate(dateStr) {
     }
   } else {
     neRateAutoValue = null;
+    rateInput.value = "";
     statusEl.textContent = yearMonth + "の自動レートが未取得です。手動でドル円レートを入力してください";
     statusEl.className = "hint ng";
   }
   updateFeePreview();
 }
 document.getElementById("ne-rate").addEventListener("input", () => {
+  neRateManualRevision++;
   const statusEl = document.getElementById("ne-rate-status");
-  const cur = Number(document.getElementById("ne-rate").value);
-  if (neRateAutoValue !== null && cur !== neRateAutoValue) {
-    statusEl.textContent = "手動入力(自動取得値を上書き)";
-    statusEl.className = "hint";
-  }
+  const raw = document.getElementById("ne-rate").value;
+  const cur = Number(raw);
+  if (raw && Number.isFinite(cur) && cur > 0) statusEl.textContent = "手動入力";
+  else statusEl.textContent = neRateLoading ? "自動取得中・手動入力が空欄です" : "手動でドル円レートを入力してください";
+  statusEl.className = raw && Number.isFinite(cur) && cur > 0 ? "hint" : "hint ng";
 });
 document.getElementById("ne-date").addEventListener("change", (e) => applyOrderDateRate(e.target.value));
 
@@ -3497,6 +3572,11 @@ document.getElementById("ne-parse-btn").addEventListener("click", () => {
 
 document.getElementById("ne-submit-btn").addEventListener("click", async () => {
   const statusEl = document.getElementById("ne-status");
+  if (neRateLoading) {
+    statusEl.textContent = "為替レートを確認中です。完了後に登録してください";
+    statusEl.className = "hint ng";
+    return;
+  }
   const body = {
     注文番号: document.getElementById("ne-order").value.trim(),
     日付: document.getElementById("ne-date").value.trim(),
