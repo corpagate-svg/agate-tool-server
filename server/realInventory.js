@@ -95,8 +95,9 @@ function applyStagedQtyToRow(row, INV_COL, value) {
   if (!cleared) row.getCell(INV_COL.棚卸チェック).value = true;
 }
 
-// 棚卸チェックの一括解除(手動運用のみ)。リアル在庫・棚卸入力数量・日本語商品名など
-// 他の列は一切変更しない。
+// 棚卸チェックの一括解除(手動運用のみ、次回棚卸サイクル開始時の明示的リセット)。
+// 棚卸チェックと棚卸入力日時をあわせてクリアする(両方とも「今回の棚卸で確認済みか」を表す
+// 対の情報のため)。リアル在庫・棚卸入力数量・日本語商品名など他の列は一切変更しない。
 async function resetStocktakeChecks({ loadInventoryWorkbook, INVENTORY_PATH, INV_COL }) {
   return withInventoryLock(async () => {
     const wb = await loadInventoryWorkbook();
@@ -106,6 +107,7 @@ async function resetStocktakeChecks({ loadInventoryWorkbook, INVENTORY_PATH, INV
       const row = ws.getRow(r);
       if (!row.getCell(INV_COL.棚卸チェック).value) continue;
       row.getCell(INV_COL.棚卸チェック).value = null;
+      row.getCell(INV_COL.棚卸入力日時).value = null;
       row.commit();
       reset++;
     }
@@ -202,7 +204,9 @@ function previewStocktake({ ws, INV_HEADERS }) {
   };
 }
 
-// 棚卸一括確定(段階2): 棚卸入力数量をリアル在庫へ反映し、確認日を更新、履歴に記録、staging列をクリアする。
+// 棚卸一括確定(段階2): 棚卸入力数量をリアル在庫へ反映し、確認日を更新、履歴に記録し、
+// 棚卸入力数量(staging値)のみクリアする。棚卸チェック・棚卸入力日時は「今回の棚卸で確認済み」の
+// 履歴として一括確定後も残す(次回棚卸開始時の「棚卸チェックをすべて解除」でのみクリアする)。
 // targetPids未指定の場合は「棚卸入力数量が入っている全行」が対象。
 async function confirmStocktake({ loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_HEADERS, INV_COL, targetPids, confirmedAt }) {
   const applied = await withInventoryLock(async () => {
@@ -222,7 +226,6 @@ async function confirmStocktake({ loadInventoryWorkbook, INVENTORY_PATH, HISTORY
       row.getCell(INV_COL.リアル在庫).value = after;
       row.getCell(INV_COL.リアル在庫確認日).value = date;
       row.getCell(INV_COL.棚卸入力数量).value = null;
-      row.getCell(INV_COL.棚卸入力日時).value = null;
       row.commit();
       rows.push({ pid, name: row.getCell(INV_COL.商品名).value, before, after });
     }
