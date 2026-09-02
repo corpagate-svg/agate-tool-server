@@ -164,6 +164,8 @@ function computeDiscrepancies({ ws, INV_HEADERS, INV_COL }) {
       リアル在庫: realNum,
       リアル在庫確認日: v["リアル在庫確認日"] || null,
       unconfirmed: !v["リアル在庫確認日"],
+      // US eBay商品ページへのリンク表示専用。相違判定には使わない。
+      US_出品ID: hasUS ? v["US_出品ID"] : null,
       countries,
     });
   }

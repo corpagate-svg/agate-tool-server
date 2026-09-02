@@ -2303,6 +2303,13 @@ async function loadUnlinked() {
     tbody.innerHTML = "<tr><td colspan='6'>通信エラー: " + e.message + "</td></tr>";
   }
 }
+// US_出品IDが有効な値の場合のみUS eBay商品ページのURLを返す(なければnull)。
+function usEbayListingUrl(usItemId) {
+  if (usItemId === null || usItemId === undefined) return null;
+  const id = String(usItemId).trim();
+  if (!id) return null;
+  return "https://www.ebay.com/itm/" + encodeURIComponent(id);
+}
 function renderDiscrepancies(rows) {
   document.getElementById("disc-count").textContent = rows.length.toLocaleString("ja-JP") + " 件";
   const tbody = document.getElementById("disc-tbody");
@@ -2314,7 +2321,12 @@ function renderDiscrepancies(rows) {
       if (!c) return "<td class='num'>-</td>";
       return "<td class='num" + (c.mismatch ? " mismatch-cell" : "") + "'>" + c.value.toLocaleString("ja-JP") + "</td>";
     };
-    return "<tr class='" + (row.unconfirmed ? "row-unconfirmed" : "") + "'><td>" + row.商品ID + "</td><td class='truncate'>" + (row.商品名 || "") + "</td><td class='num'>" +
+    const name = row.商品名 || "";
+    const usUrl = usEbayListingUrl(row.US_出品ID);
+    const nameCell = usUrl
+      ? "<td class='truncate'><a href='" + usUrl + "' target='_blank' rel='noopener noreferrer' title='US eBay商品ページを開く'>" + name + "</a></td>"
+      : "<td class='truncate'>" + name + "</td>";
+    return "<tr class='" + (row.unconfirmed ? "row-unconfirmed" : "") + "'><td>" + row.商品ID + "</td>" + nameCell + "<td class='num'>" +
       row.リアル在庫.toLocaleString("ja-JP") + "</td>" + cell("US") + cell("UK") + cell("AU") + "<td>" + (row.リアル在庫確認日 || "(未確認)") + "</td></tr>";
   }).join("");
 }
