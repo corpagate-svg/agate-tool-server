@@ -1354,7 +1354,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         <div class="pager" id="stk-pager-top"></div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>商品ID</th><th>商品名(英語)</th><th>商品名(日本語)</th><th>画像</th><th class="num">仕入価格(円)</th><th class="num">リアル在庫</th><th class="num">棚卸入力数量</th><th>入力日時</th></tr></thead>
+            <thead><tr id="stk-thead"></tr></thead>
             <tbody id="stk-tbody"></tbody>
           </table>
         </div>
@@ -2324,6 +2324,9 @@ document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscre
 const STK_PAGE_SIZE = 300;
 let stkPage = 1;
 let stkPrevQ = "";
+// 列見出しクリックによる並び替え。nullの間は既存のプルダウン(stk-sort)が有効。
+// {key, dir} が入っている間はこちらを優先する(プルダウンはstk-sort変更時にクリアする)。
+let stkHeaderSort = null;
 
 function loadStocktakeList() { stkPage = 1; renderStocktake(); }
 
@@ -2334,6 +2337,57 @@ function stkRowMatches(row, idx, q) {
   const sku = row[idx.sku] || ""; // 検索対象のみ。一覧には表示しない
   const searchable = (String(pid || "") + " " + name + " " + jaName + " " + sku).toLowerCase();
   return !q || searchable.indexOf(q) !== -1;
+}
+
+// 列見出しクリックで並び替え可能な列(画像・操作列は対象外)。idxオブジェクトのキー名と対応させる。
+const STK_SORTABLE_COLUMNS = [
+  { key: "pid", label: "商品ID" },
+  { key: "name", label: "商品名(英語)" },
+  { key: "jaName", label: "商品名(日本語)" },
+  null,
+  { key: "price", label: "仕入価格(円)", num: true },
+  { key: "real", label: "リアル在庫", num: true },
+  { key: "staged", label: "棚卸入力数量", num: true },
+  { key: "stagedAt", label: "入力日時" },
+];
+const STK_HEADER_NUM_KEYS = new Set(["price", "real", "staged"]);
+
+// 空欄/未入力は昇順・降順にかかわらず必ず末尾に置く(0は有効な数値として通常どおり比較する)。
+function compareStkHeaderValue(av, bv, isNum, dir) {
+  const aEmpty = av === "" || av === null || av === undefined;
+  const bEmpty = bv === "" || bv === null || bv === undefined;
+  if (aEmpty && bEmpty) return 0;
+  if (aEmpty) return 1;
+  if (bEmpty) return -1;
+  if (isNum) return (Number(av) - Number(bv)) * dir;
+  return String(av).localeCompare(String(bv), "ja", { numeric: true, sensitivity: "base" }) * dir;
+}
+
+function sortStocktakeRowsByHeader(rows, idx, headerSort) {
+  const field = idx[headerSort.key];
+  const isNum = STK_HEADER_NUM_KEYS.has(headerSort.key);
+  return rows.slice().sort((a, b) => compareStkHeaderValue(a[field], b[field], isNum, headerSort.dir));
+}
+
+function renderStocktakeHead() {
+  const thead = document.getElementById("stk-thead");
+  thead.innerHTML = STK_SORTABLE_COLUMNS.map((col) => {
+    if (!col) return "<th>画像</th>";
+    const isSortCol = stkHeaderSort && stkHeaderSort.key === col.key;
+    const arrow = isSortCol ? '<span class="sort-arrow">' + (stkHeaderSort.dir === 1 ? "▲" : "▼") + '</span>' : "";
+    return '<th class="sortable' + (col.num ? " num" : "") + '" data-key="' + col.key + '">' + col.label + arrow + '</th>';
+  }).join("");
+  thead.querySelectorAll("th.sortable").forEach((th) => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.key;
+      // 1回目クリックは昇順、同じ列の再クリックで昇順/降順を切り替える。別の列は昇順から開始する。
+      stkHeaderSort = { key, dir: stkHeaderSort && stkHeaderSort.key === key ? -stkHeaderSort.dir : 1 };
+      // ヘッダーソートを優先させ、プルダウンは通常状態(先頭の商品ID順)へ戻す。
+      document.getElementById("stk-sort").value = "pid";
+      stkPage = 1;
+      renderStocktake();
+    });
+  });
 }
 
 function sortStocktakeRows(rows, idx, sortKey) {
@@ -2470,6 +2524,7 @@ function renderStocktake() {
     checked: invHeaders.indexOf("棚卸チェック"),
   };
   renderStocktakeProgress(idx);
+  renderStocktakeHead();
   const q = document.getElementById("stk-q").value.trim().toLowerCase();
   if (q !== stkPrevQ) stkPage = 1;
   stkPrevQ = q;
@@ -2481,8 +2536,12 @@ function renderStocktake() {
   tbody.innerHTML = "";
 
   // 元のinvRowsは変更せず、検索結果のコピーだけを並び替えてからページ分けする。
+  // 検索→ソート→ページネーションの順を維持し、表示中のページだけでなく
+  // 検索結果全体を並び替えてから300件ずつに分割する。
   const filteredRows = invRows.filter((row) => stkRowMatches(row, idx, q));
-  const displayRows = sortStocktakeRows(filteredRows, idx, sortKey);
+  const displayRows = stkHeaderSort
+    ? sortStocktakeRowsByHeader(filteredRows, idx, stkHeaderSort)
+    : sortStocktakeRows(filteredRows, idx, sortKey);
 
   const totalPages = Math.max(1, Math.ceil(displayRows.length / STK_PAGE_SIZE));
   if (stkPage > totalPages) stkPage = totalPages;
@@ -2500,7 +2559,7 @@ function renderStocktake() {
     : rangeText + " / " + displayRows.length.toLocaleString("ja-JP") + " 件(" + stkPage + " / " + totalPages + " ページ)";
 }
 document.getElementById("stk-q").addEventListener("input", renderStocktake);
-document.getElementById("stk-sort").addEventListener("change", () => { stkPage = 1; renderStocktake(); });
+document.getElementById("stk-sort").addEventListener("change", () => { stkHeaderSort = null; stkPage = 1; renderStocktake(); });
 
 // 検索条件やページに関わらず、全商品を対象に棚卸チェックの進捗を集計する
 function renderStocktakeProgress(idx) {
