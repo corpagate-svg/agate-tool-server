@@ -988,7 +988,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   .search-input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
   .result-count { font-size: 12.5px; color: var(--ink-muted); white-space: nowrap; }
 
-  .table-scroll { overflow-x: auto; min-width: 0; max-height: 620px; overflow-y: auto; margin-top: 14px; }
+  .table-scroll { overflow-x: auto; min-width: 0; max-height: 620px; overflow-y: auto; margin-top: 14px; padding-right: 24px; }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   thead th { text-align: left; font-size: 11.5px; color: var(--ink-muted); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; position: sticky; top: 0; background: var(--surface); z-index: 2; }
   thead th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -1810,7 +1810,9 @@ function setupScrollMirror(mirrorId, scrollId) {
   const inner = mirror.querySelector(".scroll-mirror-top-inner");
   const table = scrollEl.querySelector("table");
   if (!table) return;
-  inner.style.width = table.scrollWidth + "px";
+  // table.scrollWidthではなくscrollEl.scrollWidthを使う。table-scrollの右側paddingが
+  // 実スクロール範囲に含まれるため、ミラー側もそれを含めないと最大までずれてしまう。
+  inner.style.width = scrollEl.scrollWidth + "px";
   let syncing = false;
   mirror.onscroll = () => { if (syncing) return; syncing = true; scrollEl.scrollLeft = mirror.scrollLeft; syncing = false; };
   scrollEl.onscroll = () => { if (syncing) return; syncing = true; mirror.scrollLeft = scrollEl.scrollLeft; syncing = false; };
