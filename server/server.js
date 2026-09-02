@@ -1326,7 +1326,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>商品ID</th><th>商品名</th><th class="num">リアル在庫</th><th class="num">US在庫</th><th class="num">UK在庫</th><th class="num">AU在庫</th><th>リアル在庫確認日</th></tr></thead>
+            <thead><tr id="disc-thead"></tr></thead>
             <tbody id="disc-tbody"></tbody>
           </table>
         </div>
@@ -2334,12 +2334,78 @@ function usEbayListingUrl(usItemId) {
   if (!id) return null;
   return "https://www.ebay.com/itm/" + encodeURIComponent(id);
 }
+// 列見出しクリックで並び替え可能な列。相違一覧はキーが行オブジェクトの直接プロパティではない列
+// (US/UK/AU在庫はcountries配列から探す)があるため、棚卸ページのidx方式ではなくアクセサ関数で扱う。
+const DISC_SORTABLE_COLUMNS = [
+  { key: "pid", label: "商品ID" },
+  { key: "name", label: "商品名" },
+  { key: "real", label: "リアル在庫", num: true },
+  { key: "us", label: "US在庫", num: true },
+  { key: "uk", label: "UK在庫", num: true },
+  { key: "au", label: "AU在庫", num: true },
+  { key: "confirmedAt", label: "リアル在庫確認日" },
+];
+const DISC_HEADER_NUM_KEYS = new Set(["real", "us", "uk", "au"]);
+const DISC_SITE_BY_KEY = { us: "US", uk: "UK", au: "AU" };
+
+function discHeaderValue(row, key) {
+  if (key === "pid") return row.商品ID;
+  if (key === "name") return row.商品名;
+  if (key === "real") return row.リアル在庫;
+  if (key === "confirmedAt") return row.リアル在庫確認日;
+  const site = DISC_SITE_BY_KEY[key];
+  const c = row.countries.find((x) => x.site === site);
+  return c ? c.value : null; // その国に出品していない場合は「空欄」として扱う(0とは区別する)
+}
+
+// 相違一覧は棚卸ページ(compareStkHeaderValue)と異なり「空欄は常に最後」ではなく、
+// 並び替え方向に連動して空欄の位置も反転させる仕様(昇順=空欄が先頭、降順=空欄が末尾)。
+// 棚卸ページの既存仕様には一切影響しないよう、比較関数・呼び出し元とも完全に分離して実装する。
+function compareDiscHeaderValue(av, bv, isNum, dir) {
+  const aEmpty = av === "" || av === null || av === undefined;
+  const bEmpty = bv === "" || bv === null || bv === undefined;
+  if (aEmpty && bEmpty) return 0;
+  if (aEmpty) return -1 * dir;
+  if (bEmpty) return 1 * dir;
+  if (isNum) return (Number(av) - Number(bv)) * dir;
+  return String(av).localeCompare(String(bv), "ja", { numeric: true, sensitivity: "base" }) * dir;
+}
+
+function sortDiscrepancyRowsByHeader(rows, headerSort) {
+  const isNum = DISC_HEADER_NUM_KEYS.has(headerSort.key);
+  return rows.slice().sort((a, b) =>
+    compareDiscHeaderValue(discHeaderValue(a, headerSort.key), discHeaderValue(b, headerSort.key), isNum, headerSort.dir));
+}
+
+let discHeaderSort = null;
+let discAllRows = [];
+
+function renderDiscrepancyHead() {
+  const thead = document.getElementById("disc-thead");
+  thead.innerHTML = DISC_SORTABLE_COLUMNS.map((col) => {
+    const isSortCol = discHeaderSort && discHeaderSort.key === col.key;
+    const arrow = isSortCol ? '<span class="sort-arrow">' + (discHeaderSort.dir === 1 ? "▲" : "▼") + '</span>' : "";
+    return '<th class="sortable' + (col.num ? " num" : "") + '" data-key="' + col.key + '">' + col.label + arrow + '</th>';
+  }).join("");
+  thead.querySelectorAll("th.sortable").forEach((th) => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.key;
+      // 1回目クリックは昇順、同じ列の再クリックで昇順/降順を切り替える。別の列は昇順から開始する。
+      discHeaderSort = { key, dir: discHeaderSort && discHeaderSort.key === key ? -discHeaderSort.dir : 1 };
+      renderDiscrepancies(discAllRows);
+    });
+  });
+}
+
 function renderDiscrepancies(rows) {
+  discAllRows = rows;
   document.getElementById("disc-count").textContent = rows.length.toLocaleString("ja-JP") + " 件";
+  renderDiscrepancyHead();
   const tbody = document.getElementById("disc-tbody");
   if (!rows.length) { tbody.innerHTML = "<tr><td colspan='7'>相違はありません</td></tr>"; return; }
+  const displayRows = discHeaderSort ? sortDiscrepancyRowsByHeader(rows, discHeaderSort) : rows;
   const bySite = (row, site) => row.countries.find((c) => c.site === site);
-  tbody.innerHTML = rows.map((row) => {
+  tbody.innerHTML = displayRows.map((row) => {
     const cell = (site) => {
       const c = bySite(row, site);
       if (!c) return "<td class='num'>-</td>";
@@ -2354,6 +2420,7 @@ function renderDiscrepancies(rows) {
       row.リアル在庫.toLocaleString("ja-JP") + "</td>" + cell("US") + cell("UK") + cell("AU") + "<td>" + (row.リアル在庫確認日 || "(未確認)") + "</td></tr>";
   }).join("");
 }
+renderDiscrepancyHead();
 document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscrepancies);
 
 // ---- 棚卸 ----
