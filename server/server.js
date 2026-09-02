@@ -9,14 +9,32 @@ const { rebuildInventoryFromRecords } = require("./inventoryRebuild");
 const realInv = require("./realInventory");
 const { listHistory, appendHistory } = require("./inventoryHistory");
 const { withInventoryLock, atomicWriteWorkbook, atomicWriteBuffer } = require("./inventoryLock");
+const { resolveManualInventoryLink, canEditOrderProductId } = require("./orderInventorySafety");
+const { parseOrderText } = require("./orderParser");
+const { processOrderInventoryTransaction } = require("./orderRegistration");
+const { withSalesLock } = require("./orderLock");
+const {
+  validateInventorySheet,
+  validateProtectedSheets,
+  buildProtectedImportWorkbook,
+  readOrderLines,
+  ORDER_LINE_STATUS,
+} = require("./inventoryProtectedSheets");
+const { createInventoryWorkbookLoaders } = require("./inventoryManagementStore");
+const { createSalesWorkbookLoaders } = require("./salesWorkbookStore");
+const { resolveOrderLineTransaction } = require("./manualOrderResolution");
+const { editManagedOrderTransaction, deleteManagedOrdersTransaction } = require("./managedOrderMutation");
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
-const DATA_DIR = path.join(__dirname, "..", "data");
+// 通常は従来どおり data/ を使う。HTTP統合テストでは実Excelへ触れないよう隔離先を明示できる。
+const DATA_DIR = process.env.AGATE_DATA_DIR ? path.resolve(process.env.AGATE_DATA_DIR) : path.join(__dirname, "..", "data");
 const LEDGER_PATH = path.join(DATA_DIR, "売上管理表.xlsx");
 const INVENTORY_PATH = path.join(DATA_DIR, "在庫管理表.xlsx");
 const HISTORY_PATH = path.join(DATA_DIR, "在庫変更履歴.xlsx");
 const SNAPSHOT_DIR = path.join(DATA_DIR, "snapshots");
+const INVENTORY_IMPORT_BACKUP_DIR = path.join(DATA_DIR, "backups", "inventory-import");
+const ORDER_PARSER_PATH = path.join(__dirname, "orderParser.js");
 
 const HEADERS = [
   "注文番号", "日付", "サイト", "商品メモ", "数量", "商品ID",
@@ -54,31 +72,17 @@ function styleHeaderRow(ws, headers) {
   ws.getRow(1).font = { bold: true };
 }
 
-async function loadWorkbook() {
-  const wb = new ExcelJS.Workbook();
-  if (fs.existsSync(LEDGER_PATH)) {
-    await wb.xlsx.readFile(LEDGER_PATH);
-    return wb;
-  }
-  const ws = wb.addWorksheet("記録");
-  styleHeaderRow(ws, HEADERS);
-  await wb.xlsx.writeFile(LEDGER_PATH);
-  return wb;
-}
+const { loadSalesWorkbook: loadWorkbook, loadSalesWorkbookLocked: loadWorkbookLocked } = createSalesWorkbookLoaders({
+  LEDGER_PATH,
+  HEADERS,
+});
 
-async function loadInventoryWorkbook() {
-  const wb = new ExcelJS.Workbook();
-  if (fs.existsSync(INVENTORY_PATH)) {
-    await wb.xlsx.readFile(INVENTORY_PATH);
-    return wb;
-  }
-  const ws = wb.addWorksheet("在庫管理表");
-  styleHeaderRow(ws, INV_HEADERS);
-  await wb.xlsx.writeFile(INVENTORY_PATH);
-  return wb;
-}
+const { loadInventoryWorkbook, loadInventoryWorkbookLocked } = createInventoryWorkbookLoaders({
+  INVENTORY_PATH,
+  INV_HEADERS,
+});
 
-const handleEbayInventoryRebuild = createInventoryRebuildHandler({ INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook });
+const handleEbayInventoryRebuild = createInventoryRebuildHandler({ INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook: loadInventoryWorkbookLocked });
 
 function dataSheets(wb) {
   return wb.worksheets.filter((ws) => isDataSheet(ws.name));
@@ -214,31 +218,61 @@ async function handleAddOrder(req, res) {
   const packing = numOrNull(body["梱包費円"]);
   const { profit, margin } = recompute(revenueJpy, fee, cost, shipping, packing);
 
-  const wb = await loadWorkbook();
-  if (findOrderRowByNo(wb, body["注文番号"])) {
-    return sendJson(res, 409, { error: `注文番号「${body["注文番号"]}」は既に登録されています(二重登録防止のため中止しました)` });
+  const salesWorkbook = await loadWorkbookLocked(); // 呼び出し元がsales lockを保持する。
+  const hasRawOrderText = Object.prototype.hasOwnProperty.call(body, "注文貼付テキスト");
+
+  // 貼り付け原文がない旧方式は従来互換。第1段階の安全ガードにより自動在庫連動は行われない。
+  if (!hasRawOrderText) {
+    if (findOrderRowByNo(salesWorkbook, body["注文番号"])) {
+      return sendJson(res, 409, { error: `注文番号「${body["注文番号"]}」は既に登録されています(二重登録防止のため中止しました)` });
+    }
+    const inventoryLink = resolveManualInventoryLink(body);
+    const ws = getOrCreateMonthSheet(salesWorkbook, body["日付"]);
+    ws.addRow([
+      body["注文番号"], body["日付"], body["サイト"], body["商品メモ"], numOrNull(body["数量"]) === null ? "" : numOrNull(body["数量"]), inventoryLink.pid,
+      usd, rate, Math.round(revenueJpy), fee,
+      cost === null ? "" : cost, shipping === null ? "" : shipping, packing === null ? "" : packing,
+      profit, margin,
+    ]);
+    await atomicWriteWorkbook(salesWorkbook, LEDGER_PATH);
+    return sendJson(res, 200, { status: "ok", 収益円: Math.round(revenueJpy), 手数料円: fee, 最終利益円: profit, 利益率: margin, warning: inventoryLink.reason || null });
   }
-  const ws = getOrCreateMonthSheet(wb, body["日付"]);
-  const pid = body["商品ID"] || "";
-  const qty = numOrNull(body["数量"]) === null ? 1 : numOrNull(body["数量"]);
+
+  const parsed = parseOrderText(body["注文貼付テキスト"]);
+  if (!parsed.orderNo || String(parsed.orderNo) !== String(body["注文番号"])) {
+    return sendJson(res, 400, { error: "貼り付け原文の注文番号と登録内容が一致しません" });
+  }
+  const salesOrderExists = Boolean(findOrderRowByNo(salesWorkbook, parsed.orderNo));
+  const inventoryResult = await processOrderInventoryTransaction({
+    withInventoryLock, loadInventoryWorkbookLocked, atomicWriteWorkbook, INVENTORY_PATH,
+    parsed, salesOrderExists, INV_HEADERS,
+  });
+
+  if (inventoryResult.legacyOrder) {
+    return sendJson(res, 409, { error: "売上登録済みですが注文明細がない旧方式の注文です。自動在庫処理は行いません" });
+  }
+  if (inventoryResult.alreadyRegistered) {
+    return sendJson(res, 200, { status: "already_registered", inventory: inventoryResult });
+  }
+
+  // inventory保存後にsales保存が失敗しても、retry時は保存済み明細一致により在庫再減算されない。
+  const ws = getOrCreateMonthSheet(salesWorkbook, body["日付"] || parsed.date);
+  const salesSite = parsed.parseStatus === "OK" ? parsed.site : body["サイト"];
+  const salesNote = parsed.items.length ? parsed.note : body["商品メモ"];
+  const salesQty = parsed.items.length ? parsed.quantityTotal : numOrNull(body["数量"]);
   ws.addRow([
-    body["注文番号"], body["日付"], body["サイト"], body["商品メモ"], numOrNull(body["数量"]) === null ? "" : numOrNull(body["数量"]), pid,
+    parsed.orderNo, body["日付"] || parsed.date, salesSite, salesNote,
+    salesQty === null ? "" : salesQty, "",
     usd, rate, Math.round(revenueJpy), fee,
     cost === null ? "" : cost, shipping === null ? "" : shipping, packing === null ? "" : packing,
     profit, margin,
   ]);
-  await wb.xlsx.writeFile(LEDGER_PATH);
-
-  let warning = null;
-  if (pid) {
-    const r = await realInv.adjustRealStock({
-      loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL,
-      pid, delta: -qty, reason: "注文登録", orderNo: body["注文番号"],
-    });
-    warning = r.warning;
-  }
-
-  sendJson(res, 200, { status: "ok", 収益円: Math.round(revenueJpy), 手数料円: fee, 最終利益円: profit, 利益率: margin, warning });
+  await atomicWriteWorkbook(salesWorkbook, LEDGER_PATH);
+  sendJson(res, 200, {
+    status: inventoryResult.retry ? "recovered" : "ok",
+    収益円: Math.round(revenueJpy), 手数料円: fee, 最終利益円: profit, 利益率: margin,
+    inventory: inventoryResult,
+  });
 }
 
 function findOrderRowByNo(wb, orderNo) {
@@ -261,66 +295,85 @@ async function handlePatchOrder(req, res) {
   const orderNo = body["注文番号"];
   if (!orderNo) return sendJson(res, 400, { error: "注文番号 は必須です" });
 
-  const wb = await loadWorkbook();
-  const sheets = dataSheets(wb);
-  let updated = null;
-  let stockAdjustments = [];
-  for (const ws of sheets) {
-    for (let r = 2; r <= ws.rowCount; r++) {
-      const row = ws.getRow(r);
-      if (String(row.getCell(COL.注文番号).value || "") !== String(orderNo)) continue;
+  const wb = await loadWorkbookLocked();
+  const row = findOrderRowByNo(wb, orderNo);
+  if (!row) return sendJson(res, 404, { error: "該当する注文番号が見つかりません" });
 
-      const oldPid = String(row.getCell(COL.商品ID).value || "");
-      const oldQty = numOrNull(row.getCell(COL.数量).value) === null ? 1 : numOrNull(row.getCell(COL.数量).value);
+  const hasRawEdit = Object.prototype.hasOwnProperty.call(body, "注文貼付テキスト");
+  const parsedEdit = hasRawEdit ? parseOrderText(body["注文貼付テキスト"]) : null;
+  const managedResult = await editManagedOrderTransaction({
+    withInventoryLock, loadInventoryWorkbookLocked, atomicWriteWorkbook, INVENTORY_PATH,
+    orderNo, parsed: parsedEdit,
+    quantityOverride: !hasRawEdit && "数量" in body && !("商品ID" in body) ? body["数量"] : undefined,
+    INV_HEADERS,
+  });
 
-      const cost = "仕入原価円" in body ? numOrNull(body["仕入原価円"]) : numOrNull(row.getCell(COL.仕入原価).value);
-      const shipping = "送料円" in body ? numOrNull(body["送料円"]) : numOrNull(row.getCell(COL.送料).value);
-      const packing = "梱包費円" in body ? numOrNull(body["梱包費円"]) : numOrNull(row.getCell(COL.梱包費).value);
-      const usd = "収益USD" in body ? numOrNull(body["収益USD"]) : numOrNull(row.getCell(COL.収益USD).value);
-      const rate = "ドル円レート" in body ? numOrNull(body["ドル円レート"]) : numOrNull(row.getCell(COL.ドル円レート).value);
-      const revenueJpy = usd !== null && rate !== null ? usd * rate : Number(row.getCell(COL.収益円).value) || 0;
-      const fee = Math.round(revenueJpy * 0.03);
-      const { profit, margin } = recompute(revenueJpy, fee, cost, shipping, packing);
+  if (managedResult.managed && "商品ID" in body && !hasRawEdit) {
+    return sendJson(res, 409, { error: "管理対象注文の商品変更は、Item IDを含む注文詳細を再解析して行ってください。在庫は変更されていません" });
+  }
 
-      if (usd !== null) row.getCell(COL.収益USD).value = usd;
-      if (rate !== null) row.getCell(COL.ドル円レート).value = rate;
-      if ("商品メモ" in body) row.getCell(COL.商品メモ).value = body["商品メモ"];
-      if ("数量" in body) { const q = numOrNull(body["数量"]); row.getCell(COL.数量).value = q === null ? "" : q; }
-      if ("商品ID" in body) row.getCell(COL.商品ID).value = body["商品ID"] || "";
-      row.getCell(COL.収益円).value = Math.round(revenueJpy);
-      row.getCell(COL.手数料).value = fee;
-      row.getCell(COL.仕入原価).value = cost === null ? "" : cost;
-      row.getCell(COL.送料).value = shipping === null ? "" : shipping;
-      row.getCell(COL.梱包費).value = packing === null ? "" : packing;
-      row.getCell(COL.最終利益).value = profit;
-      row.getCell(COL.利益率).value = margin;
-      row.commit();
-      updated = { 注文番号: orderNo, 最終利益円: profit, 利益率: margin };
+  const oldPid = String(row.getCell(COL.商品ID).value || "");
+  const oldQty = numOrNull(row.getCell(COL.数量).value) === null ? 1 : numOrNull(row.getCell(COL.数量).value);
+  const requestedPid = "商品ID" in body ? String(body["商品ID"] || "") : oldPid;
+  if (!managedResult.managed && !canEditOrderProductId(oldPid, requestedPid)) {
+    return sendJson(res, 400, { error: "商品IDが空欄の注文には、明細確認なしでPxxxxを後付けできません" });
+  }
 
-      const newPid = "商品ID" in body ? String(body["商品ID"] || "") : oldPid;
-      const newQty = "数量" in body ? (numOrNull(body["数量"]) === null ? 1 : numOrNull(body["数量"])) : oldQty;
-      if (newPid !== oldPid) {
-        if (oldPid) stockAdjustments.push({ pid: oldPid, delta: oldQty, reason: "注文編集(商品ID変更・戻し)" });
-        if (newPid) stockAdjustments.push({ pid: newPid, delta: -newQty, reason: "注文編集(商品ID変更)" });
-      } else if (newQty !== oldQty && oldPid) {
-        stockAdjustments.push({ pid: oldPid, delta: oldQty - newQty, reason: "注文編集(数量変更)" });
-      }
+  const cost = "仕入原価円" in body ? numOrNull(body["仕入原価円"]) : numOrNull(row.getCell(COL.仕入原価).value);
+  const shipping = "送料円" in body ? numOrNull(body["送料円"]) : numOrNull(row.getCell(COL.送料).value);
+  const packing = "梱包費円" in body ? numOrNull(body["梱包費円"]) : numOrNull(row.getCell(COL.梱包費).value);
+  const usd = "収益USD" in body ? numOrNull(body["収益USD"]) : numOrNull(row.getCell(COL.収益USD).value);
+  const rate = "ドル円レート" in body ? numOrNull(body["ドル円レート"]) : numOrNull(row.getCell(COL.ドル円レート).value);
+  const revenueJpy = usd !== null && rate !== null ? usd * rate : Number(row.getCell(COL.収益円).value) || 0;
+  const fee = Math.round(revenueJpy * 0.03);
+  const { profit, margin } = recompute(revenueJpy, fee, cost, shipping, packing);
+
+  if (usd !== null) row.getCell(COL.収益USD).value = usd;
+  if (rate !== null) row.getCell(COL.ドル円レート).value = rate;
+  if ("商品メモ" in body) row.getCell(COL.商品メモ).value = body["商品メモ"];
+  if (managedResult.managed && hasRawEdit) {
+    row.getCell(COL.サイト).value = parsedEdit.site;
+    row.getCell(COL.商品メモ).value = parsedEdit.note;
+    row.getCell(COL.数量).value = parsedEdit.quantityTotal;
+    row.getCell(COL.商品ID).value = "";
+  } else if ("数量" in body) {
+    const q = numOrNull(body["数量"]);
+    row.getCell(COL.数量).value = q === null ? "" : q;
+  }
+  if (!managedResult.managed && "商品ID" in body) row.getCell(COL.商品ID).value = body["商品ID"] || "";
+  row.getCell(COL.収益円).value = Math.round(revenueJpy);
+  row.getCell(COL.手数料).value = fee;
+  row.getCell(COL.仕入原価).value = cost === null ? "" : cost;
+  row.getCell(COL.送料).value = shipping === null ? "" : shipping;
+  row.getCell(COL.梱包費).value = packing === null ? "" : packing;
+  row.getCell(COL.最終利益).value = profit;
+  row.getCell(COL.利益率).value = margin;
+  row.commit();
+  await atomicWriteWorkbook(wb, LEDGER_PATH);
+
+  const warnings = [];
+  if (!managedResult.managed) {
+    const newPid = requestedPid;
+    const newQty = "数量" in body ? (numOrNull(body["数量"]) === null ? 1 : numOrNull(body["数量"])) : oldQty;
+    const stockAdjustments = [];
+    if (newPid !== oldPid) {
+      if (oldPid) stockAdjustments.push({ pid: oldPid, delta: oldQty, reason: "注文編集(商品ID変更・戻し)" });
+      if (newPid) stockAdjustments.push({ pid: newPid, delta: -newQty, reason: "注文編集(商品ID変更)" });
+    } else if (newQty !== oldQty && oldPid) stockAdjustments.push({ pid: oldPid, delta: oldQty - newQty, reason: "注文編集(数量変更)" });
+    for (const adj of stockAdjustments) {
+      const result = await realInv.adjustRealStock({
+        loadInventoryWorkbook: loadInventoryWorkbookLocked, INVENTORY_PATH, HISTORY_PATH, INV_COL,
+        pid: adj.pid, delta: adj.delta, reason: adj.reason, orderNo,
+      });
+      if (result.warning) warnings.push(result.warning);
     }
   }
 
-  if (!updated) return sendJson(res, 404, { error: "該当する注文番号が見つかりません" });
-  await wb.xlsx.writeFile(LEDGER_PATH);
-
-  const warnings = [];
-  for (const adj of stockAdjustments) {
-    const r = await realInv.adjustRealStock({
-      loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL,
-      pid: adj.pid, delta: adj.delta, reason: adj.reason, orderNo,
-    });
-    if (r.warning) warnings.push(r.warning);
-  }
-
-  sendJson(res, 200, { status: "ok", ...updated, warning: warnings.length ? warnings.join(" / ") : null });
+  sendJson(res, 200, {
+    status: managedResult.retry ? "already_applied" : "ok", 注文番号: orderNo, 最終利益円: profit, 利益率: margin,
+    managed: managedResult.managed, inventory: managedResult.managed ? managedResult : undefined,
+    warning: warnings.length ? warnings.join(" / ") : null,
+  });
 }
 
 async function handleDeleteOrders(req, res) {
@@ -333,7 +386,14 @@ async function handleDeleteOrders(req, res) {
   const targets = new Set((body["注文番号"] || []).map(String));
   if (!targets.size) return sendJson(res, 400, { error: "削除する注文番号を指定してください" });
 
-  const wb = await loadWorkbook();
+  const wb = await loadWorkbookLocked();
+  // sales lockは呼び出し元が保持している。必ず sales → inventory の順で取得し、
+  // inventory側を先に冪等更新することでsales保存失敗後のretryでも二重復元しない。
+  const managedResult = await deleteManagedOrdersTransaction({
+    withInventoryLock, loadInventoryWorkbookLocked, atomicWriteWorkbook, INVENTORY_PATH,
+    orderNumbers: targets, INV_HEADERS,
+  });
+  const managedTargets = new Set(managedResult.managedOrderNumbers);
   let deleted = 0;
   const restores = [];
   for (const ws of dataSheets(wb)) {
@@ -342,28 +402,37 @@ async function handleDeleteOrders(req, res) {
       const row = ws.getRow(r);
       if (!targets.has(String(row.getCell(COL.注文番号).value || ""))) continue;
       toRemove.push(r);
-      const pid = String(row.getCell(COL.商品ID).value || "");
-      const qty = numOrNull(row.getCell(COL.数量).value) === null ? 1 : numOrNull(row.getCell(COL.数量).value);
-      if (pid) restores.push({ pid, qty, orderNo: String(row.getCell(COL.注文番号).value || "") });
+      const targetOrderNo = String(row.getCell(COL.注文番号).value || "");
+      if (!managedTargets.has(targetOrderNo)) {
+        const pid = String(row.getCell(COL.商品ID).value || "");
+        const qty = numOrNull(row.getCell(COL.数量).value) === null ? 1 : numOrNull(row.getCell(COL.数量).value);
+        if (pid) restores.push({ pid, qty, orderNo: targetOrderNo });
+      }
     }
     for (let i = toRemove.length - 1; i >= 0; i--) {
       ws.spliceRows(toRemove[i], 1);
       deleted++;
     }
   }
-  if (!deleted) return sendJson(res, 404, { error: "該当する注文が見つかりません" });
-  await wb.xlsx.writeFile(LEDGER_PATH);
+  if (!deleted) {
+    if (managedTargets.size) {
+      const status = managedResult.alreadyDeleted.length === managedTargets.size ? "already_deleted" : "recovered_deleted";
+      return sendJson(res, 200, { status, deleted: 0, managed: managedResult });
+    }
+    return sendJson(res, 404, { error: "該当する注文が見つかりません" });
+  }
+  await atomicWriteWorkbook(wb, LEDGER_PATH);
 
   const warnings = [];
   for (const r of restores) {
     const result = await realInv.adjustRealStock({
-      loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_COL,
+      loadInventoryWorkbook: loadInventoryWorkbookLocked, INVENTORY_PATH, HISTORY_PATH, INV_COL,
       pid: r.pid, delta: r.qty, reason: "注文削除", orderNo: r.orderNo,
     });
     if (result.warning) warnings.push(result.warning);
   }
 
-  sendJson(res, 200, { status: "ok", deleted, warning: warnings.length ? warnings.join(" / ") : null });
+  sendJson(res, 200, { status: "ok", deleted, managed: managedResult, warning: warnings.length ? warnings.join(" / ") : null });
 }
 
 async function handleDeleteInventory(req, res) {
@@ -377,7 +446,7 @@ async function handleDeleteInventory(req, res) {
   if (!targets.size) return sendJson(res, 400, { error: "削除する商品IDを指定してください" });
 
   const deletedCount = await withInventoryLock(async () => {
-    const wb = await loadInventoryWorkbook();
+    const wb = await loadInventoryWorkbookLocked();
     const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
     const toRemove = [];
     for (let r = 2; r <= ws.rowCount; r++) {
@@ -428,9 +497,10 @@ async function handleImport(req, res) {
   } catch (e) {
     return sendJson(res, 400, { error: "有効なxlsxファイルではありません" });
   }
-  const tmpPath = LEDGER_PATH + ".tmp";
-  fs.writeFileSync(tmpPath, buf);
-  fs.renameSync(tmpPath, LEDGER_PATH);
+  await withSalesLock(async () => {
+    // 検証済みbufferだけを、一意tmp + renameの共通atomic writerで置換する。
+    atomicWriteBuffer(buf, LEDGER_PATH);
+  });
   sendJson(res, 200, { status: "ok", message: "取り込みが完了しました" });
 }
 
@@ -573,7 +643,7 @@ async function handlePatchInventory(req, res) {
   // (以前は汎用フィールド・リアル在庫・棚卸入力数量でそれぞれ個別に読み書きしており、
   //  Excel全体への書き込みが最大3回発生していた。同時更新の競合リスクを減らすため統合する)。
   const outcome = await withInventoryLock(async () => {
-    const wb = await loadInventoryWorkbook();
+    const wb = await loadInventoryWorkbookLocked();
     const ws = wb.getWorksheet("在庫管理表") || wb.worksheets[0];
     const row = realInv.findInventoryRow(ws, INV_COL, pid);
     if (!row) return { found: false };
@@ -615,16 +685,37 @@ async function handlePatchInventory(req, res) {
 
 async function handleImportInventory(req, res) {
   const buf = await readRawBody(req, 30 * 1024 * 1024);
-  const wb = new ExcelJS.Workbook();
+  const uploadedWorkbook = new ExcelJS.Workbook();
   try {
-    await wb.xlsx.load(buf);
+    await uploadedWorkbook.xlsx.load(buf);
   } catch (e) {
     return sendJson(res, 400, { error: "有効なxlsxファイルではありません" });
   }
-  await withInventoryLock(async () => {
-    atomicWriteBuffer(buf, INVENTORY_PATH);
+  const requiredHeaders = ["商品ID", "商品名", "US_出品ID", "UK_出品ID", "AU_出品ID"];
+  let uploadValidation;
+  try {
+    uploadValidation = validateInventorySheet(uploadedWorkbook, requiredHeaders);
+  } catch (e) {
+    return sendJson(res, 400, { error: e.message });
+  }
+
+  const result = await withInventoryLock(async () => {
+    const serverWorkbook = await loadInventoryWorkbookLocked();
+    // 両方未作成の旧形式は許可するが、一方だけ存在する/壊れている状態は取り込みで隠さない。
+    validateProtectedSheets(serverWorkbook, { allowMissing: true });
+    const merged = buildProtectedImportWorkbook({ uploadedWorkbook, serverWorkbook, requiredInventoryHeaders: requiredHeaders });
+
+    fs.mkdirSync(INVENTORY_IMPORT_BACKUP_DIR, { recursive: true });
+    let backupPath = null;
+    if (fs.existsSync(INVENTORY_PATH)) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      backupPath = path.join(INVENTORY_IMPORT_BACKUP_DIR, `在庫管理表.${stamp}.${process.pid}-${crypto.randomBytes(4).toString("hex")}.bak.xlsx`);
+      fs.copyFileSync(INVENTORY_PATH, backupPath);
+    }
+    await atomicWriteWorkbook(merged.workbook, INVENTORY_PATH);
+    return { backupPath, productCount: uploadValidation.productCount };
   });
-  sendJson(res, 200, { status: "ok", message: "取り込みが完了しました" });
+  sendJson(res, 200, { status: "ok", message: "取り込みが完了しました", productCount: result.productCount, backupCreated: Boolean(result.backupPath) });
 }
 
 async function handleRebuildInventory(req, res) {
@@ -645,7 +736,7 @@ async function handleRebuildInventory(req, res) {
     removedNoteLabel: "eBay出品CSV",
     INV_HEADERS,
     INVENTORY_PATH,
-    loadInventoryWorkbook,
+    loadInventoryWorkbook: loadInventoryWorkbookLocked,
   });
   sendJson(res, 200, { status: "ok", ...summary });
 }
@@ -687,7 +778,7 @@ async function handleStocktakeConfirm(req, res) {
     return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
   }
   const result = await realInv.confirmStocktake({
-    loadInventoryWorkbook, INVENTORY_PATH, HISTORY_PATH, INV_HEADERS, INV_COL,
+    loadInventoryWorkbook: loadInventoryWorkbookLocked, INVENTORY_PATH, HISTORY_PATH, INV_HEADERS, INV_COL,
     targetPids: Array.isArray(body["商品ID"]) ? body["商品ID"] : null,
   });
   sendJson(res, 200, { status: "ok", ...result });
@@ -695,7 +786,7 @@ async function handleStocktakeConfirm(req, res) {
 
 // 棚卸チェックの一括解除。リアル在庫・棚卸入力数量・日本語商品名などは一切変更しない。
 async function handleStocktakeResetChecks(req, res) {
-  const result = await realInv.resetStocktakeChecks({ loadInventoryWorkbook, INVENTORY_PATH, INV_COL });
+  const result = await realInv.resetStocktakeChecks({ loadInventoryWorkbook: loadInventoryWorkbookLocked, INVENTORY_PATH, INV_COL });
   sendJson(res, 200, { status: "ok", ...result });
 }
 
@@ -704,6 +795,47 @@ async function handleInventoryHistory(req, res) {
   const pid = url.searchParams.get("商品ID") || undefined;
   const rows = await listHistory(HISTORY_PATH, { pid });
   sendJson(res, 200, { headers: require("./inventoryHistory").HISTORY_HEADERS, rows });
+}
+
+async function handleListUnresolvedOrderLines(req, res) {
+  const workbook = await loadInventoryWorkbook();
+  validateProtectedSheets(workbook, { allowMissing: true });
+  const lines = readOrderLines(workbook)
+    .filter((line) => [ORDER_LINE_STATUS.UNAPPLIED, ORDER_LINE_STATUS.REVIEW, ORDER_LINE_STATUS.CONFLICT].includes(line["適用状態"]))
+    .map((line) => ({
+      lineKey: line["明細キー"], orderNo: line["注文番号"], site: line["販売サイト"],
+      ebayItemId: line["eBay Item ID"], title: line["商品タイトル"], quantity: line["注文数量"],
+      status: line["適用状態"], actionable: line["適用状態"] === ORDER_LINE_STATUS.UNAPPLIED,
+    }));
+  const sheet = workbook.getWorksheet("在庫管理表") || workbook.worksheets[0];
+  const products = [];
+  for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber++) {
+    const row = sheet.getRow(rowNumber);
+    const pid = String(row.getCell(INV_COL.商品ID).value || "").trim();
+    if (!pid) continue;
+    products.push({
+      pid,
+      title: String(row.getCell(INV_COL.商品名).value || ""),
+      japaneseTitle: String(row.getCell(INV_COL.日本語商品名).value || ""),
+      sku: String(row.getCell(INV_COL.SKU).value || ""),
+    });
+  }
+  sendJson(res, 200, { count: lines.length, lines, products });
+}
+
+async function handleResolveOrderLine(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readRawBody(req, 1024 * 1024)).toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  if (body.confirmed !== true) return sendJson(res, 400, { error: "確認操作が完了していません" });
+  const result = await resolveOrderLineTransaction({
+    withInventoryLock, loadInventoryWorkbookLocked, atomicWriteWorkbook, INVENTORY_PATH,
+    lineKey: body.lineKey, pid: body.pid, INV_HEADERS,
+  });
+  sendJson(res, 200, { status: result.alreadyApplied ? "already_applied" : "applied", ...result });
 }
 
 async function handleClosingChecklist(req, res) {
@@ -940,6 +1072,13 @@ const DASHBOARD_PAGE = `<!doctype html>
   .hint { font-size: 12px; color: var(--ink-muted); }
   .hint.ok { color: var(--good); }
   .hint.ng { color: var(--series-cost); }
+  .order-parse-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); font-size: 12.5px; }
+  .order-parse-summary.ok { border-color: var(--good); }
+  .order-parse-summary.ng { border-color: var(--series-cost); background: #fde8e8; }
+  .order-items-review { max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+  .order-items-review table { min-width: 850px; }
+  .order-item-status-ok { color: var(--good); font-weight: 700; }
+  .order-item-status-ng { color: var(--series-cost); font-weight: 700; }
   input[type=file] { font-size: 12.5px; color: var(--ink-2); }
 </style></head>
 <body>
@@ -1083,10 +1222,37 @@ const DASHBOARD_PAGE = `<!doctype html>
               <datalist id="ne-pid-list"></datalist>
             </label>
           </div>
+          <div id="ne-items-review" style="display:none;">
+            <div id="ne-parse-summary" class="order-parse-summary"></div>
+            <div class="order-items-review" style="margin-top:10px;">
+              <table>
+                <thead><tr><th>No.</th><th>商品タイトル</th><th>eBay Item ID</th><th class="num">数量</th><th>SKU</th><th>解析状態</th></tr></thead>
+                <tbody id="ne-items-body"></tbody>
+              </table>
+            </div>
+          </div>
           <div class="browser-toolbar" id="ne-submit-row" style="display:none;">
             <button class="btn" id="ne-submit-btn">この内容で登録する</button>
             <span id="ne-status" class="hint"></span>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>未紐付け明細</h2>
+      <p class="desc">未適用のeBay Item IDを、確認したAgate商品へ手動で紐付けます。矛盾・要確認はこの画面では変更できません。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar">
+          <button class="btn" id="unresolved-refresh">再読み込み</button>
+          <span id="unresolved-status" class="hint"></span>
+        </div>
+        <datalist id="unresolved-products"></datalist>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>注文番号</th><th>サイト</th><th>eBay Item ID</th><th>商品タイトル</th><th class="num">数量</th><th>状態</th><th>確認したPxxxx</th><th>操作</th></tr></thead>
+            <tbody id="unresolved-body"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -1168,6 +1334,16 @@ const DASHBOARD_PAGE = `<!doctype html>
         </div>
         <div class="browser-toolbar">
           <input type="text" class="search-input" id="stk-q" placeholder="英語商品名・日本語商品名・商品ID・SKUで検索…">
+          <label class="hint">並び替え
+            <select id="stk-sort">
+              <option value="pid">商品ID順</option>
+              <option value="name">英語商品名順</option>
+              <option value="ja-name">日本語商品名順</option>
+              <option value="price">仕入価格が安い順</option>
+              <option value="real">リアル在庫が少ない順</option>
+              <option value="unchecked">未棚卸を先頭</option>
+            </select>
+          </label>
           <span class="result-count" id="stk-count"></span>
         </div>
         <div class="pager" id="stk-pager-top"></div>
@@ -1242,6 +1418,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <div class="img-modal-caption" id="img-modal-caption"></div>
   </div>
 </div>
+<script src="/order-parser.js"></script>
 <script>
 const ORD_HEADERS = ["注文番号","日付","サイト","商品メモ","数量","商品ID","収益USD","ドル円レート","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
 const ORD_EDITABLE = ["収益USD","ドル円レート","数量","仕入原価(円)","送料(円)","梱包費(円)"];
@@ -1255,6 +1432,7 @@ const INV_FIELD_KEY = { "仕入価格(円)": "仕入価格円", "仕入日": "�
 let orderRows = [];
 let invRows = [];
 let invHeaders = [];
+let unresolvedProducts = [];
 
 function getToken() { return localStorage.getItem("agate_token") || ""; }
 (() => {
@@ -1295,9 +1473,10 @@ async function loadAll() {
   if (!token) { statusEl.textContent = "トークンを入力してください"; return; }
   statusEl.textContent = "読み込み中...";
   try {
-    const [ordRes, invRes] = await Promise.all([
+    const [ordRes, invRes, unresolvedRes] = await Promise.all([
       fetch("/api/orders", { headers: { Authorization: "Bearer " + token } }),
       fetch("/api/inventory", { headers: { Authorization: "Bearer " + token } }),
+      fetch("/api/order-lines/unresolved", { headers: { Authorization: "Bearer " + token } }),
     ]);
     if (!ordRes.ok) { statusEl.textContent = "エラー: " + ordRes.status + "(トークンを確認してください)"; return; }
     const ordData = await ordRes.json();
@@ -1307,6 +1486,7 @@ async function loadAll() {
       invRows = invData.rows;
       invHeaders = invData.headers;
     }
+    if (unresolvedRes.ok) renderUnresolvedOrderLines(await unresolvedRes.json());
     renderKpis();
     renderSalesTab();
     renderOrders();
@@ -1316,6 +1496,80 @@ async function loadAll() {
     statusEl.textContent = "通信エラー: " + e.message;
   }
 }
+
+function renderUnresolvedOrderLines(data) {
+  const body = document.getElementById("unresolved-body");
+  const productList = document.getElementById("unresolved-products");
+  const statusEl = document.getElementById("unresolved-status");
+  unresolvedProducts = Array.isArray(data.products) ? data.products : [];
+  productList.replaceChildren();
+  unresolvedProducts.forEach((product) => {
+    const option = document.createElement("option");
+    option.value = product.pid + " | " + product.title + " | " + product.japaneseTitle + " | " + product.sku;
+    option.label = product.pid + " / " + product.title + (product.japaneseTitle ? " / " + product.japaneseTitle : "");
+    productList.appendChild(option);
+  });
+  body.replaceChildren();
+  (data.lines || []).forEach((line) => {
+    const tr = document.createElement("tr");
+    [line.orderNo, line.site, line.ebayItemId, line.title, line.quantity, line.status].forEach((value, index) => {
+      const td = document.createElement("td");
+      td.textContent = value === null || value === undefined ? "" : value;
+      if (index === 4) td.className = "num";
+      tr.appendChild(td);
+    });
+    const selectTd = document.createElement("td");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.setAttribute("list", "unresolved-products");
+    input.placeholder = "Pxxxx・商品名・SKUで検索";
+    input.disabled = !line.actionable;
+    selectTd.appendChild(input);
+    tr.appendChild(selectTd);
+    const actionTd = document.createElement("td");
+    const button = document.createElement("button");
+    button.className = "btn";
+    button.textContent = line.actionable ? "確認して適用" : "要確認";
+    button.disabled = !line.actionable;
+    button.addEventListener("click", async () => {
+      const pidMatch = /^\s*(P\d+)\b/.exec(input.value);
+      if (!pidMatch) { statusEl.textContent = "候補からPxxxxを選択してください"; statusEl.className = "hint ng"; return; }
+      const pid = pidMatch[1];
+      const product = unresolvedProducts.find((candidate) => candidate.pid === pid);
+      if (!product) { statusEl.textContent = "選択したPxxxxが候補にありません"; statusEl.className = "hint ng"; return; }
+      const message = line.site + "\\nItem ID: " + line.ebayItemId + "\\n商品: " + line.title + "\\n数量: " + line.quantity
+        + "\\n\\n適用先: " + product.pid + "\\n英語商品名: " + product.title + "\\n日本語商品名: " + product.japaneseTitle
+        + "\\n\\nこの対応でリアル在庫を" + line.quantity + "減らし、今後このItem IDを" + product.pid + "として使用します。よろしいですか？";
+      if (!window.confirm(message)) return;
+      statusEl.textContent = "適用中...";
+      statusEl.className = "hint";
+      try {
+        const response = await fetch("/api/order-lines/resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + getToken() },
+          body: JSON.stringify({ lineKey: line.lineKey, pid, confirmed: true }),
+        });
+        const result = await response.json();
+        if (!response.ok) { statusEl.textContent = "失敗: " + (result.error || response.status); statusEl.className = "hint ng"; return; }
+        await loadAll();
+        statusEl.textContent = result.status === "already_applied"
+          ? "この明細はすでに適用済みです"
+          : pid + "へ数量" + result.quantity + "を適用しました（リアル在庫 " + result.before + " → " + result.after + "）";
+        statusEl.className = "hint ok";
+      } catch (error) {
+        statusEl.textContent = "通信エラー: " + error.message;
+        statusEl.className = "hint ng";
+      }
+    });
+    actionTd.appendChild(button);
+    tr.appendChild(actionTd);
+    body.appendChild(tr);
+  });
+  statusEl.textContent = "未処理・要確認 " + (data.count || 0) + "件";
+  statusEl.className = "hint";
+}
+
+document.getElementById("unresolved-refresh").addEventListener("click", loadAll);
 
 function renderKpis() {
   let revenue = 0, cost = 0, profit = 0, profitKnown = 0, qty = 0;
@@ -1342,11 +1596,36 @@ function renderKpis() {
 
   const top10 = orderRows.filter(r => r[13] !== "" && r[13] !== null && r[13] !== undefined)
     .slice().sort((a, b) => Number(b[13]) - Number(a[13])).slice(0, 10);
-  document.getElementById("top10-body").innerHTML = top10.map(r =>
-    "<tr><td>" + (r[1] || "") + "</td><td><span class='site-chip'>" + (r[2] || "不明") + "</span></td><td class='truncate' title='" + (String(r[3] || "").replace(/'/g, "&#39;")) + "'>" + (r[3] || "") +
-    "</td><td class='num'>" + fmt(r[4]) + "</td><td class='num'>" + fmt(r[8]) + "</td><td class='num profit-cell" + (Number(r[13]) < 0 ? " bad" : "") + "'>" + fmt(r[13]) +
-    "</td><td class='num'>" + fmt(r[14], true) + "</td></tr>"
-  ).join("");
+  const top10Body = document.getElementById("top10-body");
+  top10Body.replaceChildren();
+  top10.forEach((r) => {
+    const tr = document.createElement("tr");
+    const dateTd = document.createElement("td");
+    dateTd.textContent = r[1] || "";
+    tr.appendChild(dateTd);
+
+    const siteTd = document.createElement("td");
+    const siteChip = document.createElement("span");
+    siteChip.className = "site-chip";
+    siteChip.textContent = r[2] || "不明";
+    siteTd.appendChild(siteChip);
+    tr.appendChild(siteTd);
+
+    const noteTd = document.createElement("td");
+    noteTd.className = "truncate";
+    noteTd.textContent = r[3] || "";
+    noteTd.title = String(r[3] || "");
+    tr.appendChild(noteTd);
+
+    const values = [[r[4], "num", false], [r[8], "num", false], [r[13], "num profit-cell" + (Number(r[13]) < 0 ? " bad" : ""), false], [r[14], "num", true]];
+    values.forEach(([value, className, percent]) => {
+      const td = document.createElement("td");
+      td.className = className;
+      td.textContent = fmt(value, percent);
+      tr.appendChild(td);
+    });
+    top10Body.appendChild(tr);
+  });
 }
 
 function computeMonthly() {
@@ -1676,8 +1955,8 @@ document.getElementById("ord-delete-btn").addEventListener("click", async () => 
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
       body: JSON.stringify({ 注文番号: Array.from(ordSelected) }),
     });
-    if (!r.ok) { alert("削除に失敗しました"); return; }
     const data = await r.json().catch(() => ({}));
+    if (!r.ok) { alert("削除に失敗しました。在庫変更は安全停止しました: " + (data.error || r.status)); return; }
     ordSelected.clear();
     await loadAll();
     if (data.warning) alert(data.warning);
@@ -1708,8 +1987,8 @@ async function saveOrderField(tr, orderNo, header, value) {
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
       body: JSON.stringify(body),
     });
-    if (!r.ok) { tr.className = "error"; return; }
     const data = await r.json().catch(() => ({}));
+    if (!r.ok) { tr.className = "error"; alert("編集できませんでした。在庫変更は安全停止しました: " + (data.error || r.status)); return; }
     tr.className = "saved";
     setTimeout(() => { tr.className = ""; }, 1500);
     if (data.warning) alert(data.warning);
@@ -2037,6 +2316,25 @@ function stkRowMatches(row, idx, q) {
   return !q || searchable.indexOf(q) !== -1;
 }
 
+function sortStocktakeRows(rows, idx, sortKey) {
+  const sorted = rows.slice();
+  const textCompare = (a, b, field) => String(a[field] || "").localeCompare(String(b[field] || ""), "ja", { numeric: true, sensitivity: "base" });
+  const numberCompare = (a, b, field) => {
+    const av = a[field] === "" || a[field] === null || a[field] === undefined ? Infinity : Number(a[field]);
+    const bv = b[field] === "" || b[field] === null || b[field] === undefined ? Infinity : Number(b[field]);
+    return av - bv;
+  };
+  sorted.sort((a, b) => {
+    if (sortKey === "name") return textCompare(a, b, idx.name);
+    if (sortKey === "ja-name") return textCompare(a, b, idx.jaName);
+    if (sortKey === "price") return numberCompare(a, b, idx.price);
+    if (sortKey === "real") return numberCompare(a, b, idx.real);
+    if (sortKey === "unchecked") return Number(Boolean(a[idx.checked])) - Number(Boolean(b[idx.checked]));
+    return textCompare(a, b, idx.pid);
+  });
+  return sorted;
+}
+
 function buildStocktakeRow(row, idx) {
   const pid = row[idx.pid];
   const name = row[idx.name] || "";
@@ -2152,41 +2450,36 @@ function renderStocktake() {
   };
   renderStocktakeProgress(idx);
   const q = document.getElementById("stk-q").value.trim().toLowerCase();
-  // 検索を解除したら通常のページ表示(1ページ目)に戻す
-  if (!q && stkPrevQ) stkPage = 1;
+  if (q !== stkPrevQ) stkPage = 1;
   stkPrevQ = q;
+  const sortKey = document.getElementById("stk-sort").value;
 
   const tbody = document.getElementById("stk-tbody");
   const pagerTop = document.getElementById("stk-pager-top");
   const pagerBottom = document.getElementById("stk-pager-bottom");
   tbody.innerHTML = "";
 
-  if (q) {
-    // 検索時: 全1,192件を対象に絞り込み、ページ分けせずヒット件数だけ表示する
-    const matched = invRows.filter((row) => stkRowMatches(row, idx, q));
-    matched.forEach((row) => tbody.appendChild(buildStocktakeRow(row, idx)));
-    pagerTop.innerHTML = "";
-    pagerBottom.innerHTML = "";
-    document.getElementById("stk-count").textContent = matched.length.toLocaleString("ja-JP") + " 件ヒット(全" + invRows.length.toLocaleString("ja-JP") + "件中)";
-    return;
-  }
+  // 元のinvRowsは変更せず、検索結果のコピーだけを並び替えてからページ分けする。
+  const filteredRows = invRows.filter((row) => stkRowMatches(row, idx, q));
+  const displayRows = sortStocktakeRows(filteredRows, idx, sortKey);
 
-  // 通常時: 300件ごとにページ分けし、実際にDOMへ描画する行数もそのページ分だけに絞る
-  const totalPages = Math.max(1, Math.ceil(invRows.length / STK_PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(displayRows.length / STK_PAGE_SIZE));
   if (stkPage > totalPages) stkPage = totalPages;
   if (stkPage < 1) stkPage = 1;
   const start = (stkPage - 1) * STK_PAGE_SIZE;
-  const pageRows = invRows.slice(start, start + STK_PAGE_SIZE);
+  const pageRows = displayRows.slice(start, start + STK_PAGE_SIZE);
   pageRows.forEach((row) => tbody.appendChild(buildStocktakeRow(row, idx)));
 
   const goToStkPage = (p) => { stkPage = p; renderStocktake(); };
   renderPager(pagerTop, stkPage, totalPages, goToStkPage);
   renderPager(pagerBottom, stkPage, totalPages, goToStkPage);
-  document.getElementById("stk-count").textContent =
-    (invRows.length ? (start + 1) : 0).toLocaleString("ja-JP") + "〜" + Math.min(start + STK_PAGE_SIZE, invRows.length).toLocaleString("ja-JP") +
-    " / " + invRows.length.toLocaleString("ja-JP") + " 件(" + stkPage + " / " + totalPages + " ページ)";
+  const rangeText = (displayRows.length ? (start + 1) : 0).toLocaleString("ja-JP") + "〜" + Math.min(start + STK_PAGE_SIZE, displayRows.length).toLocaleString("ja-JP");
+  document.getElementById("stk-count").textContent = q
+    ? rangeText + " / " + displayRows.length.toLocaleString("ja-JP") + " 件ヒット(全" + invRows.length.toLocaleString("ja-JP") + "件中、" + stkPage + " / " + totalPages + " ページ)"
+    : rangeText + " / " + displayRows.length.toLocaleString("ja-JP") + " 件(" + stkPage + " / " + totalPages + " ページ)";
 }
 document.getElementById("stk-q").addEventListener("input", renderStocktake);
+document.getElementById("stk-sort").addEventListener("change", () => { stkPage = 1; renderStocktake(); });
 
 // 検索条件やページに関わらず、全商品を対象に棚卸チェックの進捗を集計する
 function renderStocktakeProgress(idx) {
@@ -2502,64 +2795,50 @@ document.getElementById("ord-xlsx-upload").addEventListener("click", async () =>
   }
 });
 
-const MONTH_MAP = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
+const parseOrderText = AgateOrderParser.parseOrderText;
 
-function parseOrderText(text) {
-  const lines = text.split(/\\r?\\n/).map((l) => l.trim());
-  const result = { orderNo: "", date: "", site: "", usd: "", note: "", qty: "" };
+function renderOrderParseReview(parsed) {
+  const review = document.getElementById("ne-items-review");
+  const summary = document.getElementById("ne-parse-summary");
+  const body = document.getElementById("ne-items-body");
+  review.style.display = "block";
+  summary.className = "order-parse-summary " + (parsed.parseStatus === "OK" ? "ok" : "ng");
+  summary.replaceChildren();
 
-  for (const line of lines) {
-    const m = /^(\\d{1,3}-\\d{4,7}-\\d{4,7})$/.exec(line);
-    if (m) { result.orderNo = m[1]; break; }
+  const summaryValues = [
+    ["明細数", parsed.itemCount],
+    ["数量合計", parsed.quantityTotal],
+    ["小計", parsed.subtotalQuantity === null ? "取得なし" : parsed.subtotalQuantity],
+    ["解析状態", parsed.parseStatus],
+  ];
+  for (const pair of summaryValues) {
+    const span = document.createElement("span");
+    span.textContent = pair[0] + "：" + pair[1];
+    summary.appendChild(span);
+  }
+  if (parsed.parseErrors.length) {
+    const error = document.createElement("span");
+    error.textContent = parsed.parseErrors.join(" / ");
+    error.className = "order-item-status-ng";
+    summary.appendChild(error);
   }
 
-  const saleIdx = lines.indexOf("販売");
-  if (saleIdx !== -1) {
-    for (let i = saleIdx + 1; i < lines.length && i < saleIdx + 4; i++) {
-      const dm = /^([A-Za-z]{3})[a-z]*\\s+(\\d{1,2}),\\s*(\\d{4})/.exec(lines[i]);
-      if (dm) {
-        const key = dm[1][0].toUpperCase() + dm[1].slice(1, 3).toLowerCase();
-        const mm = MONTH_MAP[key];
-        if (mm) {
-          result.date = dm[3] + "-" + String(mm).padStart(2, "0") + "-" + String(dm[2]).padStart(2, "0");
-          break;
-        }
-      }
-    }
-  }
-
-  for (const line of lines) {
-    const sm = /^([A-Z]{2})\\s*[£$]/.exec(line);
-    if (sm) { result.site = sm[1]; break; }
-  }
-
-  const revIdx = lines.indexOf("注文の収益");
-  if (revIdx !== -1) {
-    for (let i = revIdx + 1; i < lines.length && i < revIdx + 3; i++) {
-      const um = /US\\s*\\$\\s*([\\d.]+)/.exec(lines[i]);
-      if (um) { result.usd = um[1]; break; }
-    }
-  }
-
-  const titles = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (/^商品ID/.test(lines[i]) && i >= 2) {
-      const t = lines[i - 2];
-      if (t && !titles.includes(t)) titles.push(t);
-    }
-  }
-  result.note = titles.join(" / ");
-
-  let qtySum = 0, qtyFound = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i] === "数量" && i + 1 < lines.length) {
-      const qm = /^(\\d+)$/.exec(lines[i + 1]);
-      if (qm) { qtySum += Number(qm[1]); qtyFound = true; }
-    }
-  }
-  if (qtyFound) result.qty = String(qtySum);
-
-  return result;
+  body.replaceChildren();
+  parsed.items.forEach((item, index) => {
+    const tr = document.createElement("tr");
+    const values = [index + 1, item.title, item.ebayItemId, item.quantity === null ? "" : item.quantity, item.sku];
+    values.forEach((value, columnIndex) => {
+      const td = document.createElement("td");
+      td.textContent = value;
+      if (columnIndex === 3) td.className = "num";
+      tr.appendChild(td);
+    });
+    const status = document.createElement("td");
+    status.textContent = item.parseStatus === "OK" ? "OK" : "要確認：" + item.errors.join(" / ");
+    status.className = item.parseStatus === "OK" ? "order-item-status-ok" : "order-item-status-ng";
+    tr.appendChild(status);
+    body.appendChild(tr);
+  });
 }
 
 function updateFeePreview() {
@@ -2588,12 +2867,18 @@ document.getElementById("ne-parse-btn").addEventListener("click", () => {
   document.getElementById("ne-cost").value = "";
   document.getElementById("ne-shipping").value = "";
   document.getElementById("ne-packing").value = "50";
-  document.getElementById("ne-pid").value = "";
+  const pidInput = document.getElementById("ne-pid");
+  pidInput.value = "";
+  // 貼り付け原文がある新規注文は明細方式だけを在庫変更の正とし、旧単一Pxxxx経路と併用しない。
+  pidInput.disabled = true;
   updateFeePreview();
+  renderOrderParseReview(parsed);
   document.getElementById("ne-review").style.display = "grid";
   document.getElementById("ne-submit-row").style.display = "flex";
-  document.getElementById("ne-status").textContent = "内容を確認してから登録してください(空欄は自分で埋めてください)。手数料(3%)は自動計算されます";
-  document.getElementById("ne-status").className = "hint";
+  document.getElementById("ne-status").textContent = parsed.parseStatus === "OK"
+    ? "内容を確認して登録してください。在庫は販売サイト + eBay Item IDの完全一致だけで明細単位に反映します"
+    : "売上情報は登録できますが、解析状態が要確認のためリアル在庫には反映しません";
+  document.getElementById("ne-status").className = "hint " + (parsed.parseStatus === "OK" ? "" : "ng");
 });
 
 document.getElementById("ne-submit-btn").addEventListener("click", async () => {
@@ -2605,6 +2890,7 @@ document.getElementById("ne-submit-btn").addEventListener("click", async () => {
     商品メモ: document.getElementById("ne-note").value.trim(),
     収益USD: document.getElementById("ne-usd").value,
     ドル円レート: document.getElementById("ne-rate").value,
+    注文貼付テキスト: document.getElementById("ne-paste").value,
   };
   const cost = document.getElementById("ne-cost").value;
   const shipping = document.getElementById("ne-shipping").value;
@@ -2632,11 +2918,19 @@ document.getElementById("ne-submit-btn").addEventListener("click", async () => {
     });
     const data = await r.json();
     if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
-    statusEl.textContent = "登録しました(収益円: " + data.収益円 + "・手数料: " + data.手数料円 + ")" + (data.warning ? " ※" + data.warning : "");
-    statusEl.className = "hint " + (data.warning ? "ng" : "ok");
+    const inv = data.inventory;
+    const inventorySummary = inv
+      ? "・在庫反映 " + inv.applied + "/" + inv.total + "明細・未反映 " + inv.unapplied + "明細" + (inv.conflict ? "・矛盾 " + inv.conflict + "明細" : "")
+      : "";
+    statusEl.textContent = (data.status === "already_registered" ? "既に登録済みです" : "登録しました")
+      + (data.収益円 === undefined ? "" : "(収益円: " + data.収益円 + "・手数料: " + data.手数料円 + ")")
+      + inventorySummary + (data.warning ? " ※" + data.warning : "");
+    statusEl.className = "hint " + ((data.warning || (inv && inv.unapplied)) ? "ng" : "ok");
     document.getElementById("ne-paste").value = "";
     document.getElementById("ne-review").style.display = "none";
+    document.getElementById("ne-items-review").style.display = "none";
     document.getElementById("ne-submit-row").style.display = "none";
+    document.getElementById("ne-pid").disabled = false;
     await loadAll();
   } catch (e) {
     statusEl.textContent = "通信エラー: " + e.message;
@@ -2674,11 +2968,16 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && (pathname === "/orders" || pathname === "/dashboard")) {
     return sendHtml(res, DASHBOARD_PAGE);
   }
+  if (req.method === "GET" && pathname === "/order-parser.js") {
+    res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-store" });
+    return fs.createReadStream(ORDER_PARSER_PATH).pipe(res);
+  }
 
   const protectedRoutes = [
     "/api/orders", "/api/inventory", "/download/売上管理表.xlsx", "/api/import", "/api/import/inventory", "/api/inventory/rebuild", "/api/summary",
     "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild",
     "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/stocktake/reset-checks", "/api/inventory/history",
+    "/api/order-lines/unresolved", "/api/order-lines/resolve",
     "/api/closing/checklist", "/api/closing/export", "/api/closing/snapshot", "/api/closing/snapshots",
   ];
   const isProtected = protectedRoutes.includes(pathname) || pathname.startsWith("/download/snapshots/");
@@ -2691,15 +2990,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/ebay/callback") return await handleEbayCallback(req, res);
     if (req.method === "GET" && pathname === "/api/ebay/inventory") return await handleEbayInventory(req, res);
     if (req.method === "POST" && pathname === "/api/ebay/inventory/rebuild") return await handleEbayInventoryRebuild(req, res);
-    if (req.method === "POST" && pathname === "/api/orders") return await handleAddOrder(req, res);
-    if (req.method === "PATCH" && pathname === "/api/orders") return await handlePatchOrder(req, res);
+    if (req.method === "POST" && pathname === "/api/orders") return await withSalesLock(() => handleAddOrder(req, res));
+    if (req.method === "PATCH" && pathname === "/api/orders") return await withSalesLock(() => handlePatchOrder(req, res));
     if (req.method === "GET" && pathname === "/api/orders") return await handleListOrders(req, res);
     if (req.method === "GET" && pathname === "/download/売上管理表.xlsx") return await handleDownload(req, res);
     if (req.method === "POST" && pathname === "/api/import") return await handleImport(req, res);
     if (req.method === "GET" && pathname === "/api/inventory") return await handleListInventory(req, res);
     if (req.method === "GET" && pathname === "/api/summary") return await handleSummary(req, res);
     if (req.method === "PATCH" && pathname === "/api/inventory") return await handlePatchInventory(req, res);
-    if (req.method === "DELETE" && pathname === "/api/orders") return await handleDeleteOrders(req, res);
+    if (req.method === "DELETE" && pathname === "/api/orders") return await withSalesLock(() => handleDeleteOrders(req, res));
     if (req.method === "DELETE" && pathname === "/api/inventory") return await handleDeleteInventory(req, res);
     if (req.method === "POST" && pathname === "/api/import/inventory") return await handleImportInventory(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/rebuild") return await handleRebuildInventory(req, res);
@@ -2709,6 +3008,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/inventory/stocktake/confirm") return await handleStocktakeConfirm(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/stocktake/reset-checks") return await handleStocktakeResetChecks(req, res);
     if (req.method === "GET" && pathname === "/api/inventory/history") return await handleInventoryHistory(req, res);
+    if (req.method === "GET" && pathname === "/api/order-lines/unresolved") return await handleListUnresolvedOrderLines(req, res);
+    if (req.method === "POST" && pathname === "/api/order-lines/resolve") return await handleResolveOrderLine(req, res);
     if (req.method === "GET" && pathname === "/api/closing/checklist") return await handleClosingChecklist(req, res);
     if (req.method === "GET" && pathname === "/api/closing/export") return await handleClosingExport(req, res);
     if (req.method === "POST" && pathname === "/api/closing/snapshot") return await handleClosingSnapshot(req, res);
@@ -2716,7 +3017,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname.startsWith("/download/snapshots/")) return await handleDownloadSnapshot(req, res, pathname);
   } catch (e) {
     console.error(e);
-    return sendJson(res, 500, { error: "サーバー内部でエラーが発生しました" });
+    const statusCode = Number(e && e.statusCode) || 500;
+    return sendJson(res, statusCode, { error: statusCode === 500 ? "サーバー内部でエラーが発生しました" : e.message });
   }
 
   sendJson(res, 404, { error: "not found" });

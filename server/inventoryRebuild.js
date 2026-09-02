@@ -3,6 +3,7 @@
 // eBay Trading API経由の再構築(ebay/inventorySync.js)からも共通で利用します。
 const ExcelJS = require("exceljs");
 const { withInventoryLock, atomicWriteWorkbook } = require("./inventoryLock");
+const { copyProtectedSheets } = require("./inventoryProtectedSheets");
 
 const INV_HEADER_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F4E78" } };
 const INV_HEADER_FONT = { bold: true, color: { argb: "FFFFFFFF" } };
@@ -253,6 +254,7 @@ async function rebuildInventoryFromRecordsLocked({ records, sourceNote, removedN
   });
   ws3.getColumn(1).width = 110;
 
+  copyProtectedSheets(oldWb, wb);
   await atomicWriteWorkbook(wb, INVENTORY_PATH);
 
   return {

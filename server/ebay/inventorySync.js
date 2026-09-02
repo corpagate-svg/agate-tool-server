@@ -10,6 +10,7 @@
 const ExcelJS = require("exceljs");
 const { fetchAllActiveListings } = require("./sellerListings");
 const { withInventoryLock, atomicWriteWorkbook } = require("../inventoryLock");
+const { copyProtectedSheets } = require("../inventoryProtectedSheets");
 const {
   normText,
   stripShippingNote,
@@ -79,8 +80,8 @@ function takeMatch(pool, key, anchorStartTime) {
 // 不必要に待たせない。ロックを取るのは「在庫管理表.xlsxの読み込み→マージ→書き込み」
 // の間だけにし、しかもロック取得後に改めて最新のxlsxを読み込む(eBay通信中に行われた
 // 棚卸数量・仕入価格・日本語商品名・リアル在庫の変更を、古い状態で上書きして消さないため)。
-async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook }) {
-  const allItems = await fetchAllActiveListings();
+async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook, fetchListings = fetchAllActiveListings }) {
+  const allItems = await fetchListings();
 
   const usRawAll = allItems.filter((it) => siteFromViewItemUrl(it.viewItemUrl) === "US");
   const ukRawAll = allItems.filter((it) => siteFromViewItemUrl(it.viewItemUrl) === "UK");
@@ -288,6 +289,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
   });
   ws3.getColumn(1).width = 110;
 
+  copyProtectedSheets(oldWb, wb);
   await atomicWriteWorkbook(wb, INVENTORY_PATH);
 
   return {
