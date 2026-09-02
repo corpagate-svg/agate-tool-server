@@ -24,6 +24,8 @@ const { createInventoryWorkbookLoaders } = require("./inventoryManagementStore")
 const { createSalesWorkbookLoaders } = require("./salesWorkbookStore");
 const { resolveOrderLineTransaction } = require("./manualOrderResolution");
 const { editManagedOrderTransaction, deleteManagedOrdersTransaction } = require("./managedOrderMutation");
+const { fetchMonthlyAverageRate, BOJ_SOURCE_LABEL } = require("./exchangeRateFetcher");
+const { getRate: getExchangeRate, saveProvisionalRate: saveProvisionalExchangeRate, confirmRate: confirmExchangeRate } = require("./exchangeRateStore");
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
@@ -32,6 +34,7 @@ const DATA_DIR = process.env.AGATE_DATA_DIR ? path.resolve(process.env.AGATE_DAT
 const LEDGER_PATH = path.join(DATA_DIR, "売上管理表.xlsx");
 const INVENTORY_PATH = path.join(DATA_DIR, "在庫管理表.xlsx");
 const HISTORY_PATH = path.join(DATA_DIR, "在庫変更履歴.xlsx");
+const EXCHANGE_RATE_PATH = path.join(DATA_DIR, "為替レート管理.xlsx");
 const SNAPSHOT_DIR = path.join(DATA_DIR, "snapshots");
 const INVENTORY_IMPORT_BACKUP_DIR = path.join(DATA_DIR, "backups", "inventory-import");
 const ORDER_PARSER_PATH = path.join(__dirname, "orderParser.js");
@@ -616,6 +619,123 @@ async function handleSummary(req, res) {
   });
 }
 
+// ---- 為替レート(日銀・月次平均USD/JPY) ----
+// 注文登録・編集の既存トランザクション(recompute/orderRegistration等)は一切変更しない。
+// ここはあくまで「その年月の保存済みレートを参照する」独立した読み書きのみを担当する。
+function currentYearMonth() {
+  return new Date().toISOString().slice(0, 7);
+}
+function previousYearMonthOf(yearMonth) {
+  const [y, m] = String(yearMonth).split("-").map(Number);
+  const d = new Date(Date.UTC(y, m - 1, 1));
+  d.setUTCMonth(d.getUTCMonth() - 1);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+function isSameJstDate(isoA, isoB) {
+  if (!isoA || !isoB) return false;
+  return String(isoA).slice(0, 10) === String(isoB).slice(0, 10);
+}
+
+// GET /api/exchange-rate?yearMonth=YYYY-MM (省略時は当月)
+async function handleGetExchangeRate(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const yearMonth = url.searchParams.get("yearMonth") || currentYearMonth();
+  const record = await getExchangeRate({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
+  sendJson(res, 200, { yearMonth, record });
+}
+
+// POST /api/exchange-rate/refresh  body: { yearMonth?, force? }
+// 日銀APIへの呼び出しはExcelロックの外側(fetchMonthlyAverageRate自体がExcelを一切扱わない)。
+// force指定がない場合、確定済みの月・当日既に取得成功済みの月はAPI呼び出し自体を行わない
+// (高頻度アクセス回避、および注文登録のたびにAPIを呼ばないための共通ガード)。
+async function handleRefreshExchangeRate(req, res) {
+  let body = {};
+  try {
+    const raw = await readRawBody(req, 1024 * 10);
+    if (raw.length) body = JSON.parse(raw.toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  const yearMonth = body.yearMonth || currentYearMonth();
+  const force = Boolean(body.force);
+
+  const existing = await getExchangeRate({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
+  if (!force) {
+    if (existing && existing["状態"] === "確定") {
+      return sendJson(res, 200, { status: "skipped", reason: "confirmed", record: existing });
+    }
+    if (existing && isSameJstDate(existing["取得日時"], new Date().toISOString())) {
+      return sendJson(res, 200, { status: "skipped", reason: "already_fetched_today", record: existing });
+    }
+  } else if (existing && existing["状態"] === "確定") {
+    // 強制更新であっても確定済みの月は絶対に上書きしない。
+    return sendJson(res, 409, { status: "error", error: `${yearMonth}は既に確定済みのため更新できません` });
+  }
+
+  const result = await fetchMonthlyAverageRate(yearMonth);
+  if (!result.ok) {
+    return sendJson(res, 502, { status: "error", error: result.error, errorType: result.errorType });
+  }
+  const saveResult = await saveProvisionalExchangeRate({
+    RATE_PATH: EXCHANGE_RATE_PATH, yearMonth, rate: result.average, count: result.count,
+    startDate: result.startDate, endDate: result.endDate, seriesCode: result.seriesCode,
+    source: BOJ_SOURCE_LABEL, inputMethod: "自動",
+  });
+  if (!saveResult.ok) return sendJson(res, saveResult.status || 409, { status: "error", error: saveResult.error });
+  const record = await getExchangeRate({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
+  sendJson(res, 200, { status: "ok", record });
+}
+
+// GET /api/exchange-rate/confirm-preview?yearMonth=YYYY-MM
+// 確定前のプレビュー: 日銀APIから再取得した候補値・対象期間・件数・現在の暫定値を返すのみで、何も保存しない。
+async function handleExchangeRateConfirmPreview(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const yearMonth = url.searchParams.get("yearMonth");
+  if (!yearMonth) return sendJson(res, 400, { error: "yearMonth は必須です" });
+  const existing = await getExchangeRate({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
+  if (existing && existing["状態"] === "確定") {
+    return sendJson(res, 409, { error: `${yearMonth}は既に確定済みです`, record: existing });
+  }
+  const result = await fetchMonthlyAverageRate(yearMonth);
+  if (!result.ok) return sendJson(res, 502, { error: result.error, errorType: result.errorType });
+  sendJson(res, 200, {
+    yearMonth, candidateRate: result.average, count: result.count,
+    startDate: result.startDate, endDate: result.endDate,
+    currentProvisional: existing && existing["状態"] === "暫定" ? existing["レート"] : null,
+  });
+}
+
+// POST /api/exchange-rate/confirm  body: { yearMonth }
+// 確定操作は必ず人間の明示的なリクエストによってのみ実行される(自動確定は行わない)。
+// 既に確定済みの月への再確定はexchangeRateStore.confirmRate側で拒否される。
+async function handleConfirmExchangeRate(req, res) {
+  let body;
+  try {
+    body = JSON.parse((await readRawBody(req, 1024 * 10)).toString("utf8"));
+  } catch (e) {
+    return sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+  }
+  const yearMonth = body.yearMonth;
+  if (!yearMonth) return sendJson(res, 400, { error: "yearMonth は必須です" });
+
+  const existing = await getExchangeRate({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
+  if (existing && existing["状態"] === "確定") {
+    return sendJson(res, 409, { error: `${yearMonth}は既に確定済みです` });
+  }
+
+  const result = await fetchMonthlyAverageRate(yearMonth);
+  if (!result.ok) return sendJson(res, 502, { error: result.error, errorType: result.errorType });
+
+  const saveResult = await confirmExchangeRate({
+    RATE_PATH: EXCHANGE_RATE_PATH, yearMonth, rate: result.average, count: result.count,
+    startDate: result.startDate, endDate: result.endDate, seriesCode: result.seriesCode,
+    source: BOJ_SOURCE_LABEL, inputMethod: "自動",
+  });
+  if (!saveResult.ok) return sendJson(res, saveResult.status || 409, { error: saveResult.error });
+  const record = await getExchangeRate({ RATE_PATH: EXCHANGE_RATE_PATH, yearMonth });
+  sendJson(res, 200, { status: "ok", record });
+}
+
 async function handlePatchInventory(req, res) {
   let body;
   try {
@@ -999,6 +1119,9 @@ const DASHBOARD_PAGE = `<!doctype html>
   .panel h2 { margin: 0; font-size: 15px; font-weight: 700; }
   .panel .desc { margin: 3px 0 0; font-size: 12.5px; color: var(--ink-muted); }
   .panel-body { margin-top: 16px; }
+  .fx-card { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-top: 0; }
+  .fx-label { font-size: 12px; color: var(--ink-muted); }
+  .fx-value { font-size: 20px; font-weight: 700; }
 
   .browser-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .search-input { font: inherit; font-size: 13px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; flex: 1; min-width: 220px; }
@@ -1136,6 +1259,22 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div class="tabpanel active" id="tab-sales">
     <div class="kpis" id="kpis"></div>
 
+    <div class="panel" id="fx-panel">
+      <div class="panel-body fx-card">
+        <div class="fx-main">
+          <div class="fx-label">USD/JPY(<span id="fx-yearmonth"></span>)</div>
+          <div class="fx-value"><span id="fx-rate">-</span> <span id="fx-status-badge" class="hint"></span></div>
+        </div>
+        <div class="hint" id="fx-detail"></div>
+        <button class="btn" id="fx-refresh-btn">為替更新</button>
+        <span id="fx-refresh-status" class="hint"></span>
+        <div id="fx-confirm-area" style="display:none;">
+          <button class="btn" id="fx-confirm-preview-btn">前月を確定</button>
+          <span id="fx-confirm-status" class="hint"></span>
+        </div>
+      </div>
+    </div>
+
     <div class="panel">
       <h2>月次データ</h2>
       <p class="desc">サーバー上の最新データから自動集計(注文の日付ごとに月単位でまとめています)</p>
@@ -1238,7 +1377,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             <label>日付<input id="ne-date" type="date"></label>
             <label>サイト<input id="ne-site" type="text"></label>
             <label>収益USD<input id="ne-usd" type="number" step="any"></label>
-            <label>ドル円レート<input id="ne-rate" type="number" step="any" value="155"></label>
+            <label>ドル円レート<input id="ne-rate" type="number" step="any"><span id="ne-rate-status" class="hint"></span></label>
             <label>手数料(円)<input id="ne-fee-preview" type="text" disabled placeholder="自動計算(収益円の3%)"></label>
             <label>仕入原価(円)<input id="ne-cost" type="number" step="any" placeholder="わかれば入力"></label>
             <label>送料(円)<input id="ne-shipping" type="number" step="any" placeholder="わかれば入力"></label>
@@ -1485,7 +1624,123 @@ document.querySelectorAll(".tabbtn").forEach(btn => {
     if (btn.dataset.tab === "discrepancy") loadDiscrepancies();
     if (btn.dataset.tab === "stocktake") loadStocktakeList();
     if (btn.dataset.tab === "closing") loadSnapshotList();
+    if (btn.dataset.tab === "sales") loadFxCard();
   });
+});
+
+// ---- 為替(日銀・月次平均USD/JPY) ----
+// 注文一覧・棚卸・在庫など他タブの読み込みとは完全に独立しており、失敗してもそれらをブロックしない。
+function fxYearMonthNow() { return new Date().toISOString().slice(0, 7); }
+function fxPreviousYearMonth(yearMonth) {
+  const parts = yearMonth.split("-").map(Number);
+  const d = new Date(Date.UTC(parts[0], parts[1] - 1, 1));
+  d.setUTCMonth(d.getUTCMonth() - 1);
+  return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0");
+}
+async function fetchExchangeRateRecord(yearMonth) {
+  const token = getToken();
+  if (!token) return null;
+  try {
+    const r = await fetch("/api/exchange-rate?yearMonth=" + encodeURIComponent(yearMonth), { headers: { Authorization: "Bearer " + token } });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data.record || null;
+  } catch (e) {
+    return null;
+  }
+}
+function renderFxCard(yearMonth, record, prevYearMonth, prevRecord) {
+  document.getElementById("fx-yearmonth").textContent = yearMonth;
+  const badge = document.getElementById("fx-status-badge");
+  if (record) {
+    document.getElementById("fx-rate").textContent = Number(record["レート"]).toFixed(2) + "円";
+    badge.textContent = "[" + record["状態"] + "]";
+    badge.className = "hint " + (record["状態"] === "確定" ? "ok" : "");
+    document.getElementById("fx-detail").textContent =
+      "対象期間: " + (record["対象開始日"] || "") + "〜" + (record["対象終了日"] || "") +
+      " ・データ" + (record["データ件数"] || 0) + "件 ・取得元: " + (record["取得元"] || "") +
+      " ・最終取得: " + (record["取得日時"] ? String(record["取得日時"]).slice(0, 16).replace("T", " ") : "");
+  } else {
+    document.getElementById("fx-rate").textContent = "未取得";
+    badge.textContent = "";
+    document.getElementById("fx-detail").textContent = "この月の為替レートはまだ取得されていません(手動で「為替更新」を押してください)";
+  }
+  const confirmArea = document.getElementById("fx-confirm-area");
+  if (prevRecord && prevRecord["状態"] === "確定") {
+    confirmArea.style.display = "none";
+  } else {
+    confirmArea.style.display = "block";
+    confirmArea.dataset.yearMonth = prevYearMonth;
+  }
+}
+async function loadFxCard() {
+  const token = getToken();
+  if (!token) return;
+  const yearMonth = fxYearMonthNow();
+  const prevYearMonth = fxPreviousYearMonth(yearMonth);
+  // 当月分の自動取得を試みる(バックエンド側で当日取得済み・確定済みならAPI自体を呼ばずskipされる)。
+  // 失敗してもここでは無視し、以降のカード表示は保存済みデータだけで続行する(画面をブロックしない)。
+  try {
+    await fetch("/api/exchange-rate/refresh", {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ yearMonth }),
+    });
+  } catch (e) { /* 自動取得の失敗はここでは無視する */ }
+  const [record, prevRecord] = await Promise.all([
+    fetchExchangeRateRecord(yearMonth), fetchExchangeRateRecord(prevYearMonth),
+  ]);
+  renderFxCard(yearMonth, record, prevYearMonth, prevRecord);
+}
+document.getElementById("fx-refresh-btn").addEventListener("click", async () => {
+  const statusEl = document.getElementById("fx-refresh-status");
+  statusEl.textContent = "更新中...";
+  statusEl.className = "hint";
+  try {
+    const r = await fetch("/api/exchange-rate/refresh", {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + getToken() },
+      body: JSON.stringify({ yearMonth: fxYearMonthNow(), force: true }),
+    });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = data.status === "skipped" ? "確定済みのため更新不要です" : "更新しました";
+    statusEl.className = "hint ok";
+    await loadFxCard();
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
+});
+document.getElementById("fx-confirm-preview-btn").addEventListener("click", async () => {
+  const statusEl = document.getElementById("fx-confirm-status");
+  const yearMonth = document.getElementById("fx-confirm-area").dataset.yearMonth;
+  statusEl.textContent = "確認中...";
+  statusEl.className = "hint";
+  try {
+    const token = getToken();
+    const r = await fetch("/api/exchange-rate/confirm-preview?yearMonth=" + encodeURIComponent(yearMonth), { headers: { Authorization: "Bearer " + token } });
+    const data = await r.json();
+    if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
+    const lines = [
+      yearMonth + "を確定します。",
+      "候補レート: " + data.candidateRate.toFixed(2) + "円(" + data.count + "件、" + data.startDate + "〜" + data.endDate + ")",
+      data.currentProvisional ? "現在の暫定値: " + Number(data.currentProvisional).toFixed(2) + "円" : "",
+      "確定後は通常操作で変更できません。よろしいですか?",
+    ].filter(Boolean);
+    if (!confirm(lines.join("\\n"))) { statusEl.textContent = ""; return; }
+    statusEl.textContent = "確定中...";
+    const r2 = await fetch("/api/exchange-rate/confirm", {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ yearMonth }),
+    });
+    const data2 = await r2.json();
+    if (!r2.ok) { statusEl.textContent = "失敗: " + (data2.error || r2.status); statusEl.className = "hint ng"; return; }
+    statusEl.textContent = "確定しました";
+    statusEl.className = "hint ok";
+    await loadFxCard();
+  } catch (e) {
+    statusEl.textContent = "通信エラー: " + e.message;
+    statusEl.className = "hint ng";
+  }
 });
 
 function fmt(v, isPercent) {
@@ -3096,10 +3351,41 @@ document.getElementById("ne-usd").addEventListener("input", updateFeePreview);
 document.getElementById("ne-rate").addEventListener("input", updateFeePreview);
 preventQtyWheelChange(document.getElementById("ne-qty"));
 
+// 注文日から対象年月の保存済み為替レートを自動取得してドル円レート欄へ反映する。
+// 取得できない場合はレートを空のままにし、手動入力を促す警告を表示する(155等への暗黙フォールバックは行わない)。
+let neRateAutoValue = null;
+async function applyOrderDateRate(dateStr) {
+  const statusEl = document.getElementById("ne-rate-status");
+  if (!dateStr) { statusEl.textContent = ""; neRateAutoValue = null; return; }
+  const yearMonth = dateStr.slice(0, 7);
+  const record = await fetchExchangeRateRecord(yearMonth);
+  if (record && record["レート"]) {
+    neRateAutoValue = Number(record["レート"]);
+    document.getElementById("ne-rate").value = neRateAutoValue;
+    statusEl.textContent = "自動取得(" + record["状態"] + "、" + yearMonth + ")";
+    statusEl.className = "hint ok";
+  } else {
+    neRateAutoValue = null;
+    statusEl.textContent = yearMonth + "の自動レートが未取得です。手動でドル円レートを入力してください";
+    statusEl.className = "hint ng";
+  }
+  updateFeePreview();
+}
+document.getElementById("ne-rate").addEventListener("input", () => {
+  const statusEl = document.getElementById("ne-rate-status");
+  const cur = Number(document.getElementById("ne-rate").value);
+  if (neRateAutoValue !== null && cur !== neRateAutoValue) {
+    statusEl.textContent = "手動入力(自動取得値を上書き)";
+    statusEl.className = "hint";
+  }
+});
+document.getElementById("ne-date").addEventListener("change", (e) => applyOrderDateRate(e.target.value));
+
 document.getElementById("ne-parse-btn").addEventListener("click", () => {
   const parsed = parseOrderText(document.getElementById("ne-paste").value);
   document.getElementById("ne-order").value = parsed.orderNo;
   document.getElementById("ne-date").value = parsed.date;
+  applyOrderDateRate(parsed.date);
   document.getElementById("ne-site").value = parsed.site;
   document.getElementById("ne-usd").value = parsed.usd;
   document.getElementById("ne-note").value = parsed.note;
@@ -3178,7 +3464,7 @@ document.getElementById("ne-submit-btn").addEventListener("click", async () => {
   }
 });
 
-if (getToken()) loadAll();
+if (getToken()) { loadAll(); loadFxCard(); }
 </script>
 </body></html>`;
 
@@ -3219,6 +3505,7 @@ const server = http.createServer(async (req, res) => {
     "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/stocktake/reset-checks", "/api/inventory/stocktake/undo", "/api/inventory/history",
     "/api/order-lines/unresolved", "/api/order-lines/resolve",
     "/api/closing/checklist", "/api/closing/export", "/api/closing/snapshot", "/api/closing/snapshots",
+    "/api/exchange-rate", "/api/exchange-rate/refresh", "/api/exchange-rate/confirm-preview", "/api/exchange-rate/confirm",
   ];
   const isProtected = protectedRoutes.includes(pathname) || pathname.startsWith("/download/snapshots/");
   if (isProtected && !isAuthorized(req)) {
@@ -3237,6 +3524,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/import") return await handleImport(req, res);
     if (req.method === "GET" && pathname === "/api/inventory") return await handleListInventory(req, res);
     if (req.method === "GET" && pathname === "/api/summary") return await handleSummary(req, res);
+    if (req.method === "GET" && pathname === "/api/exchange-rate") return await handleGetExchangeRate(req, res);
+    if (req.method === "POST" && pathname === "/api/exchange-rate/refresh") return await handleRefreshExchangeRate(req, res);
+    if (req.method === "GET" && pathname === "/api/exchange-rate/confirm-preview") return await handleExchangeRateConfirmPreview(req, res);
+    if (req.method === "POST" && pathname === "/api/exchange-rate/confirm") return await handleConfirmExchangeRate(req, res);
     if (req.method === "PATCH" && pathname === "/api/inventory") return await handlePatchInventory(req, res);
     if (req.method === "DELETE" && pathname === "/api/orders") return await withSalesLock(() => handleDeleteOrders(req, res));
     if (req.method === "DELETE" && pathname === "/api/inventory") return await handleDeleteInventory(req, res);
