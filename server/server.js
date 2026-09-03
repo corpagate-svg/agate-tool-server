@@ -2603,6 +2603,7 @@ function renderInventory() {
         inp.min = "0";
         inp.step = "1";
         inp.className = "qty-input real-stock-input";
+        preventQtyWheelChange(inp);
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
         inp.dataset.savedValue = inp.value;
         inp.addEventListener("input", () => inp.setCustomValidity(""));
@@ -2957,6 +2958,7 @@ function renderDiscrepancies(rows) {
     realInput.min = "0";
     realInput.step = "1";
     realInput.className = "qty-input real-stock-input";
+    preventQtyWheelChange(realInput);
     realInput.value = String(row.リアル在庫);
     realInput.dataset.savedValue = realInput.value;
     realInput.addEventListener("input", () => realInput.setCustomValidity(""));
