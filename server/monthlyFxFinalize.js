@@ -4,19 +4,20 @@
 // 重複実装せずそのまま再利用するための構成。exchangeRateFetcher.js/exchangeRateStore.js
 // の既存責務・既存の確定保護(confirmRate)は一切変更しない)。
 
-// 「前月が安全に確定できる」条件: 前月分のBOJ日次データが1件以上あり、かつ「翌月」
-// (= 呼び出し時点の実際の現在月)のBOJデータも既に1件以上存在すること。
-// BOJの日次系列は時系列順に公表されるため、「翌月分のデータが存在する」という事実自体が
-// 「前月分の公表はもう追いつき切っている」ことの直接的な証拠になる。月末の実際の営業日が
-// 何日かを知る必要がなく、祝日・連休の並びに関わらず常に正しく判定できる
-// (「月末から何日以内」のような暦日ベースの閾値は、連休が月末にかかる場合に前月の最終
-// 営業日がその閾値より前になり得るため、永久にスキップし続める恐れがあり採用しない)。
-async function isPreviousMonthSafeToConfirm({ targetYearMonth, currentYearMonth, fetchMonthlyAverageRate }) {
-  const targetResult = await fetchMonthlyAverageRate(targetYearMonth);
-  if (!targetResult.ok) return { safe: false, reason: "target_month_fetch_failed", targetResult };
-  const nextMonthResult = await fetchMonthlyAverageRate(currentYearMonth);
-  if (!nextMonthResult.ok) return { safe: false, reason: "next_month_not_started", targetResult };
-  return { safe: true, targetResult };
+// 「前月が安全に確定できる」条件: 日銀の公式月次平均系列(FXERM09、DB FM08)で対象月の値が
+// 既に公表済みであること。実日銀APIで、FXERD05の日次有効値平均から現行コードで計算した値と
+// FXERM09の値が2026-01/04/06/07/08の5か月で完全一致することを確認済み(以前の実装で使っていた
+// 「翌月のFXERD05データが1件でも存在するか」という間接的な代理指標よりも、BOJ自身が
+// 「この月の月次平均を確定して公表した」という事実を直接確認できるため、より安全)。
+// 進行中の月をFXERM09で問い合わせるとVALUESがnullで返る(実日銀APIで確認済み)ため、
+// isMonthlyAveragePublishedはnull/0件応答のどちらも「未公表」として扱う。
+// 注文へ適用するレート自体はこの系列の値を採用せず、従来どおりFXERD05の日次有効値平均
+// (fetchMonthlyAverageRate、小数第2位丸め)のまま計算する。
+async function isPreviousMonthSafeToConfirm({ targetYearMonth, isMonthlyAveragePublished }) {
+  const published = await isMonthlyAveragePublished(targetYearMonth);
+  if (!published.ok) return { safe: false, reason: "monthly_series_fetch_failed" };
+  if (!published.published) return { safe: false, reason: "monthly_average_not_published" };
+  return { safe: true };
 }
 
 // 前月の為替を必要なら確定し、その月の注文を確定レートへ揃える。冪等(何度呼んでも安全)。
@@ -28,7 +29,7 @@ async function finalizePreviousMonthFx(deps) {
   const {
     EXCHANGE_RATE_PATH, LEDGER_PATH,
     currentYearMonth, previousYearMonthOf,
-    fetchMonthlyAverageRate, BOJ_SOURCE_LABEL,
+    fetchMonthlyAverageRate, isMonthlyAveragePublished, BOJ_SOURCE_LABEL,
     getExchangeRate, confirmExchangeRate,
     withSalesLock, loadSalesWorkbookLocked, atomicWriteWorkbook,
     monthSheetName, COL, numOrNull, computeOrderFinancials,
@@ -41,11 +42,16 @@ async function finalizePreviousMonthFx(deps) {
   let justConfirmed = false;
 
   if (!record || record["状態"] !== "確定") {
-    const safety = await isPreviousMonthSafeToConfirm({ targetYearMonth, currentYearMonth: nowYearMonth, fetchMonthlyAverageRate });
+    const safety = await isPreviousMonthSafeToConfirm({ targetYearMonth, isMonthlyAveragePublished });
     if (!safety.safe) {
       return { action: "skipped", reason: safety.reason, targetYearMonth };
     }
-    const result = safety.targetResult;
+    // 確定可否の判定(FXERM09公表確認)と、注文へ適用する実際のレート計算(FXERD05日次平均)は
+    // 別系列・別APIコールに分離している。安全確認が通った後にここで初めてレートを計算する。
+    const result = await fetchMonthlyAverageRate(targetYearMonth);
+    if (!result.ok) {
+      return { action: "skipped", reason: "target_month_fetch_failed", targetYearMonth };
+    }
     const saveResult = await confirmExchangeRate({
       RATE_PATH: EXCHANGE_RATE_PATH, yearMonth: targetYearMonth, rate: result.average, count: result.count,
       startDate: result.startDate, endDate: result.endDate, seriesCode: result.seriesCode,

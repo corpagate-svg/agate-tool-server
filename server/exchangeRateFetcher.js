@@ -6,6 +6,12 @@
 const BOJ_API_BASE = process.env.AGATE_BOJ_API_BASE_OVERRIDE || "https://www.stat-search.boj.or.jp/api/v1/getDataCode";
 const BOJ_DB = "FM08";
 const BOJ_SERIES_CODE = "FXERD05";
+// 対象月が日銀側で「月次データとして公表済みか」の確認専用の系列。実日銀APIで確認したところ、
+// 同じDB(FM08)にFXERD05の日次有効値平均と一致する公式月次平均系列が存在する
+// (2026-01/04/06/07/08の計5か月で完全一致を確認済み)。注文へ適用するレート自体は
+// 従来どおりFXERD05の日次有効値平均(小数第2位丸め)のままで、この系列の値そのものを
+// レートとして採用することはしない(monthlyFxFinalize.jsの確定可否判定にのみ使う)。
+const BOJ_MONTHLY_SERIES_CODE = "FXERM09";
 const BOJ_SOURCE_LABEL = "日本銀行";
 const DEFAULT_TIMEOUT_MS = 10000;
 
@@ -13,10 +19,10 @@ function toBojYearMonth(yearMonth) {
   return String(yearMonth || "").replace("-", "");
 }
 
-function buildRequestUrl(yearMonth) {
+function buildRequestUrl(yearMonth, seriesCode = BOJ_SERIES_CODE) {
   const ym = toBojYearMonth(yearMonth);
   const params = new URLSearchParams({
-    format: "json", lang: "jp", db: BOJ_DB, code: BOJ_SERIES_CODE,
+    format: "json", lang: "jp", db: BOJ_DB, code: seriesCode,
     startDate: ym, endDate: ym,
   });
   return `${BOJ_API_BASE}?${params.toString()}`;
@@ -163,8 +169,68 @@ async function fetchMonthlyAverageRate(yearMonth, opts = {}) {
   };
 }
 
+// 対象月について、日銀の公式月次平均系列(FXERM09)が「公表済み」かどうかだけを確認する。
+// 前月為替の自動確定可否判定専用(monthlyFxFinalize.js)。注文へ適用するレートの計算には
+// 一切使わない(そちらは従来どおりfetchMonthlyAverageRate/FXERD05のまま)。
+// 0件応答(該当データなし)・値がnull(月内はSURVEY_DATESに載るが未確定でVALUESがnullになる)は
+// どちらも「未公表」として扱う(実日銀APIで、進行中の月がnullで返ることを確認済み)。
+async function isMonthlyAveragePublished(yearMonth, { fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  const url = buildRequestUrl(yearMonth, BOJ_MONTHLY_SERIES_CODE);
+  let res;
+  try {
+    res = await fetchWithTimeout(url, { timeoutMs, fetchImpl });
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      return { ok: false, error: "日銀APIへの接続がタイムアウトしました", errorType: "timeout" };
+    }
+    return { ok: false, error: `日銀APIへの接続に失敗しました: ${e.message}`, errorType: "network" };
+  }
+
+  let text;
+  try {
+    text = await res.text();
+  } catch (e) {
+    return { ok: false, error: "日銀APIの応答を読み取れませんでした", errorType: "network" };
+  }
+  if (!res.ok) {
+    return { ok: false, error: `日銀APIがHTTPエラーを返しました(${res.status})`, errorType: "http", httpStatus: res.status };
+  }
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, error: "日銀APIの応答形式が想定と異なります(JSON解析に失敗しました)", errorType: "format" };
+  }
+  if (!json || typeof json !== "object") {
+    return { ok: false, error: "日銀APIの応答形式が想定と異なります", errorType: "format" };
+  }
+  if (json.STATUS !== 200) {
+    return {
+      ok: false,
+      error: `日銀APIがエラーを返しました: ${json.MESSAGE || "STATUS=" + json.STATUS}`,
+      errorType: "boj_error",
+      bojStatus: json.STATUS,
+    };
+  }
+
+  const resultSet = Array.isArray(json.RESULTSET) ? json.RESULTSET : [];
+  const series = resultSet.find((s) => s && s.SERIES_CODE === BOJ_MONTHLY_SERIES_CODE);
+  if (!series || !series.VALUES) return { ok: true, published: false };
+
+  const dates = Array.isArray(series.VALUES.SURVEY_DATES) ? series.VALUES.SURVEY_DATES : [];
+  const values = Array.isArray(series.VALUES.VALUES) ? series.VALUES.VALUES : [];
+  const idx = dates.findIndex((d) => String(d) === toBojYearMonth(yearMonth));
+  if (idx === -1) return { ok: true, published: false };
+
+  const raw = values[idx];
+  const num = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+  return { ok: true, published: num !== null, value: num };
+}
+
 module.exports = {
-  BOJ_API_BASE, BOJ_DB, BOJ_SERIES_CODE, BOJ_SOURCE_LABEL,
+  BOJ_API_BASE, BOJ_DB, BOJ_SERIES_CODE, BOJ_MONTHLY_SERIES_CODE, BOJ_SOURCE_LABEL,
   buildRequestUrl, normalizeDate,
   fetchDailyRates, computeMonthlyAverage, fetchMonthlyAverageRate,
+  isMonthlyAveragePublished,
 };

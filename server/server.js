@@ -24,7 +24,7 @@ const { createInventoryWorkbookLoaders } = require("./inventoryManagementStore")
 const { createSalesWorkbookLoaders } = require("./salesWorkbookStore");
 const { resolveOrderLineTransaction } = require("./manualOrderResolution");
 const { editManagedOrderTransaction, deleteManagedOrdersTransaction } = require("./managedOrderMutation");
-const { fetchMonthlyAverageRate, BOJ_SOURCE_LABEL } = require("./exchangeRateFetcher");
+const { fetchMonthlyAverageRate, isMonthlyAveragePublished, BOJ_SOURCE_LABEL } = require("./exchangeRateFetcher");
 const { jstYearMonth, isSameJstDate } = require("./jstDate");
 const {
   getRate: getExchangeRate, saveProvisionalRate: saveProvisionalExchangeRate, confirmRate: confirmExchangeRate,
@@ -99,7 +99,7 @@ const handleEbayInventoryRebuild = createInventoryRebuildHandler(
   () => finalizePreviousMonthFx({
     EXCHANGE_RATE_PATH, LEDGER_PATH,
     currentYearMonth, previousYearMonthOf,
-    fetchMonthlyAverageRate, BOJ_SOURCE_LABEL,
+    fetchMonthlyAverageRate, isMonthlyAveragePublished, BOJ_SOURCE_LABEL,
     getExchangeRate, confirmExchangeRate,
     withSalesLock, loadSalesWorkbookLocked: loadWorkbookLocked, atomicWriteWorkbook,
     monthSheetName, COL, numOrNull, computeOrderFinancials,
