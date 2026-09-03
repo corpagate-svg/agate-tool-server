@@ -30,6 +30,7 @@ const {
   getRate: getExchangeRate, saveProvisionalRate: saveProvisionalExchangeRate, confirmRate: confirmExchangeRate,
   getNoDataCheckLog, recordNoDataCheck,
 } = require("./exchangeRateStore");
+const { finalizePreviousMonthFx } = require("./monthlyFxFinalize");
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
@@ -89,7 +90,21 @@ const { loadInventoryWorkbook, loadInventoryWorkbookLocked } = createInventoryWo
   INV_HEADERS,
 });
 
-const handleEbayInventoryRebuild = createInventoryRebuildHandler({ INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook: loadInventoryWorkbookLocked });
+// afterRebuildは在庫反映成功後に呼ばれる(在庫反映自体が失敗した場合は呼ばれない)。
+// currentYearMonth/numOrNull/recompute等はfunction宣言でファイル全体からホイストされるため、
+// この時点(まだ後方で定義される前)で参照しても、実際に呼ばれるのはサーバー起動完了後
+// (リクエスト到達時)なので問題ない。
+const handleEbayInventoryRebuild = createInventoryRebuildHandler(
+  { INV_HEADERS, INVENTORY_PATH, loadInventoryWorkbook: loadInventoryWorkbookLocked },
+  () => finalizePreviousMonthFx({
+    EXCHANGE_RATE_PATH, LEDGER_PATH,
+    currentYearMonth, previousYearMonthOf,
+    fetchMonthlyAverageRate, BOJ_SOURCE_LABEL,
+    getExchangeRate, confirmExchangeRate,
+    withSalesLock, loadSalesWorkbookLocked: loadWorkbookLocked, atomicWriteWorkbook,
+    monthSheetName, COL, numOrNull, computeOrderFinancials,
+  }),
+);
 
 function dataSheets(wb) {
   return wb.worksheets.filter((ws) => isDataSheet(ws.name));
@@ -196,6 +211,17 @@ function recompute(revenueJpy, fee, cost, shipping, packing) {
 
 function numOrNull(v) {
   return v !== undefined && v !== null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null;
+}
+
+// 収益USD・ドル円レート・仕入原価/送料/梱包費から収益円・手数料・最終利益・利益率を計算する。
+// 個別編集(handlePatchOrder)・月次為替確定後の一括更新(monthlyFxFinalize.js)で共通利用し、
+// 計算式が別々にズレないようにする(handleAddOrderは必須値が確定済みで分岐が不要なため、
+// 従来どおり直接計算のまま維持する)。
+function computeOrderFinancials(usd, rate, existingRevenueJpy, cost, shipping, packing) {
+  const revenueJpy = usd !== null && rate !== null ? usd * rate : (existingRevenueJpy || 0);
+  const fee = Math.round(revenueJpy * 0.03);
+  const { profit, margin } = recompute(revenueJpy, fee, cost, shipping, packing);
+  return { revenueJpy, fee, profit, margin };
 }
 
 async function handleAddOrder(req, res) {
@@ -331,9 +357,9 @@ async function handlePatchOrder(req, res) {
   const packing = "梱包費円" in body ? numOrNull(body["梱包費円"]) : numOrNull(row.getCell(COL.梱包費).value);
   const usd = "収益USD" in body ? numOrNull(body["収益USD"]) : numOrNull(row.getCell(COL.収益USD).value);
   const rate = "ドル円レート" in body ? numOrNull(body["ドル円レート"]) : numOrNull(row.getCell(COL.ドル円レート).value);
-  const revenueJpy = usd !== null && rate !== null ? usd * rate : Number(row.getCell(COL.収益円).value) || 0;
-  const fee = Math.round(revenueJpy * 0.03);
-  const { profit, margin } = recompute(revenueJpy, fee, cost, shipping, packing);
+  const { revenueJpy, fee, profit, margin } = computeOrderFinancials(
+    usd, rate, Number(row.getCell(COL.収益円).value) || 0, cost, shipping, packing,
+  );
 
   if (usd !== null) row.getCell(COL.収益USD).value = usd;
   if (rate !== null) row.getCell(COL.ドル円レート).value = rate;
@@ -3416,7 +3442,16 @@ document.getElementById("ebay-rebuild-btn").addEventListener("click", async () =
     });
     const data = await r.json();
     if (!r.ok) { statusEl.textContent = "失敗: " + (data.error || r.status); statusEl.className = "hint ng"; return; }
-    statusEl.textContent = "更新完了(USベース" + data.total + "件・新規" + data.new + "件・削除" + data.deletedCount + "件・要確認" + data.ambiguousMatches + "件・UK/AU保管" + data.ukAuOrphanCount + "件)";
+    let msg = "更新完了(USベース" + data.total + "件・新規" + data.new + "件・削除" + data.deletedCount + "件・要確認" + data.ambiguousMatches + "件・UK/AU保管" + data.ukAuOrphanCount + "件)";
+    // 前月為替の自動確定結果(あれば)。既に確定・反映済み(何もしなかった)場合は表示を増やさない。
+    if (data.fx) {
+      if (data.fx.action === "confirmed_and_updated" || data.fx.action === "orders_synced") {
+        msg += " / " + data.fx.targetYearMonth + " 為替確定: " + Number(data.fx.rate).toFixed(2) + "円・対象注文" + data.fx.targetCount + "件・" + data.fx.updatedCount + "件を確定レートへ更新しました";
+      } else if (data.fx.action === "skipped") {
+        msg += " / 前月為替: 未確定のため今回は更新なし";
+      }
+    }
+    statusEl.textContent = msg;
     statusEl.className = "hint ok";
     await loadAll();
   } catch (e) {
