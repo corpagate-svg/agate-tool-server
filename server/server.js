@@ -1272,6 +1272,9 @@ const DASHBOARD_PAGE = `<!doctype html>
   .entry-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
   .entry-form input { font: inherit; font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 7px 9px; }
   .entry-form input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; }
+  /* 新規注文フォームのドル円レートは自動取得専用。手入力による誤ったレート混入を防ぐため
+     readonlyにし、見た目でも「自動取得された値である」ことがわかるようにする。 */
+  .entry-form input[readonly] { background: var(--surface-2); color: var(--ink-2); cursor: not-allowed; }
   .hint { font-size: 12px; color: var(--ink-muted); }
   .hint.ok { color: var(--good); }
   .hint.ng { color: var(--series-cost); }
@@ -1429,7 +1432,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             <label>日付<input id="ne-date" type="date"></label>
             <label>サイト<input id="ne-site" type="text"></label>
             <label>収益USD<input id="ne-usd" type="number" step="any"></label>
-            <label>ドル円レート<input id="ne-rate" type="number" step="any"><span id="ne-rate-status" class="hint"></span></label>
+            <label>ドル円レート(自動取得)<input id="ne-rate" type="number" step="any" readonly><span id="ne-rate-status" class="hint"></span></label>
             <label>手数料(円)<input id="ne-fee-preview" type="text" disabled placeholder="自動計算(収益円の3%)"></label>
             <label>仕入原価(円)<input id="ne-cost" type="number" step="any" placeholder="わかれば入力"></label>
             <label>送料(円)<input id="ne-shipping" type="number" step="any" placeholder="わかれば入力"></label>
@@ -1732,7 +1735,7 @@ function renderFxCard(yearMonth, applicable, prevYearMonth, prevRecord) {
   if (!applicable) {
     document.getElementById("fx-rate").textContent = "未取得";
     badge.textContent = "";
-    detailEl.textContent = "自動レートを取得できません(「為替更新」を押すか、注文登録時に手動でドル円レートを入力してください)";
+    detailEl.textContent = "自動レートを取得できません。「為替更新」を押すか、原因を確認してください(この間は該当月の新規注文登録もできません)";
   } else {
     document.getElementById("fx-rate").textContent = Number(applicable.rate).toFixed(2) + "円";
     const periodText = "対象期間: " + (applicable.startDate || "") + "〜" + (applicable.endDate || "") +
@@ -3535,9 +3538,14 @@ function updateFeePreview() {
 document.getElementById("ne-usd").addEventListener("input", updateFeePreview);
 document.getElementById("ne-rate").addEventListener("input", updateFeePreview);
 preventQtyWheelChange(document.getElementById("ne-qty"));
+// ドル円レートはreadonly化済みだが、number入力のスピナー/ホイール操作による
+// 意図しない値変更を防ぐ多重防御として同じガードを適用する。
+preventQtyWheelChange(document.getElementById("ne-rate"));
 
 // 注文日から対象年月の保存済み為替レートを自動取得してドル円レート欄へ反映する。
-// 取得できない場合はレートを空のままにし、手動入力を促す警告を表示する(155等への暗黙フォールバックは行わない)。
+// 取得できない場合はレートを空のままにし、登録できない旨を表示する(155等への暗黙フォールバックは行わない)。
+// ne-rateはreadonly化済みのため手入力は不可。以下のneRateManualRevision関連ガードは
+// readonly導入前からの多重防御として残す(新規注文フォーム以外からは参照されない)。
 let neRateAutoValue = null;
 let neRateRequestSequence = 0;
 let neRateManualRevision = 0;
@@ -3585,7 +3593,7 @@ async function applyOrderDateRate(dateStr) {
   } else {
     neRateAutoValue = null;
     rateInput.value = "";
-    statusEl.textContent = yearMonth + "の自動レートが未取得です。手動でドル円レートを入力してください";
+    statusEl.textContent = yearMonth + "の自動レートが未取得です。「為替更新」を押すか、原因を確認してください(この月の新規注文登録はできません)";
     statusEl.className = "hint ng";
   }
   updateFeePreview();
