@@ -1582,16 +1582,6 @@ const DASHBOARD_PAGE = `<!doctype html>
         </div>
         <div class="browser-toolbar">
           <input type="text" class="search-input" id="stk-q" placeholder="英語商品名・日本語商品名・商品ID・SKUで検索…">
-          <label class="hint">並び替え
-            <select id="stk-sort">
-              <option value="pid">商品ID順</option>
-              <option value="name">英語商品名順</option>
-              <option value="ja-name">日本語商品名順</option>
-              <option value="price">仕入価格が安い順</option>
-              <option value="real">リアル在庫が少ない順</option>
-              <option value="unchecked">未棚卸を先頭</option>
-            </select>
-          </label>
           <span class="result-count" id="stk-count"></span>
         </div>
         <div class="pager" id="stk-pager-top"></div>
@@ -2862,9 +2852,8 @@ document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscre
 const STK_PAGE_SIZE = 300;
 let stkPage = 1;
 let stkPrevQ = "";
-// 列見出しクリックによる並び替え。nullの間は既存のプルダウン(stk-sort)が有効。
-// {key, dir} が入っている間はこちらを優先する(プルダウンはstk-sort変更時にクリアする)。
-let stkHeaderSort = null;
+// 列見出しクリックによる並び替え。初期表示は従来どおり商品ID昇順。
+let stkHeaderSort = { key: "pid", dir: 1 };
 
 function loadStocktakeList() { stkPage = 1; renderStocktake(); }
 
@@ -2882,13 +2871,14 @@ const STK_SORTABLE_COLUMNS = [
   { key: "pid", label: "商品ID" },
   { key: "name", label: "商品名(英語)" },
   { key: "jaName", label: "商品名(日本語)" },
-  null,
+  { label: "画像" },
   { key: "price", label: "仕入価格(円)", num: true },
   { key: "real", label: "リアル在庫", num: true },
-  { key: "staged", label: "棚卸入力数量", num: true },
+  { label: "棚卸入力数量", num: true },
+  { key: "checked", label: "棚卸チェック" },
   { key: "stagedAt", label: "入力日時" },
 ];
-const STK_HEADER_NUM_KEYS = new Set(["price", "real", "staged"]);
+const STK_HEADER_NUM_KEYS = new Set(["price", "real"]);
 
 // 空欄/未入力は昇順・降順にかかわらず必ず末尾に置く(0は有効な数値として通常どおり比較する)。
 function compareStkHeaderValue(av, bv, isNum, dir) {
@@ -2903,6 +2893,11 @@ function compareStkHeaderValue(av, bv, isNum, dir) {
 
 function sortStocktakeRowsByHeader(rows, idx, headerSort) {
   const field = idx[headerSort.key];
+  if (headerSort.key === "checked") {
+    return rows.slice().sort((a, b) =>
+      (Number(a[field] === true) - Number(b[field] === true)) * headerSort.dir
+    );
+  }
   const isNum = STK_HEADER_NUM_KEYS.has(headerSort.key);
   return rows.slice().sort((a, b) => compareStkHeaderValue(a[field], b[field], isNum, headerSort.dir));
 }
@@ -2910,7 +2905,7 @@ function sortStocktakeRowsByHeader(rows, idx, headerSort) {
 function renderStocktakeHead() {
   const thead = document.getElementById("stk-thead");
   thead.innerHTML = STK_SORTABLE_COLUMNS.map((col) => {
-    if (!col) return "<th>画像</th>";
+    if (!col.key) return '<th' + (col.num ? ' class="num"' : "") + '>' + col.label + '</th>';
     const isSortCol = stkHeaderSort && stkHeaderSort.key === col.key;
     const arrow = isSortCol ? '<span class="sort-arrow">' + (stkHeaderSort.dir === 1 ? "▲" : "▼") + '</span>' : "";
     return '<th class="sortable' + (col.num ? " num" : "") + '" data-key="' + col.key + '">' + col.label + arrow + '</th>';
@@ -2920,31 +2915,10 @@ function renderStocktakeHead() {
       const key = th.dataset.key;
       // 1回目クリックは昇順、同じ列の再クリックで昇順/降順を切り替える。別の列は昇順から開始する。
       stkHeaderSort = { key, dir: stkHeaderSort && stkHeaderSort.key === key ? -stkHeaderSort.dir : 1 };
-      // ヘッダーソートを優先させ、プルダウンは通常状態(先頭の商品ID順)へ戻す。
-      document.getElementById("stk-sort").value = "pid";
       stkPage = 1;
       renderStocktake();
     });
   });
-}
-
-function sortStocktakeRows(rows, idx, sortKey) {
-  const sorted = rows.slice();
-  const textCompare = (a, b, field) => String(a[field] || "").localeCompare(String(b[field] || ""), "ja", { numeric: true, sensitivity: "base" });
-  const numberCompare = (a, b, field) => {
-    const av = a[field] === "" || a[field] === null || a[field] === undefined ? Infinity : Number(a[field]);
-    const bv = b[field] === "" || b[field] === null || b[field] === undefined ? Infinity : Number(b[field]);
-    return av - bv;
-  };
-  sorted.sort((a, b) => {
-    if (sortKey === "name") return textCompare(a, b, idx.name);
-    if (sortKey === "ja-name") return textCompare(a, b, idx.jaName);
-    if (sortKey === "price") return numberCompare(a, b, idx.price);
-    if (sortKey === "real") return numberCompare(a, b, idx.real);
-    if (sortKey === "unchecked") return Number(Boolean(a[idx.checked])) - Number(Boolean(b[idx.checked]));
-    return textCompare(a, b, idx.pid);
-  });
-  return sorted;
 }
 
 function buildStocktakeRow(row, idx) {
@@ -3081,9 +3055,12 @@ function buildStocktakeRow(row, idx) {
     refreshUndoBtn();
   }));
   stagedTd.appendChild(inp);
-  stagedTd.appendChild(checkBadge);
-  stagedTd.appendChild(undoBtn);
   tr.appendChild(stagedTd);
+
+  const checkTd = document.createElement("td");
+  checkTd.appendChild(checkBadge);
+  checkTd.appendChild(undoBtn);
+  tr.appendChild(checkTd);
 
   const atTd = document.createElement("td");
   atTd.textContent = row[idx.stagedAt] ? String(row[idx.stagedAt]).slice(0, 16).replace("T", " ") : "";
@@ -3111,7 +3088,7 @@ function renderPager(container, currentPage, totalPages, onGoToPage) {
 }
 
 function renderStocktake() {
-  if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='8'>在庫データが読み込まれていません</td></tr>"; return; }
+  if (!invHeaders.length) { document.getElementById("stk-tbody").innerHTML = "<tr><td colspan='9'>在庫データが読み込まれていません</td></tr>"; return; }
   const idx = {
     pid: invHeaders.indexOf("商品ID"), name: invHeaders.indexOf("商品名"), jaName: invHeaders.indexOf("日本語商品名"),
     image: invHeaders.indexOf("画像URL"), sku: invHeaders.indexOf("SKU"),
@@ -3124,7 +3101,6 @@ function renderStocktake() {
   const q = document.getElementById("stk-q").value.trim().toLowerCase();
   if (q !== stkPrevQ) stkPage = 1;
   stkPrevQ = q;
-  const sortKey = document.getElementById("stk-sort").value;
 
   const tbody = document.getElementById("stk-tbody");
   const pagerTop = document.getElementById("stk-pager-top");
@@ -3135,9 +3111,7 @@ function renderStocktake() {
   // 検索→ソート→ページネーションの順を維持し、表示中のページだけでなく
   // 検索結果全体を並び替えてから300件ずつに分割する。
   const filteredRows = invRows.filter((row) => stkRowMatches(row, idx, q));
-  const displayRows = stkHeaderSort
-    ? sortStocktakeRowsByHeader(filteredRows, idx, stkHeaderSort)
-    : sortStocktakeRows(filteredRows, idx, sortKey);
+  const displayRows = sortStocktakeRowsByHeader(filteredRows, idx, stkHeaderSort);
 
   const totalPages = Math.max(1, Math.ceil(displayRows.length / STK_PAGE_SIZE));
   if (stkPage > totalPages) stkPage = totalPages;
@@ -3155,7 +3129,6 @@ function renderStocktake() {
     : rangeText + " / " + displayRows.length.toLocaleString("ja-JP") + " 件(" + stkPage + " / " + totalPages + " ページ)";
 }
 document.getElementById("stk-q").addEventListener("input", renderStocktake);
-document.getElementById("stk-sort").addEventListener("change", () => { stkHeaderSort = null; stkPage = 1; renderStocktake(); });
 
 // 検索条件やページに関わらず、全商品を対象に棚卸チェックの進捗を集計する
 function renderStocktakeProgress(idx) {
