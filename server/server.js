@@ -1279,7 +1279,8 @@ const DASHBOARD_PAGE = `<!doctype html>
   td input { font: inherit; font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 5px 6px; width: 78px; text-align: right; }
   td input:focus { outline: 2px solid var(--series-rev); outline-offset: 1px; background: var(--surface); }
   td input.wide-input { width: 160px; text-align: left; }
-  td input.wide-input.wider { width: 280px; }
+  td input.inventory-date-input { width: 112px; }
+  td input.inventory-note-input { width: 200px; }
   /* 数量入力欄の誤操作防止: 上下スピナーを非表示にする(WebKit系・Firefox両対応)。
      価格・為替等の金額入力には適用しない(qty-inputクラスを付けた要素のみ対象)。 */
   input.qty-input::-webkit-outer-spin-button,
@@ -1667,6 +1668,7 @@ const INV_NUM_COLS = ["在庫数(現物)","出品国数","US価格(USD)","US累�
 const INV_EDITABLE_TEXT = ["仕入日","備考"];
 const INV_EDITABLE_NUM = ["仕入価格(円)"];
 const INV_FIELD_KEY = { "仕入価格(円)": "仕入価格円", "仕入日": "仕入日", "仕入先": "仕入先", "備考": "備考" };
+const INV_DISPLAY_LABEL = { "仕入日": "販売開始日" };
 let orderRows = [];
 let invRows = [];
 let invHeaders = [];
@@ -2497,7 +2499,8 @@ function renderInventory() {
   thead.innerHTML = checkAllTh + displayOrder.map((i, pos) => {
     const isSortCol = i === invSort.idx;
     const arrow = isSortCol ? '<span class="sort-arrow">' + (invSort.dir === 1 ? "▲" : "▼") + '</span>' : "";
-    return '<th class="sortable ' + (INV_NUM_COLS.includes(invHeaders[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '" data-idx="' + i + '">' + invHeaders[i] + arrow + '</th>';
+    const label = INV_DISPLAY_LABEL[invHeaders[i]] || invHeaders[i];
+    return '<th class="sortable ' + (INV_NUM_COLS.includes(invHeaders[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '" data-idx="' + i + '">' + label + arrow + '</th>';
   }).join("");
   thead.querySelectorAll("th.sortable").forEach((th) => {
     th.addEventListener("click", () => {
@@ -2573,7 +2576,7 @@ function renderInventory() {
       } else if (INV_EDITABLE_TEXT.includes(h)) {
         const inp = document.createElement("input");
         inp.type = "text";
-        inp.className = h === "備考" ? "wide-input wider" : "wide-input";
+        inp.className = h === "仕入日" ? "wide-input inventory-date-input" : "wide-input inventory-note-input";
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
         inp.addEventListener("change", () => saveInventoryField(tr, pid, h, inp.value, row));
         td.appendChild(inp);
