@@ -25,7 +25,7 @@ const { createSalesWorkbookLoaders } = require("./salesWorkbookStore");
 const { resolveOrderLineTransaction } = require("./manualOrderResolution");
 const { editManagedOrderTransaction, deleteManagedOrdersTransaction } = require("./managedOrderMutation");
 const { fetchMonthlyAverageRate, isMonthlyAveragePublished, BOJ_SOURCE_LABEL } = require("./exchangeRateFetcher");
-const { jstYearMonth, isSameJstDate } = require("./jstDate");
+const { jstDateString, jstYearMonth, isSameJstDate } = require("./jstDate");
 const {
   getRate: getExchangeRate, saveProvisionalRate: saveProvisionalExchangeRate, confirmRate: confirmExchangeRate,
   getNoDataCheckLog, recordNoDataCheck,
@@ -824,8 +824,9 @@ async function handlePatchInventory(req, res) {
   }
   let realStockValue; // undefined = 対象外
   if ("リアル在庫" in body) {
-    realStockValue = numOrNull(body["リアル在庫"]);
-    if (realStockValue === null) return sendJson(res, 400, { error: "リアル在庫 は数値で指定してください" });
+    const validated = realInv.validateManualRealStock(body["リアル在庫"]);
+    if (!validated.ok) return sendJson(res, 400, { error: validated.error });
+    realStockValue = validated.value;
   }
 
   // 在庫管理表.xlsxへの読み込み→変更→書き込みは1リクエストにつき1回だけ行う
@@ -843,28 +844,45 @@ async function handlePatchInventory(req, res) {
       return { found: true, blockedStocktakeEdit: true };
     }
 
+    let writeNeeded = false;
     if ("仕入価格円" in body) {
       const v = numOrNull(body["仕入価格円"]);
       row.getCell(INV_COL.仕入価格).value = v === null ? "" : v;
+      writeNeeded = true;
     }
-    if ("仕入日" in body) row.getCell(INV_COL.仕入日).value = body["仕入日"];
-    if ("仕入先" in body) row.getCell(INV_COL.仕入先).value = body["仕入先"];
-    if ("備考" in body) row.getCell(INV_COL.備考).value = body["備考"];
-    if ("日本語商品名" in body) row.getCell(INV_COL.日本語商品名).value = body["日本語商品名"];
+    if ("仕入日" in body) { row.getCell(INV_COL.仕入日).value = body["仕入日"]; writeNeeded = true; }
+    if ("仕入先" in body) { row.getCell(INV_COL.仕入先).value = body["仕入先"]; writeNeeded = true; }
+    if ("備考" in body) { row.getCell(INV_COL.備考).value = body["備考"]; writeNeeded = true; }
+    if ("日本語商品名" in body) { row.getCell(INV_COL.日本語商品名).value = body["日本語商品名"]; writeNeeded = true; }
 
     // リアル在庫・棚卸入力数量は当社独自管理の値のため、専用の変更ロジック(realInventory.js)を
     // 同じトランザクション内で(読み込み・書き込みを増やさずに)適用する。
     let realStockChange = null;
     if (realStockValue !== undefined) {
-      realStockChange = realInv.applyRealStockToRow(row, INV_COL, realStockValue, body["リアル在庫確認日"] || null);
+      const current = row.getCell(INV_COL.リアル在庫).value;
+      const hasCurrent = current !== null && current !== undefined && current !== "";
+      if (!hasCurrent || Number(current) !== realStockValue) {
+        realStockChange = realInv.applyRealStockToRow(row, INV_COL, realStockValue, body["リアル在庫確認日"] || jstDateString());
+        writeNeeded = true;
+      }
     }
     if (stagedQty !== undefined) {
       realInv.applyStagedQtyToRow(row, INV_COL, stagedQty);
+      writeNeeded = true;
     }
 
-    row.commit();
-    await atomicWriteWorkbook(wb, INVENTORY_PATH);
-    return { found: true, name: row.getCell(INV_COL.商品名).value, realStockChange };
+    if (writeNeeded) {
+      row.commit();
+      await atomicWriteWorkbook(wb, INVENTORY_PATH);
+    }
+    return {
+      found: true,
+      name: row.getCell(INV_COL.商品名).value,
+      realStockChange,
+      realStock: row.getCell(INV_COL.リアル在庫).value,
+      realStockConfirmedAt: row.getCell(INV_COL.リアル在庫確認日).value,
+      realStockUnchanged: realStockValue !== undefined && !realStockChange,
+    };
   });
 
   if (!outcome.found) return sendJson(res, 404, { error: "該当する商品IDが見つかりません" });
@@ -878,7 +896,12 @@ async function handlePatchInventory(req, res) {
     });
   }
 
-  sendJson(res, 200, { status: "ok", 商品ID: pid });
+  sendJson(res, 200, {
+    status: outcome.realStockUnchanged ? "unchanged" : "ok",
+    商品ID: pid,
+    リアル在庫: outcome.realStock,
+    リアル在庫確認日: outcome.realStockConfirmedAt || null,
+  });
 }
 
 async function handleImportInventory(req, res) {
@@ -1281,6 +1304,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   td input.wide-input { width: 160px; text-align: left; }
   td input.inventory-date-input { width: 112px; }
   td input.inventory-note-input { width: 200px; }
+  td input.real-stock-input { width: 72px; }
   /* 数量入力欄の誤操作防止: 上下スピナーを非表示にする(WebKit系・Firefox両対応)。
      価格・為替等の金額入力には適用しない(qty-inputクラスを付けた要素のみ対象)。 */
   input.qty-input::-webkit-outer-spin-button,
@@ -2573,7 +2597,21 @@ function renderInventory() {
       const isNum = INV_NUM_COLS.includes(h);
       td.className = (td.className ? td.className + " " : "") + (isNum ? "num" : "");
       if (i === stockIdx && (row[i] === 0 || row[i] === null || row[i] === undefined)) td.className += " stock-zero";
-      if (INV_EDITABLE_NUM.includes(h)) {
+      if (h === "リアル在庫") {
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.min = "0";
+        inp.step = "1";
+        inp.className = "qty-input real-stock-input";
+        inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
+        inp.dataset.savedValue = inp.value;
+        inp.addEventListener("input", () => inp.setCustomValidity(""));
+        inp.addEventListener("change", () => saveManualRealStock(tr, pid, inp, async (data) => {
+          row[i] = data.リアル在庫;
+          await loadDiscrepancies();
+        }));
+        td.appendChild(inp);
+      } else if (INV_EDITABLE_NUM.includes(h)) {
         const inp = document.createElement("input");
         inp.type = "number"; inp.step = "any";
         inp.value = row[i] === null || row[i] === undefined ? "" : row[i];
@@ -2676,6 +2714,75 @@ async function saveInventoryField(tr, pid, header, value, row, onSuccess) {
   } catch (e) {
     tr.className = "error";
   }
+}
+
+function parseManualRealStockInput(value) {
+  const text = String(value);
+  if (!/^(0|[1-9]\\d*)$/.test(text)) return { ok: false, error: "リアル在庫は0以上の整数で入力してください" };
+  const quantity = Number(text);
+  if (!Number.isSafeInteger(quantity)) return { ok: false, error: "リアル在庫は安全に扱える整数で入力してください" };
+  return { ok: true, value: quantity };
+}
+
+function updateInventoryRealStockCache(pid, quantity, confirmedAt) {
+  const pidIdx = invHeaders.indexOf("商品ID");
+  const realIdx = invHeaders.indexOf("リアル在庫");
+  const confirmedIdx = invHeaders.indexOf("リアル在庫確認日");
+  const target = invRows.find((row) => String(row[pidIdx]) === String(pid));
+  if (!target) return;
+  if (realIdx !== -1) target[realIdx] = quantity;
+  if (confirmedIdx !== -1 && confirmedAt) target[confirmedIdx] = confirmedAt;
+}
+
+async function saveManualRealStock(tr, pid, input, onSuccess) {
+  const previous = input.dataset.savedValue;
+  const parsed = parseManualRealStockInput(input.value);
+  if (!parsed.ok) {
+    input.value = previous;
+    input.setCustomValidity(parsed.error);
+    input.reportValidity();
+    tr.classList.add("error");
+    setTimeout(() => tr.classList.remove("error"), 1500);
+    return false;
+  }
+
+  tr.classList.remove("saved", "error");
+  tr.classList.add("saving");
+  input.disabled = true;
+  let data;
+  try {
+    const r = await fetch("/api/inventory", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + getToken() },
+      body: JSON.stringify({ 商品ID: pid, リアル在庫: parsed.value }),
+    });
+    data = await r.json();
+    if (!r.ok) throw new Error(data.error || "リアル在庫を保存できませんでした");
+    const savedValue = Number(data.リアル在庫);
+    input.value = String(savedValue);
+    input.dataset.savedValue = input.value;
+    updateInventoryRealStockCache(pid, savedValue, data.リアル在庫確認日);
+    tr.classList.remove("saving");
+    tr.classList.add("saved");
+    setTimeout(() => tr.classList.remove("saved"), 1500);
+  } catch (e) {
+    input.value = previous;
+    input.setCustomValidity(e.message || "リアル在庫を保存できませんでした");
+    input.reportValidity();
+    tr.classList.remove("saving");
+    tr.classList.add("error");
+    return false;
+  } finally {
+    input.disabled = false;
+  }
+  if (onSuccess) {
+    try {
+      await onSuccess(data);
+    } catch (e) {
+      console.error("リアル在庫保存後の画面更新に失敗しました", e);
+    }
+  }
+  return true;
 }
 
 document.getElementById("ord-q").addEventListener("input", renderOrders);
@@ -2844,7 +2951,20 @@ function renderDiscrepancies(rows) {
     } else {
       nameTd.textContent = name;
     }
-    appendTextCell(Number(row.リアル在庫).toLocaleString("ja-JP"), "num");
+    const realTd = appendTextCell("", "num");
+    const realInput = document.createElement("input");
+    realInput.type = "number";
+    realInput.min = "0";
+    realInput.step = "1";
+    realInput.className = "qty-input real-stock-input";
+    realInput.value = String(row.リアル在庫);
+    realInput.dataset.savedValue = realInput.value;
+    realInput.addEventListener("input", () => realInput.setCustomValidity(""));
+    realInput.addEventListener("change", () => saveManualRealStock(tr, row.商品ID, realInput, async () => {
+      renderInventory();
+      await loadDiscrepancies();
+    }));
+    realTd.appendChild(realInput);
     for (const site of ["US", "UK", "AU"]) {
       const country = bySite(row, site);
       appendTextCell(country ? Number(country.value).toLocaleString("ja-JP") : "-",

@@ -74,6 +74,15 @@ function validateStocktakeQty(raw) {
   return { ok: true, value: raw };
 }
 
+// 人間が画面から直接設定するリアル在庫は、0以上のJSON整数だけを許可する。
+// 注文処理の差分適用ではマイナス在庫を許す既存仕様があるため、この検証は手動設定経路専用とする。
+function validateManualRealStock(raw) {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return { ok: false, error: "リアル在庫は数値で指定してください" };
+  if (!Number.isSafeInteger(raw)) return { ok: false, error: "リアル在庫は安全に扱える整数で指定してください" };
+  if (raw < 0) return { ok: false, error: "リアル在庫は0以上の整数で指定してください" };
+  return { ok: true, value: raw };
+}
+
 // リアル在庫を絶対値で更新する純粋な変更処理(読み込み・書き込みは呼び出し側のトランザクションで行う)。
 // 確認日は自動的に今日にする(明示指定があればそちらを優先)。
 function applyRealStockToRow(row, INV_COL, value, confirmedAt) {
@@ -350,6 +359,7 @@ module.exports = {
   findInventoryRow,
   adjustRealStock,
   validateStocktakeQty,
+  validateManualRealStock,
   applyRealStockToRow,
   applyStagedQtyToRow,
   isStocktakeConfirmed,
