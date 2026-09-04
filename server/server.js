@@ -2981,8 +2981,8 @@ document.getElementById("replenishment-approve-all-btn").addEventListener("click
   const totalQuantity = Number(button.dataset.totalQuantity || 0);
   const mismatchCount = Number(button.dataset.usMismatchCount || 0);
   let message = "未処理候補 " + candidateCount + "件（" + productCount + "商品、合計 +" + totalQuantity + "）を一括承認します。";
-  if (mismatchCount) message += "\n現在US在庫が候補作成時の同期後US在庫と異なる候補が " + mismatchCount + "件あります。";
-  message += "\nサーバー側で最新の未処理候補を再確認して処理します。よろしいですか？";
+  if (mismatchCount) message += "\\n現在US在庫が候補作成時の同期後US在庫と異なる候補が " + mismatchCount + "件あります。";
+  message += "\\nサーバー側で最新の未処理候補を再確認して処理します。よろしいですか？";
   if (!confirm(message)) return;
   const oldY = window.scrollY;
   const discrepancyScroll = captureDiscrepancyScroll();
