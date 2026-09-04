@@ -135,6 +135,28 @@ async function updateHistoryState({ loadInventoryWorkbookLocked, INVENTORY_PATH,
   });
 }
 
+async function updateBulkHistoryState({ loadInventoryWorkbookLocked, INVENTORY_PATH, eventId, state }) {
+  return withInventoryLock(async () => {
+    const workbook = await loadInventoryWorkbookLocked();
+    const ws = workbook.getWorksheet(REPLENISHMENT_CANDIDATES_SHEET);
+    if (!ws) return;
+    const columns = columnMap(ws);
+    let changed = false;
+    for (let rowNumber = 2; rowNumber <= ws.rowCount; rowNumber++) {
+      const found = { row: ws.getRow(rowNumber), columns };
+      if (cellValue(found, "状態") !== REPLENISHMENT_STATUS.APPROVED
+        || cellValue(found, "処理理由") !== "補充候補一括承認"
+        || cellValue(found, "在庫履歴イベントID") !== eventId) continue;
+      setCell(found, "在庫履歴記録状態", state);
+      found.row.commit();
+      changed = true;
+    }
+    if (!changed) return;
+    validateProtectedSheets(workbook, { allowMissing: true });
+    await atomicWriteWorkbook(workbook, INVENTORY_PATH);
+  });
+}
+
 async function recordApprovalHistory(deps, approval) {
   try {
     await (deps.appendHistoryOnce || appendHistoryOnce)(deps.HISTORY_PATH, {
@@ -169,6 +191,7 @@ async function approveCandidate(deps) {
         alreadyProcessed: true, candidateId: deps.candidateId,
         eventId: String(cellValue(found, "在庫履歴イベントID") || ""),
         historyStatus: String(cellValue(found, "在庫履歴記録状態") || ""),
+        processingReason: String(cellValue(found, "処理理由") || ""),
         productId, productName: product ? product.getCell(deps.INV_COL.商品名).value : "",
         before: Number(cellValue(found, "適用前リアル在庫")), after: Number(cellValue(found, "適用後リアル在庫")),
         processedAt: cellValue(found, "処理日時"),
@@ -211,8 +234,152 @@ async function approveCandidate(deps) {
     await atomicWriteWorkbook(workbook, deps.INVENTORY_PATH);
     return { candidateId: deps.candidateId, eventId, productId, productName: product.getCell(deps.INV_COL.商品名).value, quantity, before, after, processedAt: deps.processedAt };
   });
+  // 一括承認のイベントは商品単位の集約履歴である。個別APIから候補1件分の履歴を
+  // 再試行すると集約内容が欠けるため、一括APIだけが履歴再試行を担当する。
+  if (outcome.alreadyProcessed && outcome.processingReason === "補充候補一括承認") return outcome;
   if (outcome.alreadyProcessed && outcome.historyStatus === HISTORY_RECORDED) return outcome;
   return recordApprovalHistory(deps, outcome);
+}
+
+function collectPendingBulkPlan(workbook, deps) {
+  const ws = workbook.getWorksheet(REPLENISHMENT_CANDIDATES_SHEET);
+  if (!ws) return { candidates: [], products: [] };
+  const usItemIdColumn = requiredInventoryColumn(deps.INV_HEADERS, "US_出品ID");
+  const productRows = inventoryRowsByPid(workbook, deps.INV_COL);
+  const seenProducts = new Set();
+  const inventorySheet = workbook.getWorksheet("在庫管理表") || workbook.worksheets[0];
+  for (let rowNumber = 2; rowNumber <= inventorySheet.rowCount; rowNumber++) {
+    const pid = String(inventorySheet.getRow(rowNumber).getCell(deps.INV_COL.商品ID).value || "").trim();
+    if (!pid) continue;
+    if (seenProducts.has(pid)) throw error(409, `商品ID「${pid}」が重複しているため一括承認できません`);
+    seenProducts.add(pid);
+  }
+  const columns = columnMap(ws);
+  const candidates = [];
+  const groups = new Map();
+  for (let rowNumber = 2; rowNumber <= ws.rowCount; rowNumber++) {
+    const found = { row: ws.getRow(rowNumber), columns };
+    if (String(cellValue(found, "状態") || "").trim() !== REPLENISHMENT_STATUS.PENDING) continue;
+    const candidateId = String(cellValue(found, "補充候補ID") || "").trim();
+    assertCandidateId(candidateId);
+    const productId = String(cellValue(found, "商品ID") || "").trim();
+    const usItemId = String(cellValue(found, "US出品ID") || "").trim();
+    const quantity = Number(cellValue(found, "補充候補数量"));
+    const product = productRows.get(productId);
+    if (!product) throw error(409, `商品ID「${productId}」が存在しないため一括承認を中止しました`);
+    const currentUsItemId = String(product.getCell(usItemIdColumn).value || "").trim();
+    if (currentUsItemId !== usItemId) throw error(409, `商品ID「${productId}」のUS出品IDが一致しないため一括承認を中止しました`);
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) throw error(409, `商品ID「${productId}」の補充候補数量が不正です`);
+    let group = groups.get(productId);
+    if (!group) {
+      const before = Number(product.getCell(deps.INV_COL.リアル在庫).value);
+      if (!Number.isSafeInteger(before) || before < 0) throw error(409, `商品ID「${productId}」の現在リアル在庫が不正です`);
+      group = { productId, product, productName: product.getCell(deps.INV_COL.商品名).value, before, total: 0, candidates: [] };
+      groups.set(productId, group);
+    }
+    const nextTotal = group.total + quantity;
+    if (!Number.isSafeInteger(nextTotal)) throw error(409, `商品ID「${productId}」の候補合計が安全な整数範囲を超えます`);
+    group.total = nextTotal;
+    group.candidates.push({ found, candidateId, quantity });
+    candidates.push({ found, candidateId, productId, quantity });
+  }
+  for (const group of groups.values()) {
+    group.after = group.before + group.total;
+    if (!Number.isSafeInteger(group.after)) throw error(409, `商品ID「${group.productId}」の加算後リアル在庫が安全な整数範囲を超えます`);
+  }
+  return { candidates, products: [...groups.values()] };
+}
+
+function collectOutstandingBulkHistories(workbook, INV_COL) {
+  const ws = workbook.getWorksheet(REPLENISHMENT_CANDIDATES_SHEET);
+  if (!ws) return [];
+  const productRows = inventoryRowsByPid(workbook, INV_COL);
+  const columns = columnMap(ws);
+  const events = new Map();
+  for (let rowNumber = 2; rowNumber <= ws.rowCount; rowNumber++) {
+    const found = { row: ws.getRow(rowNumber), columns };
+    if (cellValue(found, "状態") !== REPLENISHMENT_STATUS.APPROVED
+      || cellValue(found, "処理理由") !== "補充候補一括承認"
+      || cellValue(found, "在庫履歴記録状態") === HISTORY_RECORDED) continue;
+    const eventId = String(cellValue(found, "在庫履歴イベントID") || "");
+    if (!UUID_PATTERN.test(eventId)) continue;
+    const productId = String(cellValue(found, "商品ID") || "");
+    const before = Number(cellValue(found, "適用前リアル在庫"));
+    const after = Number(cellValue(found, "適用後リアル在庫"));
+    let event = events.get(eventId);
+    if (!event) {
+      const product = productRows.get(productId);
+      event = { eventId, productId, productName: product ? product.getCell(INV_COL.商品名).value : "", before, after, processedAt: cellValue(found, "処理日時") };
+      events.set(eventId, event);
+    } else {
+      event.before = Math.min(event.before, before);
+      event.after = Math.max(event.after, after);
+    }
+  }
+  return [...events.values()];
+}
+
+async function recordBulkHistories(deps, histories) {
+  const results = [];
+  for (const history of histories) {
+    try {
+      await (deps.appendHistoryOnce || appendHistoryOnce)(deps.HISTORY_PATH, {
+        pid: history.productId, name: history.productName, before: history.before, after: history.after,
+        reason: "補充候補一括承認", at: history.processedAt,
+      }, history.eventId);
+      await updateBulkHistoryState({ ...deps, eventId: history.eventId, state: HISTORY_RECORDED });
+      results.push({ eventId: history.eventId, status: HISTORY_RECORDED });
+    } catch (_) {
+      try { await updateBulkHistoryState({ ...deps, eventId: history.eventId, state: HISTORY_FAILED }); } catch (_) {}
+      results.push({ eventId: history.eventId, status: HISTORY_FAILED });
+    }
+  }
+  return results;
+}
+
+async function approveAllCandidates(deps) {
+  const outcome = await withInventoryLock(async () => {
+    const workbook = await deps.loadInventoryWorkbookLocked();
+    validateProtectedSheets(workbook, { allowMissing: true });
+    const plan = collectPendingBulkPlan(workbook, deps);
+    const processedAt = deps.processedAt;
+    for (const group of plan.products) {
+      const eventId = crypto.randomUUID();
+      group.eventId = eventId;
+      group.product.getCell(deps.INV_COL.リアル在庫).value = group.after;
+      group.product.commit();
+      let running = group.before;
+      for (const candidate of group.candidates) {
+        const candidateAfter = running + candidate.quantity;
+        setCell(candidate.found, "状態", REPLENISHMENT_STATUS.APPROVED);
+        setCell(candidate.found, "処理日時", processedAt);
+        setCell(candidate.found, "処理者", deps.actor);
+        setCell(candidate.found, "適用数量", candidate.quantity);
+        setCell(candidate.found, "適用前リアル在庫", running);
+        setCell(candidate.found, "適用後リアル在庫", candidateAfter);
+        setCell(candidate.found, "処理理由", "補充候補一括承認");
+        setCell(candidate.found, "在庫履歴記録状態", HISTORY_PENDING);
+        setCell(candidate.found, "在庫履歴イベントID", eventId);
+        candidate.found.row.commit();
+        running = candidateAfter;
+      }
+    }
+    if (plan.candidates.length) {
+      validateProtectedSheets(workbook, { allowMissing: true });
+      await atomicWriteWorkbook(workbook, deps.INVENTORY_PATH);
+    }
+    const outstanding = collectOutstandingBulkHistories(workbook, deps.INV_COL);
+    return {
+      approvedCandidateCount: plan.candidates.length,
+      productCount: plan.products.length,
+      totalQuantity: plan.products.reduce((sum, group) => sum + group.total, 0),
+      products: plan.products.map((group) => ({ productId: group.productId, before: group.before, after: group.after, quantity: group.total })),
+      outstanding,
+    };
+  });
+  const historyResults = await recordBulkHistories(deps, outcome.outstanding);
+  const { outstanding, ...summary } = outcome;
+  return { ...summary, historyResults, historyWarningCount: historyResults.filter((result) => result.status === HISTORY_FAILED).length };
 }
 
 async function rejectCandidate(deps) {
@@ -237,5 +404,5 @@ async function rejectCandidate(deps) {
 module.exports = {
   HISTORY_PENDING, HISTORY_RECORDED, HISTORY_FAILED,
   listPendingCandidates, approveCandidate, rejectCandidate, invalidatePendingCandidates,
-  requiredInventoryColumn,
+  approveAllCandidates, requiredInventoryColumn,
 };

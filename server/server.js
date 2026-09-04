@@ -1071,6 +1071,14 @@ async function handleRejectReplenishmentCandidate(req, res) {
   sendJson(res, 200, { status: result.alreadyProcessed ? "already_processed" : "rejected", ...result });
 }
 
+async function handleApproveAllReplenishmentCandidates(req, res) {
+  const result = await replenishment.approveAllCandidates({
+    loadInventoryWorkbookLocked, INVENTORY_PATH, HISTORY_PATH, INV_HEADERS, INV_COL,
+    actor: "画面操作", processedAt: new Date().toISOString(),
+  });
+  sendJson(res, 200, { status: "ok", ...result });
+}
+
 async function handleListUnresolvedOrderLines(req, res) {
   const workbook = await loadInventoryWorkbook();
   validateProtectedSheets(workbook, { allowMissing: true });
@@ -1601,7 +1609,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>補充候補</h2>
       <p class="desc">eBay US在庫の増加を検知した未処理候補です。承認すると、現在のリアル在庫へ候補数量だけを加算します。</p>
       <div class="panel-body">
-        <div class="browser-toolbar"><button class="btn" id="replenishment-refresh-btn">再読み込み</button><span class="result-count" id="replenishment-count"></span><span class="hint" id="replenishment-status"></span></div>
+        <div class="browser-toolbar"><button class="btn" id="replenishment-refresh-btn">再読み込み</button><button class="btn" id="replenishment-approve-all-btn" disabled>未処理候補を一括承認</button><span class="result-count" id="replenishment-count"></span><span class="hint" id="replenishment-status"></span></div>
         <div class="table-scroll"><table>
           <thead><tr><th>商品ID</th><th>商品名</th><th>US出品ID</th><th class="num">同期前US在庫</th><th class="num">同期後US在庫</th><th class="num">現在US在庫</th><th class="num">補充候補数量</th><th class="num">現在のリアル在庫</th><th>検知日時</th><th>状態</th><th>操作</th></tr></thead>
           <tbody id="replenishment-tbody"></tbody>
@@ -2908,6 +2916,12 @@ async function loadReplenishmentCandidates(options) {
 
 function renderReplenishmentCandidates(rows) {
   document.getElementById("replenishment-count").textContent = rows.length.toLocaleString("ja-JP") + " 件";
+  const approveAllButton = document.getElementById("replenishment-approve-all-btn");
+  approveAllButton.disabled = rows.length === 0;
+  approveAllButton.dataset.candidateCount = String(rows.length);
+  approveAllButton.dataset.productCount = String(new Set(rows.map((row) => String(row.productId))).size);
+  approveAllButton.dataset.totalQuantity = String(rows.reduce((sum, row) => sum + Number(row.candidateQuantity || 0), 0));
+  approveAllButton.dataset.usMismatchCount = String(rows.filter((row) => row.currentUsStock !== null && row.currentUsStock !== undefined && Number(row.currentUsStock) !== Number(row.afterUsStock)).length);
   const tbody = document.getElementById("replenishment-tbody");
   if (!rows.length) { showReplenishmentMessage("未処理の補充候補はありません"); return; }
   tbody.replaceChildren();
@@ -2959,6 +2973,35 @@ async function processReplenishmentCandidate(candidate, action, buttons) {
 }
 
 document.getElementById("replenishment-refresh-btn").addEventListener("click", () => loadReplenishmentCandidates());
+document.getElementById("replenishment-approve-all-btn").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const candidateCount = Number(button.dataset.candidateCount || 0);
+  if (!candidateCount) return;
+  const productCount = Number(button.dataset.productCount || 0);
+  const totalQuantity = Number(button.dataset.totalQuantity || 0);
+  const mismatchCount = Number(button.dataset.usMismatchCount || 0);
+  let message = "未処理候補 " + candidateCount + "件（" + productCount + "商品、合計 +" + totalQuantity + "）を一括承認します。";
+  if (mismatchCount) message += "\n現在US在庫が候補作成時の同期後US在庫と異なる候補が " + mismatchCount + "件あります。";
+  message += "\nサーバー側で最新の未処理候補を再確認して処理します。よろしいですか？";
+  if (!confirm(message)) return;
+  const oldY = window.scrollY;
+  const discrepancyScroll = captureDiscrepancyScroll();
+  button.disabled = true;
+  const status = document.getElementById("replenishment-status");
+  status.textContent = "一括承認中...";
+  try {
+    const response = await fetch("/api/replenishment-candidates/approve-all", { method: "POST", headers: { Authorization: "Bearer " + getToken() } });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || String(response.status));
+    status.textContent = data.approvedCandidateCount + "件（" + data.productCount + "商品、合計 +" + data.totalQuantity + "）を承認しました" + (data.historyWarningCount ? "（履歴記録失敗 " + data.historyWarningCount + "件）" : "");
+    await loadAll();
+    await loadReplenishmentCandidates({ preserve: true });
+    await loadDiscrepancies(discrepancyScroll);
+  } catch (error) {
+    status.textContent = "エラー: " + error.message;
+    button.disabled = false;
+  } finally { window.scrollTo(0, Math.min(oldY, Math.max(0, document.documentElement.scrollHeight - window.innerHeight))); }
+});
 
 async function loadUnlinked() {
   const tbody = document.getElementById("unlinked-tbody");
@@ -4033,7 +4076,7 @@ const server = http.createServer(async (req, res) => {
     "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild",
     "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/stocktake/reset-checks", "/api/inventory/stocktake/undo", "/api/inventory/history",
     "/api/order-lines/unresolved", "/api/order-lines/resolve",
-    "/api/replenishment-candidates", "/api/replenishment-candidates/approve", "/api/replenishment-candidates/reject",
+    "/api/replenishment-candidates", "/api/replenishment-candidates/approve", "/api/replenishment-candidates/reject", "/api/replenishment-candidates/approve-all",
     "/api/closing/checklist", "/api/closing/export", "/api/closing/snapshot", "/api/closing/snapshots",
     "/api/exchange-rate", "/api/exchange-rate/refresh", "/api/exchange-rate/confirm-preview", "/api/exchange-rate/confirm",
   ];
@@ -4073,6 +4116,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/replenishment-candidates") return await handleListReplenishmentCandidates(req, res);
     if (req.method === "POST" && pathname === "/api/replenishment-candidates/approve") return await handleApproveReplenishmentCandidate(req, res);
     if (req.method === "POST" && pathname === "/api/replenishment-candidates/reject") return await handleRejectReplenishmentCandidate(req, res);
+    if (req.method === "POST" && pathname === "/api/replenishment-candidates/approve-all") return await handleApproveAllReplenishmentCandidates(req, res);
     if (req.method === "GET" && pathname === "/api/order-lines/unresolved") return await handleListUnresolvedOrderLines(req, res);
     if (req.method === "POST" && pathname === "/api/order-lines/resolve") return await handleResolveOrderLine(req, res);
     if (req.method === "GET" && pathname === "/api/closing/checklist") return await handleClosingChecklist(req, res);
