@@ -2790,17 +2790,50 @@ document.getElementById("ord-q").addEventListener("input", renderOrders);
 document.getElementById("inv-q").addEventListener("input", renderInventory);
 
 // ---- 相違 ----
-async function loadDiscrepancies() {
+function captureDiscrepancyScroll(productId) {
   const tbody = document.getElementById("disc-tbody");
-  tbody.innerHTML = "<tr><td colspan='7'>読み込み中...</td></tr>";
+  const scroller = tbody.closest(".table-scroll");
+  const target = Array.from(tbody.querySelectorAll("tr")).find((tr) => tr.dataset.productId === String(productId));
+  return {
+    productId: String(productId),
+    windowY: window.scrollY,
+    tableScrollTop: scroller ? scroller.scrollTop : 0,
+    targetTop: target ? target.getBoundingClientRect().top : null,
+  };
+}
+
+function restoreDiscrepancyScroll(state) {
+  if (!state) return;
+  const tbody = document.getElementById("disc-tbody");
+  const scroller = tbody.closest(".table-scroll");
+  const target = Array.from(tbody.querySelectorAll("tr")).find((tr) => tr.dataset.productId === state.productId);
+  if (scroller) {
+    if (target && state.targetTop !== null) {
+      scroller.scrollTop += target.getBoundingClientRect().top - state.targetTop;
+    } else {
+      scroller.scrollTop = Math.min(state.tableScrollTop, Math.max(0, scroller.scrollHeight - scroller.clientHeight));
+    }
+  }
+  window.scrollTo(0, Math.min(state.windowY, Math.max(0, document.documentElement.scrollHeight - window.innerHeight)));
+}
+
+async function loadDiscrepancies(scrollState) {
+  const tbody = document.getElementById("disc-tbody");
+  if (!scrollState) tbody.innerHTML = "<tr><td colspan='7'>読み込み中...</td></tr>";
   const token = getToken();
   try {
     const r = await fetch("/api/inventory/discrepancies", { headers: { Authorization: "Bearer " + token } });
     const data = await r.json();
-    if (!r.ok) { tbody.innerHTML = "<tr><td colspan='7'>エラー: " + (data.error || r.status) + "</td></tr>"; return; }
+    if (!r.ok) {
+      if (!scrollState) tbody.innerHTML = "<tr><td colspan='7'>エラー: " + (data.error || r.status) + "</td></tr>";
+      restoreDiscrepancyScroll(scrollState);
+      return;
+    }
     renderDiscrepancies(data.rows);
+    restoreDiscrepancyScroll(scrollState);
   } catch (e) {
-    tbody.innerHTML = "<tr><td colspan='7'>通信エラー: " + e.message + "</td></tr>";
+    if (!scrollState) tbody.innerHTML = "<tr><td colspan='7'>通信エラー: " + e.message + "</td></tr>";
+    restoreDiscrepancyScroll(scrollState);
   }
   loadUnlinked();
 }
@@ -2929,6 +2962,7 @@ function renderDiscrepancies(rows) {
   tbody.replaceChildren();
   displayRows.forEach((row) => {
     const tr = document.createElement("tr");
+    tr.dataset.productId = String(row.商品ID);
     if (row.unconfirmed) tr.className = "row-unconfirmed";
     const appendTextCell = (value, className) => {
       const td = document.createElement("td");
@@ -2963,8 +2997,9 @@ function renderDiscrepancies(rows) {
     realInput.dataset.savedValue = realInput.value;
     realInput.addEventListener("input", () => realInput.setCustomValidity(""));
     realInput.addEventListener("change", () => saveManualRealStock(tr, row.商品ID, realInput, async () => {
+      const scrollState = captureDiscrepancyScroll(row.商品ID);
       renderInventory();
-      await loadDiscrepancies();
+      await loadDiscrepancies(scrollState);
     }));
     realTd.appendChild(realInput);
     for (const site of ["US", "UK", "AU"]) {
@@ -2977,7 +3012,7 @@ function renderDiscrepancies(rows) {
   });
 }
 renderDiscrepancyHead();
-document.getElementById("disc-refresh-btn").addEventListener("click", loadDiscrepancies);
+document.getElementById("disc-refresh-btn").addEventListener("click", () => loadDiscrepancies());
 
 // ---- 棚卸 ----
 const STK_PAGE_SIZE = 300;
