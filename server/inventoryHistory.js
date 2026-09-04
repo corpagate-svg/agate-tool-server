@@ -64,6 +64,38 @@ async function appendHistory(HISTORY_PATH, entry) {
   });
 }
 
+// 別Workbook側で先に確定したイベントの履歴を安全に再試行するため、関連注文番号欄を
+// イベントIDとして利用して「未記録なら1回だけ」追記する。履歴専用lock内で検索と保存を
+// 一続きに行うので、同時再試行でも同じイベントを重複記録しない。
+async function appendHistoryOnce(HISTORY_PATH, entry, eventId) {
+  if (!eventId) throw new Error("在庫履歴イベントIDは必須です");
+  return withHistoryLock(async () => {
+    const wb = await loadHistoryWorkbook(HISTORY_PATH);
+    const ws = wb.getWorksheet("在庫変更履歴");
+    for (let rowNumber = 2; rowNumber <= ws.rowCount; rowNumber++) {
+      if (String(ws.getRow(rowNumber).getCell(8).value || "") === String(eventId)) {
+        return { appended: false, alreadyExists: true };
+      }
+    }
+    const before = entry.before === undefined || entry.before === null ? "" : entry.before;
+    const after = entry.after === undefined || entry.after === null ? "" : entry.after;
+    const diff = (typeof before === "number" && typeof after === "number") ? after - before : "";
+    ws.addRow([
+      entry.at || new Date().toISOString(), entry.pid || "", entry.name || "", before, after, diff,
+      entry.reason || "", String(eventId),
+    ]);
+    const tmpPath = `${HISTORY_PATH}.${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tmp`;
+    try {
+      await wb.xlsx.writeFile(tmpPath);
+      fs.renameSync(tmpPath, HISTORY_PATH);
+    } catch (err) {
+      cleanupTmp(tmpPath);
+      throw err;
+    }
+    return { appended: true, alreadyExists: false };
+  });
+}
+
 async function listHistory(HISTORY_PATH, { pid } = {}) {
   if (!fs.existsSync(HISTORY_PATH)) return [];
   const wb = new ExcelJS.Workbook();
@@ -80,4 +112,4 @@ async function listHistory(HISTORY_PATH, { pid } = {}) {
   return rows;
 }
 
-module.exports = { appendHistory, listHistory, HISTORY_HEADERS };
+module.exports = { appendHistory, appendHistoryOnce, listHistory, HISTORY_HEADERS };

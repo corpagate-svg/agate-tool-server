@@ -261,6 +261,26 @@ function validateReplenishmentCandidatesSheet(ws) {
       for (const name of ["処理日時", "処理者", "適用数量", "適用前リアル在庫", "適用後リアル在庫", "処理理由", "在庫履歴記録状態", "在庫履歴イベントID"]) {
         if (!isUnset(value(name))) throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} ${rowNumber}行目の未処理候補に処理情報があります`);
       }
+    } else if (status === REPLENISHMENT_STATUS.APPROVED) {
+      const appliedQty = Number(value("適用数量"));
+      const beforeReal = Number(value("適用前リアル在庫"));
+      const afterReal = Number(value("適用後リアル在庫"));
+      const historyState = String(value("在庫履歴記録状態") || "").trim();
+      const historyEventId = String(value("在庫履歴イベントID") || "").trim();
+      if (isUnset(value("処理日時")) || !String(value("処理者") || "").trim() || !String(value("処理理由") || "").trim()
+        || !Number.isSafeInteger(appliedQty) || appliedQty !== candidateQty
+        || !Number.isSafeInteger(beforeReal) || beforeReal < 0
+        || !Number.isSafeInteger(afterReal) || afterReal !== beforeReal + appliedQty
+        || !new Set(["記録待ち", "記録済み", "記録失敗"]).has(historyState) || !uuidPattern.test(historyEventId)) {
+        throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} ${rowNumber}行目の承認記録が不正です`);
+      }
+    } else {
+      if (isUnset(value("処理日時")) || !String(value("処理者") || "").trim() || !String(value("処理理由") || "").trim()) {
+        throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} ${rowNumber}行目の処理記録が不足しています`);
+      }
+      for (const name of ["適用数量", "適用前リアル在庫", "適用後リアル在庫", "在庫履歴記録状態", "在庫履歴イベントID"]) {
+        if (!isUnset(value(name))) throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} ${rowNumber}行目の非承認候補に適用情報があります`);
+      }
     }
     if (ids.has(id)) throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} に重複した補充候補IDがあります: ${id}`);
     ids.add(id);

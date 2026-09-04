@@ -7,6 +7,7 @@ const fs = require("fs");
 const ExcelJS = require("exceljs");
 const { appendHistory } = require("./inventoryHistory");
 const { withInventoryLock, atomicWriteWorkbook } = require("./inventoryLock");
+const { invalidatePendingCandidates } = require("./replenishmentCandidates");
 
 // 棚卸確定時、この基準を超える差異は「異常値の可能性あり」として警告する。
 // 絶対値5個以上、または現在のリアル在庫の50%以上の変動のどちらか。
@@ -273,6 +274,9 @@ async function confirmStocktake({ loadInventoryWorkbook, INVENTORY_PATH, HISTORY
       if (targetSet && !targetSet.has(pid)) continue;
       const before = Number(row.getCell(INV_COL.リアル在庫).value) || 0;
       const after = Number(staged) || 0;
+      if (before !== after) {
+        invalidatePendingCandidates(wb, pid, { actor: "棚卸確定", reason: "棚卸確定によるリアル在庫変更により失効" });
+      }
       row.getCell(INV_COL.リアル在庫).value = after;
       row.getCell(INV_COL.リアル在庫確認日).value = date;
       row.getCell(INV_COL.棚卸入力数量).value = null;

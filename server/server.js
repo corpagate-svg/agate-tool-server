@@ -31,6 +31,7 @@ const {
   getNoDataCheckLog, recordNoDataCheck,
 } = require("./exchangeRateStore");
 const { finalizePreviousMonthFx } = require("./monthlyFxFinalize");
+const replenishment = require("./replenishmentCandidates");
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "";
@@ -863,6 +864,7 @@ async function handlePatchInventory(req, res) {
       const hasCurrent = current !== null && current !== undefined && current !== "";
       if (!hasCurrent || Number(current) !== realStockValue) {
         realStockChange = realInv.applyRealStockToRow(row, INV_COL, realStockValue, body["リアル在庫確認日"] || jstDateString());
+        replenishment.invalidatePendingCandidates(wb, pid, { actor: "画面操作", reason: "リアル在庫手動変更により失効" });
         writeNeeded = true;
       }
     }
@@ -1033,6 +1035,40 @@ async function handleInventoryHistory(req, res) {
   const pid = url.searchParams.get("商品ID") || undefined;
   const rows = await listHistory(HISTORY_PATH, { pid });
   sendJson(res, 200, { headers: require("./inventoryHistory").HISTORY_HEADERS, rows });
+}
+
+async function handleListReplenishmentCandidates(req, res) {
+  const rows = await replenishment.listPendingCandidates({ loadInventoryWorkbook, INV_COL });
+  sendJson(res, 200, { count: rows.length, rows });
+}
+
+async function readCandidateActionBody(req, res) {
+  try {
+    return JSON.parse((await readRawBody(req, 1024 * 10)).toString("utf8"));
+  } catch (e) {
+    sendJson(res, 400, { error: "リクエストの内容を読み取れませんでした" });
+    return null;
+  }
+}
+
+async function handleApproveReplenishmentCandidate(req, res) {
+  const body = await readCandidateActionBody(req, res);
+  if (!body) return;
+  const result = await replenishment.approveCandidate({
+    loadInventoryWorkbookLocked, INVENTORY_PATH, HISTORY_PATH, INV_COL,
+    candidateId: body.candidateId, actor: "画面操作", processedAt: new Date().toISOString(),
+  });
+  sendJson(res, 200, { status: result.alreadyProcessed ? "already_processed" : "approved", ...result });
+}
+
+async function handleRejectReplenishmentCandidate(req, res) {
+  const body = await readCandidateActionBody(req, res);
+  if (!body) return;
+  const result = await replenishment.rejectCandidate({
+    loadInventoryWorkbookLocked, INVENTORY_PATH, INV_COL,
+    candidateId: body.candidateId, actor: "画面操作", processedAt: new Date().toISOString(),
+  });
+  sendJson(res, 200, { status: result.alreadyProcessed ? "already_processed" : "rejected", ...result });
 }
 
 async function handleListUnresolvedOrderLines(req, res) {
@@ -1562,6 +1598,17 @@ const DASHBOARD_PAGE = `<!doctype html>
 
   <div class="tabpanel" id="tab-discrepancy">
     <div class="panel">
+      <h2>補充候補</h2>
+      <p class="desc">eBay US在庫の増加を検知した未処理候補です。承認すると、現在のリアル在庫へ候補数量だけを加算します。</p>
+      <div class="panel-body">
+        <div class="browser-toolbar"><button class="btn" id="replenishment-refresh-btn">再読み込み</button><span class="result-count" id="replenishment-count"></span><span class="hint" id="replenishment-status"></span></div>
+        <div class="table-scroll"><table>
+          <thead><tr><th>商品ID</th><th>商品名</th><th>US出品ID</th><th class="num">同期前US在庫</th><th class="num">同期後US在庫</th><th class="num">補充候補数量</th><th class="num">現在のリアル在庫</th><th>検知日時</th><th>状態</th><th>操作</th></tr></thead>
+          <tbody id="replenishment-tbody"></tbody>
+        </table></div>
+      </div>
+    </div>
+    <div class="panel">
       <h2>相違一覧</h2>
       <p class="desc">2種類の比較のうち<b>どちらか一方でもズレていれば</b>表示します: ①「リアル在庫」(当社独自管理の実在庫)と「US在庫」の比較、②「US在庫」を基準にした「UK/AU在庫」との比較(eBaymagの国間同期が壊れていないかのチェック)。出品されている国だけを比較します。まだ実地棚卸で確認していない行(リアル在庫確認日が空欄)は黄色で表示します。</p>
       <div class="panel-body">
@@ -1718,7 +1765,7 @@ document.querySelectorAll(".tabbtn").forEach(btn => {
     document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "orders") setupScrollMirror("ord-table-mirror", "ord-table-scroll");
     if (btn.dataset.tab === "inventory") setupScrollMirror("inv-table-mirror", "inv-table-scroll");
-    if (btn.dataset.tab === "discrepancy") loadDiscrepancies();
+    if (btn.dataset.tab === "discrepancy") { loadReplenishmentCandidates(); loadDiscrepancies(); }
     if (btn.dataset.tab === "stocktake") loadStocktakeList();
     if (btn.dataset.tab === "closing") loadSnapshotList();
     if (btn.dataset.tab === "sales") loadFxCard();
@@ -2838,6 +2885,81 @@ async function loadDiscrepancies(scrollState) {
   loadUnlinked();
 }
 
+function showReplenishmentMessage(message) {
+  const tbody = document.getElementById("replenishment-tbody");
+  const tr = document.createElement("tr");
+  const td = document.createElement("td");
+  td.colSpan = 10;
+  td.textContent = message;
+  tr.appendChild(td);
+  tbody.replaceChildren(tr);
+}
+
+async function loadReplenishmentCandidates(options) {
+  const preserve = options && options.preserve;
+  if (!preserve) showReplenishmentMessage("読み込み中...");
+  try {
+    const response = await fetch("/api/replenishment-candidates", { headers: { Authorization: "Bearer " + getToken() } });
+    const data = await response.json();
+    if (!response.ok) { showReplenishmentMessage("エラー: " + (data.error || response.status)); return; }
+    renderReplenishmentCandidates(data.rows || []);
+  } catch (error) { showReplenishmentMessage("通信エラー: " + error.message); }
+}
+
+function renderReplenishmentCandidates(rows) {
+  document.getElementById("replenishment-count").textContent = rows.length.toLocaleString("ja-JP") + " 件";
+  const tbody = document.getElementById("replenishment-tbody");
+  if (!rows.length) { showReplenishmentMessage("未処理の補充候補はありません"); return; }
+  tbody.replaceChildren();
+  rows.forEach((candidate) => {
+    const tr = document.createElement("tr");
+    tr.dataset.candidateId = String(candidate.candidateId || "");
+    const addText = (value, className) => {
+      const td = document.createElement("td");
+      if (className) td.className = className;
+      td.textContent = value === null || value === undefined ? "" : String(value);
+      tr.appendChild(td);
+      return td;
+    };
+    addText(candidate.productId); addText(candidate.productName, "truncate"); addText(candidate.usItemId);
+    addText(candidate.beforeUsStock, "num"); addText(candidate.afterUsStock, "num"); addText(candidate.candidateQuantity, "num");
+    addText(candidate.currentRealStock, "num"); addText(candidate.detectedAt ? String(candidate.detectedAt).replace("T", " ").slice(0, 19) : ""); addText(candidate.status);
+    const actionTd = addText("");
+    const approve = document.createElement("button"); approve.className = "btn"; approve.textContent = "承認";
+    const reject = document.createElement("button"); reject.className = "btn"; reject.textContent = "却下";
+    approve.addEventListener("click", () => processReplenishmentCandidate(candidate, "approve", [approve, reject]));
+    reject.addEventListener("click", () => processReplenishmentCandidate(candidate, "reject", [approve, reject]));
+    actionTd.append(approve, document.createTextNode(" "), reject);
+    tbody.appendChild(tr);
+  });
+}
+
+async function processReplenishmentCandidate(candidate, action, buttons) {
+  const verb = action === "approve" ? "承認" : "却下";
+  if (!confirm(candidate.productId + " の補充候補 +" + candidate.candidateQuantity + " を" + verb + "しますか？")) return;
+  const oldY = window.scrollY;
+  const discrepancyScroll = captureDiscrepancyScroll(candidate.productId);
+  buttons.forEach((button) => { button.disabled = true; });
+  const status = document.getElementById("replenishment-status");
+  status.textContent = "処理中...";
+  try {
+    const response = await fetch("/api/replenishment-candidates/" + action, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + getToken() }, body: JSON.stringify({ candidateId: candidate.candidateId }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || String(response.status));
+    status.textContent = verb + "しました" + (data.historyWarning ? "（" + data.historyWarning + "）" : "");
+    await loadAll();
+    await loadReplenishmentCandidates({ preserve: true });
+    await loadDiscrepancies(discrepancyScroll);
+  } catch (error) {
+    status.textContent = "エラー: " + error.message;
+    buttons.forEach((button) => { button.disabled = false; });
+  } finally { window.scrollTo(0, Math.min(oldY, Math.max(0, document.documentElement.scrollHeight - window.innerHeight))); }
+}
+
+document.getElementById("replenishment-refresh-btn").addEventListener("click", () => loadReplenishmentCandidates());
+
 async function loadUnlinked() {
   const tbody = document.getElementById("unlinked-tbody");
   const showMessage = (message) => {
@@ -3911,6 +4033,7 @@ const server = http.createServer(async (req, res) => {
     "/ebay/connect", "/api/ebay/inventory", "/api/ebay/inventory/rebuild",
     "/api/inventory/discrepancies", "/api/inventory/unlinked", "/api/inventory/stocktake/preview", "/api/inventory/stocktake/confirm", "/api/inventory/stocktake/reset-checks", "/api/inventory/stocktake/undo", "/api/inventory/history",
     "/api/order-lines/unresolved", "/api/order-lines/resolve",
+    "/api/replenishment-candidates", "/api/replenishment-candidates/approve", "/api/replenishment-candidates/reject",
     "/api/closing/checklist", "/api/closing/export", "/api/closing/snapshot", "/api/closing/snapshots",
     "/api/exchange-rate", "/api/exchange-rate/refresh", "/api/exchange-rate/confirm-preview", "/api/exchange-rate/confirm",
   ];
@@ -3947,6 +4070,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/inventory/stocktake/reset-checks") return await handleStocktakeResetChecks(req, res);
     if (req.method === "POST" && pathname === "/api/inventory/stocktake/undo") return await handleStocktakeUndo(req, res);
     if (req.method === "GET" && pathname === "/api/inventory/history") return await handleInventoryHistory(req, res);
+    if (req.method === "GET" && pathname === "/api/replenishment-candidates") return await handleListReplenishmentCandidates(req, res);
+    if (req.method === "POST" && pathname === "/api/replenishment-candidates/approve") return await handleApproveReplenishmentCandidate(req, res);
+    if (req.method === "POST" && pathname === "/api/replenishment-candidates/reject") return await handleRejectReplenishmentCandidate(req, res);
     if (req.method === "GET" && pathname === "/api/order-lines/unresolved") return await handleListUnresolvedOrderLines(req, res);
     if (req.method === "POST" && pathname === "/api/order-lines/resolve") return await handleResolveOrderLine(req, res);
     if (req.method === "GET" && pathname === "/api/closing/checklist") return await handleClosingChecklist(req, res);
