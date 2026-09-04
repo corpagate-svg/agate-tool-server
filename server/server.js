@@ -1038,7 +1038,7 @@ async function handleInventoryHistory(req, res) {
 }
 
 async function handleListReplenishmentCandidates(req, res) {
-  const rows = await replenishment.listPendingCandidates({ loadInventoryWorkbook, INV_COL });
+  const rows = await replenishment.listPendingCandidates({ loadInventoryWorkbook, INV_HEADERS, INV_COL });
   sendJson(res, 200, { count: rows.length, rows });
 }
 
@@ -1055,7 +1055,7 @@ async function handleApproveReplenishmentCandidate(req, res) {
   const body = await readCandidateActionBody(req, res);
   if (!body) return;
   const result = await replenishment.approveCandidate({
-    loadInventoryWorkbookLocked, INVENTORY_PATH, HISTORY_PATH, INV_COL,
+    loadInventoryWorkbookLocked, INVENTORY_PATH, HISTORY_PATH, INV_HEADERS, INV_COL,
     candidateId: body.candidateId, actor: "画面操作", processedAt: new Date().toISOString(),
   });
   sendJson(res, 200, { status: result.alreadyProcessed ? "already_processed" : "approved", ...result });
@@ -1603,7 +1603,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <div class="panel-body">
         <div class="browser-toolbar"><button class="btn" id="replenishment-refresh-btn">再読み込み</button><span class="result-count" id="replenishment-count"></span><span class="hint" id="replenishment-status"></span></div>
         <div class="table-scroll"><table>
-          <thead><tr><th>商品ID</th><th>商品名</th><th>US出品ID</th><th class="num">同期前US在庫</th><th class="num">同期後US在庫</th><th class="num">補充候補数量</th><th class="num">現在のリアル在庫</th><th>検知日時</th><th>状態</th><th>操作</th></tr></thead>
+          <thead><tr><th>商品ID</th><th>商品名</th><th>US出品ID</th><th class="num">同期前US在庫</th><th class="num">同期後US在庫</th><th class="num">現在US在庫</th><th class="num">補充候補数量</th><th class="num">現在のリアル在庫</th><th>検知日時</th><th>状態</th><th>操作</th></tr></thead>
           <tbody id="replenishment-tbody"></tbody>
         </table></div>
       </div>
@@ -2889,7 +2889,7 @@ function showReplenishmentMessage(message) {
   const tbody = document.getElementById("replenishment-tbody");
   const tr = document.createElement("tr");
   const td = document.createElement("td");
-  td.colSpan = 10;
+  td.colSpan = 11;
   td.textContent = message;
   tr.appendChild(td);
   tbody.replaceChildren(tr);
@@ -2922,7 +2922,7 @@ function renderReplenishmentCandidates(rows) {
       return td;
     };
     addText(candidate.productId); addText(candidate.productName, "truncate"); addText(candidate.usItemId);
-    addText(candidate.beforeUsStock, "num"); addText(candidate.afterUsStock, "num"); addText(candidate.candidateQuantity, "num");
+    addText(candidate.beforeUsStock, "num"); addText(candidate.afterUsStock, "num"); addText(candidate.currentUsStock, "num"); addText(candidate.candidateQuantity, "num");
     addText(candidate.currentRealStock, "num"); addText(candidate.detectedAt ? String(candidate.detectedAt).replace("T", " ").slice(0, 19) : ""); addText(candidate.status);
     const actionTd = addText("");
     const approve = document.createElement("button"); approve.className = "btn"; approve.textContent = "承認";

@@ -60,11 +60,19 @@ function inventoryRowsByPid(workbook, INV_COL) {
   return rows;
 }
 
-async function listPendingCandidates({ loadInventoryWorkbook, INV_COL }) {
+function requiredInventoryColumn(INV_HEADERS, headerName) {
+  if (!Array.isArray(INV_HEADERS)) throw error(500, "在庫管理表の列定義が不正です");
+  const index = INV_HEADERS.indexOf(headerName);
+  if (index < 0) throw error(500, `在庫管理表に必須列「${headerName}」がありません`);
+  return index + 1;
+}
+
+async function listPendingCandidates({ loadInventoryWorkbook, INV_HEADERS, INV_COL }) {
   const workbook = await loadInventoryWorkbook();
   validateProtectedSheets(workbook, { allowMissing: true });
   const candidateSheet = workbook.getWorksheet(REPLENISHMENT_CANDIDATES_SHEET);
   if (!candidateSheet) return [];
+  const currentUsStockColumn = requiredInventoryColumn(INV_HEADERS, "在庫数(現物)");
   const products = inventoryRowsByPid(workbook, INV_COL);
   return readReplenishmentCandidates(workbook)
     .filter((candidate) => candidate["状態"] === REPLENISHMENT_STATUS.PENDING)
@@ -75,6 +83,7 @@ async function listPendingCandidates({ loadInventoryWorkbook, INV_COL }) {
         productName: product ? product.getCell(INV_COL.商品名).value : "",
         usItemId: String(candidate["US出品ID"] || ""), beforeUsStock: candidate["同期前US在庫"],
         afterUsStock: candidate["同期後US在庫"], candidateQuantity: candidate["補充候補数量"],
+        currentUsStock: product ? product.getCell(currentUsStockColumn).value : null,
         currentRealStock: product ? product.getCell(INV_COL.リアル在庫).value : null,
         detectedAt: candidate["検知日時"], status: candidate["状態"],
       };
@@ -144,6 +153,7 @@ async function recordApprovalHistory(deps, approval) {
 
 async function approveCandidate(deps) {
   assertCandidateId(deps.candidateId);
+  const usItemIdColumn = requiredInventoryColumn(deps.INV_HEADERS, "US_出品ID");
   const outcome = await withInventoryLock(async () => {
     const workbook = await deps.loadInventoryWorkbookLocked();
     validateProtectedSheets(workbook, { allowMissing: true });
@@ -169,7 +179,7 @@ async function approveCandidate(deps) {
     const usItemId = String(cellValue(found, "US出品ID") || "").trim();
     const products = inventoryRowsByPid(workbook, deps.INV_COL);
     const product = products.get(productId);
-    const currentUsItemId = product ? String(product.getCell(deps.INV_COL.US出品ID || 7).value || "").trim() : "";
+    const currentUsItemId = product ? String(product.getCell(usItemIdColumn).value || "").trim() : "";
     if (!product || currentUsItemId !== usItemId) {
       const reason = !product ? "商品が在庫管理表に存在しないため要確認" : "US出品IDが現在の商品情報と一致しないため要確認";
       markNonApplied(found, REPLENISHMENT_STATUS.REVIEW, { at: deps.processedAt, actor: deps.actor, reason });
@@ -227,4 +237,5 @@ async function rejectCandidate(deps) {
 module.exports = {
   HISTORY_PENDING, HISTORY_RECORDED, HISTORY_FAILED,
   listPendingCandidates, approveCandidate, rejectCandidate, invalidatePendingCandidates,
+  requiredInventoryColumn,
 };
