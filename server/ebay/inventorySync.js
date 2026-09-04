@@ -8,9 +8,10 @@
 // (毎回eBayから取得した最新の生データだけを元に保管シートを作り直すため、
 //  紐付いた/削除されたUK・AU出品は自然に保管シートから消える)。
 const ExcelJS = require("exceljs");
+const crypto = require("crypto");
 const { fetchAllActiveListings } = require("./sellerListings");
 const { withInventoryLock, atomicWriteWorkbook } = require("../inventoryLock");
-const { copyProtectedSheets } = require("../inventoryProtectedSheets");
+const { copyProtectedSheets, addReplenishmentCandidate, REPLENISHMENT_STATUS } = require("../inventoryProtectedSheets");
 const {
   normText,
   stripShippingNote,
@@ -39,6 +40,12 @@ function startTimeMs(item) {
   if (!item || !item.startTime) return null;
   const t = Date.parse(item.startTime);
   return Number.isFinite(t) ? t : null;
+}
+
+function inventoryQuantity(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const quantity = Number(value);
+  return Number.isSafeInteger(quantity) && quantity >= 0 ? quantity : null;
 }
 
 // 複数候補がある場合、USの出品開始日時に最も近いものを選ぶ。
@@ -112,6 +119,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
   const oldWb = await loadInventoryWorkbook();
   const oldWs = oldWb.getWorksheet("在庫管理表") || oldWb.worksheets[0];
   const savedByUsId = new Map();
+  const savedUsIdCounts = new Map();
   const savedByTitle = new Map();
   let maxId = 0;
   oldWs.eachRow((row, rowNumber) => {
@@ -128,7 +136,11 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
       wasRemoved: String(fullRow[18] || "").includes("見当たりません"),
     };
     const usId = fullRow[6];
-    if (usId !== null && usId !== undefined && usId !== "") savedByUsId.set(String(usId), savedRow);
+    if (usId !== null && usId !== undefined && usId !== "") {
+      const usIdKey = String(usId);
+      savedByUsId.set(usIdKey, savedRow);
+      savedUsIdCounts.set(usIdKey, (savedUsIdCounts.get(usIdKey) || 0) + 1);
+    }
     const tKey = titleKey(fullRow[1]);
     if (!savedByTitle.has(tKey)) savedByTitle.set(tKey, []);
     savedByTitle.get(tKey).push(savedRow);
@@ -140,6 +152,10 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
   const newProducts = [];
   let nextId = maxId + 1;
   let ambiguousCount = 0;
+  let replenishmentCandidatesSkipped = 0;
+  const replenishmentCandidates = [];
+  const syncExecutionId = crypto.randomUUID();
+  const detectedAt = new Date().toISOString();
 
   for (const usItem of usItems) {
     const key = titleKey(usItem.title);
@@ -153,7 +169,10 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     const qtyMismatch = new Set(qtys).size > 1;
     const flag = (ukResult.ambiguous || auResult.ambiguous || qtyMismatch || siteCount < 3) ? "要確認" : "";
 
-    let savedRow = savedByUsId.get(String(usItem.itemId));
+    const usItemId = String(usItem.itemId);
+    const exactSavedRow = savedByUsId.get(usItemId);
+    const hasUniqueExactMatch = Boolean(exactSavedRow) && savedUsIdCounts.get(usItemId) === 1;
+    let savedRow = exactSavedRow;
     if (!savedRow) {
       const candidates = (savedByTitle.get(key) || []).filter((s) => !claimedSaved.has(s));
       savedRow = candidates[0];
@@ -185,6 +204,39 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     // リアル在庫は当社独自管理の値。eBay APIでの再取込では上書きしない。
     // 未設定(導入前・移行直後)の場合のみ、初期値としてUSの在庫数をコピーする。
     if (realStock === null || realStock === undefined) realStock = usItem.quantityAvailable;
+
+    // 補充候補は、同じUS Item IDで一意に特定できる既存商品のUS在庫が増えた場合だけ作る。
+    // タイトルによる引継ぎ・新規商品・不正数量は誤紐付けを避けるため候補化しない。
+    if (hasUniqueExactMatch && savedRow === exactSavedRow) {
+      const oldUsQty = inventoryQuantity(savedRow.fullRow[3]);
+      const newUsQty = inventoryQuantity(usItem.quantityAvailable);
+      if (!/^P\d+$/.test(String(pid))) {
+        replenishmentCandidatesSkipped++;
+      } else if (oldUsQty !== null && newUsQty !== null) {
+        if (newUsQty > oldUsQty) {
+          replenishmentCandidates.push({
+            "商品ID": String(pid),
+            "US出品ID": usItemId,
+            "同期前US在庫": oldUsQty,
+            "同期後US在庫": newUsQty,
+            "補充候補数量": newUsQty - oldUsQty,
+            "検知日時": detectedAt,
+            "検知元": `eBay同期:${syncExecutionId}`,
+            "状態": REPLENISHMENT_STATUS.PENDING,
+          });
+        }
+      } else {
+        replenishmentCandidatesSkipped++;
+      }
+    } else if (savedRow) {
+      // 既存行をタイトルだけで引き継いだ場合やUS Item IDが重複する場合は、安全に商品を
+      // 特定できないため候補を作らない。同期結果のsummaryへ件数だけ残す。
+      const oldUsQty = inventoryQuantity(savedRow.fullRow[3]);
+      const newUsQty = inventoryQuantity(usItem.quantityAvailable);
+      if (oldUsQty !== null && newUsQty !== null && newUsQty > oldUsQty) {
+        replenishmentCandidatesSkipped++;
+      }
+    }
 
     rowsOut.push({
       row: [
@@ -290,6 +342,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
   ws3.getColumn(1).width = 110;
 
   copyProtectedSheets(oldWb, wb);
+  for (const candidate of replenishmentCandidates) addReplenishmentCandidate(wb, candidate);
   await atomicWriteWorkbook(wb, INVENTORY_PATH);
 
   return {
@@ -305,6 +358,8 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     ukAuOrphanCount: orphanRows.length,
     variationsExcludedTotal: usVariationCount + ukVariationCount + auVariationCount,
     unknownSiteSkipped: unknownSiteCount,
+    replenishmentCandidatesCreated: replenishmentCandidates.length,
+    replenishmentCandidatesSkipped,
   };
   }); // withInventoryLock ここまで
 }

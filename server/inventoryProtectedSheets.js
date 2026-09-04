@@ -1,6 +1,7 @@
 const ORDER_LINES_SHEET = "注文明細";
 const ITEM_MAPPINGS_SHEET = "確定ItemID対応";
-const PROTECTED_SHEET_NAMES = Object.freeze([ORDER_LINES_SHEET, ITEM_MAPPINGS_SHEET]);
+const REPLENISHMENT_CANDIDATES_SHEET = "補充候補";
+const PROTECTED_SHEET_NAMES = Object.freeze([ORDER_LINES_SHEET, ITEM_MAPPINGS_SHEET, REPLENISHMENT_CANDIDATES_SHEET]);
 
 const ORDER_LINE_HEADERS = Object.freeze([
   "明細キー", "注文番号", "明細連番", "販売サイト", "eBay Item ID", "商品タイトル", "SKU", "注文数量",
@@ -13,6 +14,12 @@ const ITEM_MAPPING_HEADERS = Object.freeze([
   "確認日時", "確認者", "確認理由", "有効開始日時", "有効終了日時", "変更元対応キー",
 ]);
 
+const REPLENISHMENT_CANDIDATE_HEADERS = Object.freeze([
+  "補充候補ID", "商品ID", "US出品ID", "同期前US在庫", "同期後US在庫", "補充候補数量",
+  "検知日時", "検知元", "状態", "処理日時", "処理者", "適用数量",
+  "適用前リアル在庫", "適用後リアル在庫", "処理理由", "在庫履歴記録状態", "在庫履歴イベントID",
+]);
+
 const ORDER_LINE_STATUS = Object.freeze({
   UNAPPLIED: "未適用",
   APPLIED: "適用済み",
@@ -23,6 +30,13 @@ const ORDER_LINE_STATUS = Object.freeze({
 });
 
 const MAPPING_STATUS = Object.freeze({ ACTIVE: "有効", INACTIVE: "無効", CONFLICT: "矛盾" });
+const REPLENISHMENT_STATUS = Object.freeze({
+  PENDING: "未処理",
+  APPROVED: "承認済み",
+  REJECTED: "却下",
+  INVALIDATED: "手動変更により失効",
+  REVIEW: "商品不明／要確認",
+});
 
 const HEADER_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4F6B82" } };
 const HEADER_FONT = { bold: true, color: { argb: "FFFFFFFF" } };
@@ -80,6 +94,17 @@ function ensureProtectedSheets(workbook) {
     styleManagedSheet(mappings, ITEM_MAPPING_HEADERS);
   }
   return { orderLines, mappings };
+}
+
+// 補充候補は候補が発生した時だけ遅延作成する。注文処理など、無関係な管理シート
+// 初期化では作成しない。
+function ensureReplenishmentCandidatesSheet(workbook) {
+  let candidates = workbook.getWorksheet(REPLENISHMENT_CANDIDATES_SHEET);
+  if (!candidates) {
+    candidates = workbook.addWorksheet(REPLENISHMENT_CANDIDATES_SHEET);
+    styleManagedSheet(candidates, REPLENISHMENT_CANDIDATE_HEADERS);
+  }
+  return candidates;
 }
 
 function headerIndex(ws) {
@@ -206,15 +231,58 @@ function validateItemMappingsSheet(ws) {
   return { count: keys.size, activeCount: activeMappings.size };
 }
 
+function validateReplenishmentCandidatesSheet(ws) {
+  validateHeaders(ws, REPLENISHMENT_CANDIDATE_HEADERS);
+  const index = headerIndex(ws);
+  const ids = new Set();
+  const allowedStatuses = new Set(Object.values(REPLENISHMENT_STATUS));
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  for (let rowNumber = 2; rowNumber <= ws.rowCount; rowNumber++) {
+    const row = ws.getRow(rowNumber);
+    if (isBlankRow(row, REPLENISHMENT_CANDIDATE_HEADERS.length)) continue;
+    const value = (name) => row.getCell(index.get(name)).value;
+    const id = String(value("補充候補ID") || "").trim();
+    const pid = String(value("商品ID") || "").trim();
+    const itemId = value("US出品ID");
+    const oldQty = Number(value("同期前US在庫"));
+    const newQty = Number(value("同期後US在庫"));
+    const candidateQty = Number(value("補充候補数量"));
+    const status = String(value("状態") || "").trim();
+    if (!uuidPattern.test(id) || !/^P\d+$/.test(pid) || typeof itemId !== "string" || !itemId.trim()
+      || !value("検知日時") || !String(value("検知元") || "").trim()) {
+      throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} ${rowNumber}行目の必須フィールドが不足または不正です`);
+    }
+    if (!Number.isSafeInteger(oldQty) || oldQty < 0 || !Number.isSafeInteger(newQty) || newQty <= oldQty
+      || !Number.isSafeInteger(candidateQty) || candidateQty !== newQty - oldQty) {
+      throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} ${rowNumber}行目の在庫数量が不正です`);
+    }
+    if (!allowedStatuses.has(status)) throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} ${rowNumber}行目の状態が不正です`);
+    if (status === REPLENISHMENT_STATUS.PENDING) {
+      for (const name of ["処理日時", "処理者", "適用数量", "適用前リアル在庫", "適用後リアル在庫", "処理理由", "在庫履歴記録状態", "在庫履歴イベントID"]) {
+        if (!isUnset(value(name))) throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} ${rowNumber}行目の未処理候補に処理情報があります`);
+      }
+    }
+    if (ids.has(id)) throw new Error(`${REPLENISHMENT_CANDIDATES_SHEET} に重複した補充候補IDがあります: ${id}`);
+    ids.add(id);
+  }
+  return { count: ids.size };
+}
+
 function validateProtectedSheets(workbook, { allowMissing = false } = {}) {
   const orderLines = workbook.getWorksheet(ORDER_LINES_SHEET);
   const mappings = workbook.getWorksheet(ITEM_MAPPINGS_SHEET);
-  if (allowMissing && !orderLines && !mappings) return { orderLines: 0, mappings: 0 };
+  const candidates = workbook.getWorksheet(REPLENISHMENT_CANDIDATES_SHEET);
+  if (allowMissing && !orderLines && !mappings) {
+    if (candidates) validateReplenishmentCandidatesSheet(candidates);
+    return { orderLines: 0, mappings: 0 };
+  }
   if (!orderLines || !mappings) throw new Error("サーバー管理シートの一部が不足しています");
-  return {
+  const result = {
     orderLines: validateOrderLinesSheet(orderLines).count,
     mappings: validateItemMappingsSheet(mappings).count,
   };
+  if (candidates) validateReplenishmentCandidatesSheet(candidates);
+  return result;
 }
 
 function cloneCellValue(value) {
@@ -324,6 +392,20 @@ function addItemMapping(workbook, record) {
   return normalized["対応キー"];
 }
 
+function addReplenishmentCandidate(workbook, record) {
+  const crypto = require("crypto");
+  const candidates = ensureReplenishmentCandidatesSheet(workbook);
+  const normalized = {
+    ...record,
+    "補充候補ID": record["補充候補ID"] || crypto.randomUUID(),
+    "US出品ID": String(record["US出品ID"] || ""),
+    "状態": record["状態"] || REPLENISHMENT_STATUS.PENDING,
+  };
+  candidates.addRow(rowValues(REPLENISHMENT_CANDIDATE_HEADERS, normalized));
+  validateReplenishmentCandidatesSheet(candidates);
+  return normalized["補充候補ID"];
+}
+
 function readManagedRows(workbook, sheetName, headers) {
   const ws = workbook.getWorksheet(sheetName);
   if (!ws) return [];
@@ -340,12 +422,14 @@ function readManagedRows(workbook, sheetName, headers) {
 }
 
 module.exports = {
-  ORDER_LINES_SHEET, ITEM_MAPPINGS_SHEET, PROTECTED_SHEET_NAMES,
-  ORDER_LINE_HEADERS, ITEM_MAPPING_HEADERS, ORDER_LINE_STATUS, MAPPING_STATUS,
-  createOrderLineKey, createMappingKey, ensureProtectedSheets,
-  validateOrderLinesSheet, validateItemMappingsSheet, validateProtectedSheets,
+  ORDER_LINES_SHEET, ITEM_MAPPINGS_SHEET, REPLENISHMENT_CANDIDATES_SHEET, PROTECTED_SHEET_NAMES,
+  ORDER_LINE_HEADERS, ITEM_MAPPING_HEADERS, REPLENISHMENT_CANDIDATE_HEADERS,
+  ORDER_LINE_STATUS, MAPPING_STATUS, REPLENISHMENT_STATUS,
+  createOrderLineKey, createMappingKey, ensureProtectedSheets, ensureReplenishmentCandidatesSheet,
+  validateOrderLinesSheet, validateItemMappingsSheet, validateReplenishmentCandidatesSheet, validateProtectedSheets,
   copyWorksheet, copyProtectedSheets, validateInventorySheet, buildProtectedImportWorkbook,
-  addOrderLine, addItemMapping,
+  addOrderLine, addItemMapping, addReplenishmentCandidate,
   readOrderLines: (workbook) => readManagedRows(workbook, ORDER_LINES_SHEET, ORDER_LINE_HEADERS),
   readItemMappings: (workbook) => readManagedRows(workbook, ITEM_MAPPINGS_SHEET, ITEM_MAPPING_HEADERS),
+  readReplenishmentCandidates: (workbook) => readManagedRows(workbook, REPLENISHMENT_CANDIDATES_SHEET, REPLENISHMENT_CANDIDATE_HEADERS),
 };
