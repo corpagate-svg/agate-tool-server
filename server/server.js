@@ -2499,7 +2499,17 @@ const INV_TABLE_LEADING_HEADERS = ["商品ID", "商品名", "リアル在庫", "
 function inventoryTableDisplayOrder() {
   const visible = invHeaders.map((h, i) => i).filter((i) => !INV_HIDDEN.includes(invHeaders[i]));
   const leading = INV_TABLE_LEADING_HEADERS.map((h) => invHeaders.indexOf(h)).filter((i) => visible.includes(i));
-  return leading.concat(visible.filter((i) => !leading.includes(i)));
+  const rest = visible.filter((i) => !leading.includes(i));
+  // 画面表示の並びだけ「仕入価格(円)」をUS価格(USD)の直前へ移動する
+  // (Excel/API/CSVの列順・invHeaders自体は変更しない)。
+  const priceIdx = invHeaders.indexOf("仕入価格(円)");
+  const usPriceIdx = invHeaders.indexOf("US価格(USD)");
+  if (rest.includes(priceIdx) && rest.includes(usPriceIdx)) {
+    const withoutPrice = rest.filter((i) => i !== priceIdx);
+    withoutPrice.splice(withoutPrice.indexOf(usPriceIdx), 0, priceIdx);
+    return leading.concat(withoutPrice);
+  }
+  return leading.concat(rest);
 }
 let invSort = { idx: 0, dir: -1 };
 let invSelected = new Set();
