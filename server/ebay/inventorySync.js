@@ -7,6 +7,16 @@
 // 削除せず「UK_AU保管(US未紐付け)」シートに保管し、次回実行時に改めて評価し直す
 // (毎回eBayから取得した最新の生データだけを元に保管シートを作り直すため、
 //  紐付いた/削除されたUK・AU出品は自然に保管シートから消える)。
+//
+// 【タイトル照合方針(2026-09-05〜)】
+// 今後タイトルへ送料訴求文([Extra Items Ship FREE]等)を追加しない運用のため、
+// 照合は「前後空白の除去+連続空白の1個化(titleKey)」だけを行い、完全一致した
+// US/UK/AU出品だけを紐付ける。fuzzy matching・編集距離・類似度判定・prefix一致・
+// 「...」「…」からの推測は一切行わない。一致しないものは推測せず「UK_AU保管」
+// (未紐付け)へ残す。メインシートの「商品名」列にはUSのタイトルを一切加工せず
+// (送料文言の除去も行わず)そのまま保存する(raw title)。UK/AUタイトルは紐付け
+// 判定にのみ一時的に使用し、紐付け済みの行には保存しない(在庫管理表の列構成を
+// 変えないため。未紐付けの場合のみ既存の「UK_AU保管」シートに生タイトルのまま残る)。
 const ExcelJS = require("exceljs");
 const crypto = require("crypto");
 const { fetchAllActiveListings } = require("./sellerListings");
@@ -14,7 +24,6 @@ const { withInventoryLock, atomicWriteWorkbook } = require("../inventoryLock");
 const { copyProtectedSheets, addReplenishmentCandidate, REPLENISHMENT_STATUS } = require("../inventoryProtectedSheets");
 const {
   normText,
-  stripShippingNote,
   INV_HEADER_FILL,
   INV_HEADER_FONT,
   INV_FLAG_FILL,
@@ -32,8 +41,12 @@ function siteFromViewItemUrl(url) {
   return null;
 }
 
+// US/UK/AUの照合キー。今後タイトルへ送料訴求文を追加しない運用のため、
+// 送料文言の除去(stripShippingNote)には依存せず、前後空白の除去と連続空白の
+// 1個化だけを行う。それ以外は元タイトルを一切変更しない(大文字小文字も区別する)。
+// 意図的にfuzzy matching・prefix一致・類似度判定は行わない。
 function titleKey(title) {
-  return normText(stripShippingNote(title));
+  return normText(title);
 }
 
 function startTimeMs(item) {
@@ -241,7 +254,9 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     rowsOut.push({
       row: [
         pid,
-        normText(stripShippingNote(usItem.title)),
+        // 商品名はeBayから取得したUSタイトルをそのまま保存する(raw title)。
+        // 送料文言の除去や表示用の省略は行わず、照合(titleKey)専用に別途正規化する。
+        usItem.title,
         null,
         usItem.quantityAvailable,
         siteCount,
@@ -323,6 +338,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
   const notes = [
     `・eBay Trading API(GetMyeBaySelling / ActiveList)の取得結果(${today}時点)を元に、USサイトの出品を基準として自動更新しました。`,
     "・メインシートの行数は「USサイトの出品数(バリエーション出品を除く)」と必ず一致します。UK/AUの出品は対応するUS商品の行に付随情報として紐づけるだけで、単独の行としては追加していません。",
+    "・商品名(タイトル)はeBayから取得した文字列をそのまま保存しています(前後・連続する空白の違いだけは無視して一致と判定しますが、それ以外は完全一致した場合のみ紐付けます。あいまいな類似判定は行いません)。",
     "・黄色でハイライトした行は「UK/AUの対応付けが複数候補から推定で選ばれた」「在庫数が国ごとに違う」「UK/AUが3カ国揃っていない」のいずれかに該当します。",
     "・今回のUS Active Listingsに存在しないUS出品ID(=出品終了・売り切れ後の自動終了などでeBayから消えたもの)は、メインシートから削除しています(UK/AUの有無や在庫数0は削除理由にしていません)。",
     "・UK/AUが複数候補ある場合は、US出品の出品開始日時に最も近いものを自動選択しています(確実な保証はできないため、該当行は黄色でハイライトしています)。",
