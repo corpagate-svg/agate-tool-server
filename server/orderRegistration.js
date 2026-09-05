@@ -11,12 +11,23 @@ const {
 
 const SITE_ITEM_COLUMNS = Object.freeze({ US: "US_出品ID", UK: "UK_出品ID", AU: "AU_出品ID" });
 
+// 「小計（○点）」が無い現在のeBay表示形式では、小計自体は金額表記になりsubtotalQuantityが
+// 取得できない。その場合は、Item ID解析とは独立な商品ブロック数(商品価格/商品合計ラベルの
+// 出現数)の突合が取れているときだけ安全とみなす。parseOrderText側のparseStatus判定を
+// そのまま信頼せず、ここでも同じ安全条件を独立に再検証する(既存の多重防御方針を踏襲)。
+function isSubtotalSafe(parsed) {
+  if (parsed.subtotalQuantity !== null) return parsed.quantityTotal === parsed.subtotalQuantity;
+  return Boolean(parsed.itemCount > 0
+    && parsed.productPriceLabelCount === parsed.itemCount
+    && parsed.productTotalLabelCount === parsed.itemCount
+    && parsed.productPriceLabelCount === parsed.productTotalLabelCount);
+}
+
 function isParserSafe(parsed) {
   return Boolean(parsed && parsed.parseStatus === "OK"
     && SITE_ITEM_COLUMNS[parsed.site]
     && parsed.itemCount > 0
-    && parsed.subtotalQuantity !== null
-    && parsed.quantityTotal === parsed.subtotalQuantity
+    && isSubtotalSafe(parsed)
     && parsed.items.every((item) => item.parseStatus === "OK" && typeof item.ebayItemId === "string"
       && item.ebayItemId && Number.isInteger(item.quantity) && item.quantity > 0));
 }

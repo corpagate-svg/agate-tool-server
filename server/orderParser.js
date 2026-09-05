@@ -27,6 +27,25 @@
     return null;
   }
 
+  function countLabelOccurrences(lines, label) {
+    return lines.filter((line) => line === label).length;
+  }
+
+  // 現在のeBay画面は1商品注文で「小計（○点）」を表示せず金額のみの「小計」になるため、
+  // その場合に限り、Item ID解析とは独立な商品ブロック数(商品価格/商品合計ラベルの出現数)の
+  // 突合を安全条件として使う。先頭明細のItem ID検出失敗のように、隣接明細への数量ラベル
+  // 混入では検出できない「静かな明細消失」もこの突合なら検出できる(要件シミュレーション済み)。
+  function isBlockCountSafeWithoutSubtotal(items, productSectionFound, site, priceLabelCount, totalLabelCount) {
+    return Boolean(productSectionFound
+      && items.length > 0
+      && items.every((item) => item.parseStatus === "OK" && typeof item.ebayItemId === "string" && item.ebayItemId
+        && Number.isInteger(item.quantity) && item.quantity > 0)
+      && site !== "要確認"
+      && priceLabelCount === items.length
+      && totalLabelCount === items.length
+      && priceLabelCount === totalLabelCount);
+  }
+
   function isSectionHeading(line, heading) {
     const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp("^(?:#{1,6}\\s*)?" + escaped + "\\s*$").test(line);
@@ -128,6 +147,7 @@
     const result = {
       orderNo: "", date: "", site: "要確認", usd: "", note: "", qty: "",
       items: [], itemCount: 0, quantityTotal: 0, subtotalQuantity: null,
+      productPriceLabelCount: 0, productTotalLabelCount: 0, subtotalCheckMethod: "取得不可",
       parseStatus: "要確認", parseErrors: [],
     };
 
@@ -165,6 +185,8 @@
     result.itemCount = result.items.length;
     result.quantityTotal = result.items.reduce((sum, item) => sum + (Number.isInteger(item.quantity) ? item.quantity : 0), 0);
     result.subtotalQuantity = findSubtotalQuantity(lines);
+    result.productPriceLabelCount = countLabelOccurrences(productSection.lines, "商品価格");
+    result.productTotalLabelCount = countLabelOccurrences(productSection.lines, "商品合計");
     result.note = result.items.map((item) => item.title).filter(Boolean).join(" / ");
     result.qty = result.items.length ? String(result.quantityTotal) : "";
 
@@ -172,9 +194,16 @@
     if (!result.items.length) result.parseErrors.push("注文明細がありません");
     if (result.items.some((item) => item.parseStatus !== "OK")) result.parseErrors.push("必須値を取得できない明細があります");
     if (result.subtotalQuantity === null) {
-      result.parseErrors.push("小計点数を取得できません");
+      const blockCountSafe = isBlockCountSafeWithoutSubtotal(
+        result.items, productSection.found, result.site, result.productPriceLabelCount, result.productTotalLabelCount,
+      );
+      result.subtotalCheckMethod = blockCountSafe ? "商品ブロック数" : "取得不可";
+      if (!blockCountSafe) result.parseErrors.push("小計点数を取得できません");
     } else if (result.quantityTotal !== result.subtotalQuantity) {
       result.parseErrors.push("明細の数量合計と小計が一致しません");
+      result.subtotalCheckMethod = "小計点数(不一致)";
+    } else {
+      result.subtotalCheckMethod = "小計点数";
     }
     if (result.site === "要確認") result.parseErrors.push("販売サイトを安全に判定できません");
     result.parseStatus = result.parseErrors.length ? "要確認" : "OK";

@@ -3846,7 +3846,8 @@ function renderOrderParseReview(parsed) {
   const summaryValues = [
     ["明細数", parsed.itemCount],
     ["数量合計", parsed.quantityTotal],
-    ["小計", parsed.subtotalQuantity === null ? "取得なし" : parsed.subtotalQuantity],
+    ["小計", parsed.subtotalQuantity !== null ? parsed.subtotalQuantity
+      : (parsed.subtotalCheckMethod === "商品ブロック数" ? "点数確認：商品明細から確認済み" : "取得なし")],
     ["解析状態", parsed.parseStatus],
   ];
   for (const pair of summaryValues) {
