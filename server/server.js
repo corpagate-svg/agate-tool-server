@@ -2327,15 +2327,22 @@ function downloadCsv(filename, headers, rows) {
   URL.revokeObjectURL(url);
 }
 
+// 数値列の空欄/未入力は、昇順・降順にかかわらず必ず末尾に置く(棚卸タブの
+// compareStkHeaderValueと同じ仕様に統一する)。0は有効な数値として通常どおり
+// 比較する(空欄と0を混同しない)。以前は空欄を-Infinity扱いしていたため、
+// 昇順では空欄が先頭に来てしまい、降順とで空欄の位置が入れ替わってしまっていた。
 function sortRows(rows, headers, numCols, sortState) {
   const idx = sortState.idx, dir = sortState.dir;
   const isNum = numCols.includes(headers[idx]);
   return rows.slice().sort((a, b) => {
     const av = a[idx], bv = b[idx];
     if (isNum) {
-      const an = av === "" || av === null || av === undefined ? -Infinity : Number(av);
-      const bn = bv === "" || bv === null || bv === undefined ? -Infinity : Number(bv);
-      return (an - bn) * dir;
+      const aEmpty = av === "" || av === null || av === undefined;
+      const bEmpty = bv === "" || bv === null || bv === undefined;
+      if (aEmpty && bEmpty) return 0;
+      if (aEmpty) return 1;
+      if (bEmpty) return -1;
+      return (Number(av) - Number(bv)) * dir;
     }
     return String(av || "").localeCompare(String(bv || "")) * dir;
   });
