@@ -1541,6 +1541,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           </div>
           <div id="ne-items-review" style="display:none;">
             <div id="ne-parse-summary" class="order-parse-summary"></div>
+            <div id="ne-diag" class="hint" style="opacity:0.6;font-size:11px;"></div>
             <div class="order-items-review" style="margin-top:10px;">
               <table>
                 <thead><tr><th>No.</th><th>商品タイトル</th><th>eBay Item ID</th><th class="num">数量</th><th>SKU</th><th>解析状態</th></tr></thead>
@@ -3834,12 +3835,23 @@ document.getElementById("ord-xlsx-upload").addEventListener("click", async () =>
 });
 
 const parseOrderText = AgateOrderParser.parseOrderText;
+// 診断専用(2026-09、原因切り分け用): order-parser.jsが実際に最新版として読み込まれ
+// 実行されているかをブラウザ上で確認するための一時カウンタ。原因切り分け後に削除すること。
+let neParseDiagCallCount = 0;
 
 function renderOrderParseReview(parsed) {
   const review = document.getElementById("ne-items-review");
   const summary = document.getElementById("ne-parse-summary");
   const body = document.getElementById("ne-items-body");
   review.style.display = "block";
+
+  neParseDiagCallCount += 1;
+  document.getElementById("ne-diag").textContent =
+    "[診断] Parser Build: " + (AgateOrderParser.PARSER_BUILD_ID || "不明(旧バージョンの可能性)")
+    + " / 実行回数: " + neParseDiagCallCount
+    + " / site: " + parsed.site
+    + " / subtotalCheckMethod: " + (parsed.subtotalCheckMethod || "不明(旧バージョンの可能性)")
+    + " / parseStatus: " + parsed.parseStatus;
   summary.className = "order-parse-summary " + (parsed.parseStatus === "OK" ? "ok" : "ng");
   summary.replaceChildren();
 
