@@ -65,19 +65,26 @@
     const revenueIndex = lines.indexOf("お客様の収益");
     const upperBound = revenueIndex === -1 ? lines.length : revenueIndex;
     const orderAmountLabels = new Set(["商品価格", "商品合計", "小計", "注文の合計金額"]);
-    let hasGbPounds = false;
+    const detectedSites = new Set();
+    const strongAmountPatterns = [
+      ["US", /^US\s*\$\s*[-+]?\s*[\d,.]+$/],
+      ["UK", /^GB\s*£\s*[-+]?\s*[\d,.]+$/],
+      ["AU", /^AU\s*\$\s*[-+]?\s*[\d,.]+$/],
+    ];
 
     for (let i = 0; i < upperBound; i++) {
-      if (!/^GB\s*£\s*[-+]?\s*[\d,.]+$/.test(lines[i])) continue;
+      const matchedSite = strongAmountPatterns.find(([, pattern]) => pattern.test(lines[i]));
+      if (!matchedSite) continue;
       const labelIndex = previousNonEmptyIndex(lines, i - 1, 0);
       if (labelIndex !== -1) {
         const normalizedLabel = lines[labelIndex].replace(/[（(]\s*\d+\s*点\s*[）)]$/, "");
-        if (orderAmountLabels.has(normalizedLabel)) hasGbPounds = true;
+        if (orderAmountLabels.has(normalizedLabel)) detectedSites.add(matchedSite[0]);
       }
     }
 
-    // US/AUは実サンプル確認前のため推測しない。GBポンドだけをUKへ正規化する。
-    return hasGbPounds ? "UK" : "要確認";
+    // 通貨記号単体や収益欄は使わず、注文金額ラベル直後の明示的なサイト表記だけで確定する。
+    // 複数サイトの強シグナルが混在する場合は誤判定を避けて要確認にする。
+    return detectedSites.size === 1 ? [...detectedSites][0] : "要確認";
   }
 
   function parseItems(lines) {
