@@ -1244,6 +1244,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   th.sortable:hover { color: var(--ink-2); }
   th.sortable .sort-arrow { margin-left: 3px; opacity: 0.6; }
   td.checkbox-col, th.checkbox-col { width: 30px; padding-left: 10px; padding-right: 0; }
+  #inv-table-scroll td.checkbox-col, #inv-table-scroll th.checkbox-col { width: 26px; min-width: 26px; padding-left: 6px; }
   #status { font-size: 12.5px; color: var(--ink-muted); }
 
   .tabnav { display: flex; gap: 4px; border-bottom: 1px solid var(--border); }
@@ -1541,7 +1542,6 @@ const DASHBOARD_PAGE = `<!doctype html>
           </div>
           <div id="ne-items-review" style="display:none;">
             <div id="ne-parse-summary" class="order-parse-summary"></div>
-            <div id="ne-diag" class="hint" style="opacity:0.6;font-size:11px;"></div>
             <div class="order-items-review" style="margin-top:10px;">
               <table>
                 <thead><tr><th>No.</th><th>商品タイトル</th><th>eBay Item ID</th><th class="num">数量</th><th>SKU</th><th>解析状態</th></tr></thead>
@@ -1744,7 +1744,8 @@ const ORD_EDITABLE = ["収益USD","ドル円レート","数量","仕入原価(�
 const ORD_EDITABLE_TEXT = ["商品メモ", "商品ID"];
 const ORD_NUM_COLS = ["収益USD","ドル円レート","数量","収益円","手数料(円)","仕入原価(円)","送料(円)","梱包費(円)","最終利益(円)","利益率"];
 const ORD_FIELD_KEY = { "収益USD": "収益USD", "ドル円レート": "ドル円レート", "仕入原価(円)": "仕入原価円", "送料(円)": "送料円", "梱包費(円)": "梱包費円", "商品メモ": "商品メモ", "数量": "数量", "商品ID": "商品ID" };
-const INV_NUM_COLS = ["在庫数(現物)","リアル在庫","出品国数","US価格(USD)","US累計売却数","UK価格(GBP)","UK累計売却数","AU価格(AUD)","AU累計売却数","仕入価格(円)"];
+const INV_SOLD_TOTAL = "売却個数 合計";
+const INV_NUM_COLS = ["在庫数(現物)","リアル在庫","出品国数","US価格(USD)","US累計売却数","UK価格(GBP)","UK累計売却数","AU価格(AUD)","AU累計売却数","仕入価格(円)",INV_SOLD_TOTAL];
 const INV_EDITABLE_TEXT = ["仕入日","備考"];
 const INV_EDITABLE_NUM = ["仕入価格(円)"];
 const INV_FIELD_KEY = { "仕入価格(円)": "仕入価格円", "仕入日": "仕入日", "仕入先": "仕入先", "備考": "備考" };
@@ -2502,22 +2503,14 @@ const INV_HIDDEN = [
   // 各値は「相違」「棚卸」「決算」タブや検索(SKU)から個別に利用する。
   "UK在庫数", "AU在庫数", "リアル在庫確認日", "棚卸入力数量", "棚卸入力日時", "画像URL", "日本語商品名", "SKU", "棚卸チェック",
 ];
-const INV_TABLE_LEADING_HEADERS = ["商品ID", "商品名", "リアル在庫", "在庫数(現物)"];
+const INV_TABLE_HEADERS = [
+  "商品ID", "商品名", "リアル在庫", "在庫数(現物)", "出品国数", "US_出品ID",
+  "仕入価格(円)", "US価格(USD)", "仕入日", INV_SOLD_TOTAL,
+  "US累計売却数", "UK累計売却数", "AU累計売却数", "備考",
+];
 
 function inventoryTableDisplayOrder() {
-  const visible = invHeaders.map((h, i) => i).filter((i) => !INV_HIDDEN.includes(invHeaders[i]));
-  const leading = INV_TABLE_LEADING_HEADERS.map((h) => invHeaders.indexOf(h)).filter((i) => visible.includes(i));
-  const rest = visible.filter((i) => !leading.includes(i));
-  // 画面表示の並びだけ「仕入価格(円)」をUS価格(USD)の直前へ移動する
-  // (Excel/API/CSVの列順・invHeaders自体は変更しない)。
-  const priceIdx = invHeaders.indexOf("仕入価格(円)");
-  const usPriceIdx = invHeaders.indexOf("US価格(USD)");
-  if (rest.includes(priceIdx) && rest.includes(usPriceIdx)) {
-    const withoutPrice = rest.filter((i) => i !== priceIdx);
-    withoutPrice.splice(withoutPrice.indexOf(usPriceIdx), 0, priceIdx);
-    return leading.concat(withoutPrice);
-  }
-  return leading.concat(rest);
+  return INV_TABLE_HEADERS.filter((header) => header === INV_SOLD_TOTAL || invHeaders.includes(header));
 }
 let invSort = { idx: 0, dir: -1 };
 let invSelected = new Set();
@@ -2527,6 +2520,9 @@ let invPrevQ = "";
 
 function sortInvRows(rows) {
   const idx = invSort.idx, dir = invSort.dir;
+  if (idx === INV_SOLD_TOTAL) {
+    return rows.slice().sort((a, b) => (inventorySoldTotal(a) - inventorySoldTotal(b)) * dir);
+  }
   const header = invHeaders[idx];
   if (header === "商品ID") {
     return rows.slice().sort((a, b) => {
@@ -2536,6 +2532,11 @@ function sortInvRows(rows) {
     });
   }
   return sortRows(rows, invHeaders, INV_NUM_COLS, invSort);
+}
+
+function inventorySoldTotal(row) {
+  return ["US累計売却数", "UK累計売却数", "AU累計売却数"]
+    .reduce((sum, header) => sum + (Number(row[invHeaders.indexOf(header)]) || 0), 0);
 }
 
 function updateInvDeleteBtn() {
@@ -2599,15 +2600,16 @@ function renderInventory() {
   const displayOrder = inventoryTableDisplayOrder();
   const thead = document.getElementById("inv-thead");
   const checkAllTh = '<th class="checkbox-col"><input type="checkbox" id="inv-select-all"></th>';
-  thead.innerHTML = checkAllTh + displayOrder.map((i, pos) => {
-    const isSortCol = i === invSort.idx;
+  thead.innerHTML = checkAllTh + displayOrder.map((header, pos) => {
+    const idx = header === INV_SOLD_TOTAL ? INV_SOLD_TOTAL : invHeaders.indexOf(header);
+    const isSortCol = idx === invSort.idx;
     const arrow = isSortCol ? '<span class="sort-arrow">' + (invSort.dir === 1 ? "▲" : "▼") + '</span>' : "";
-    const label = INV_DISPLAY_LABEL[invHeaders[i]] || invHeaders[i];
-    return '<th class="sortable ' + (INV_NUM_COLS.includes(invHeaders[i]) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '" data-idx="' + i + '">' + label + arrow + '</th>';
+    const label = INV_DISPLAY_LABEL[header] || header;
+    return '<th class="sortable ' + (INV_NUM_COLS.includes(header) ? "num" : "") + (pos === 0 ? " sticky-col" : "") + '" data-sort-key="' + idx + '">' + label + arrow + '</th>';
   }).join("");
   thead.querySelectorAll("th.sortable").forEach((th) => {
     th.addEventListener("click", () => {
-      const idx = Number(th.dataset.idx);
+      const idx = th.dataset.sortKey === INV_SOLD_TOTAL ? INV_SOLD_TOTAL : Number(th.dataset.sortKey);
       invSort = { idx, dir: invSort.idx === idx ? -invSort.dir : -1 };
       invPage = 1;
       renderInventory();
@@ -2663,14 +2665,18 @@ function renderInventory() {
     });
     cbTd.appendChild(cb);
     tr.appendChild(cbTd);
-    displayOrder.forEach((i, pos) => {
-      const h = invHeaders[i];
+    displayOrder.forEach((h, pos) => {
+      const i = h === INV_SOLD_TOTAL ? -1 : invHeaders.indexOf(h);
       const td = document.createElement("td");
       if (pos === 0) td.className = "sticky-col";
       const isNum = INV_NUM_COLS.includes(h);
       td.className = (td.className ? td.className + " " : "") + (isNum ? "num" : "");
-      if (i === stockIdx && (row[i] === 0 || row[i] === null || row[i] === undefined)) td.className += " stock-zero";
-      if (h === "リアル在庫") {
+      if (h === INV_SOLD_TOTAL) {
+        td.textContent = fmt(inventorySoldTotal(row));
+      } else if (i === stockIdx && (row[i] === 0 || row[i] === null || row[i] === undefined)) {
+        td.className += " stock-zero";
+        td.textContent = row[i] === null || row[i] === undefined ? "" : fmt(row[i]);
+      } else if (h === "リアル在庫") {
         const inp = document.createElement("input");
         inp.type = "number";
         inp.min = "0";
@@ -3835,9 +3841,6 @@ document.getElementById("ord-xlsx-upload").addEventListener("click", async () =>
 });
 
 const parseOrderText = AgateOrderParser.parseOrderText;
-// 診断専用(2026-09、原因切り分け用): order-parser.jsが実際に最新版として読み込まれ
-// 実行されているかをブラウザ上で確認するための一時カウンタ。原因切り分け後に削除すること。
-let neParseDiagCallCount = 0;
 
 function renderOrderParseReview(parsed) {
   const review = document.getElementById("ne-items-review");
@@ -3845,13 +3848,6 @@ function renderOrderParseReview(parsed) {
   const body = document.getElementById("ne-items-body");
   review.style.display = "block";
 
-  neParseDiagCallCount += 1;
-  document.getElementById("ne-diag").textContent =
-    "[診断] Parser Build: " + (AgateOrderParser.PARSER_BUILD_ID || "不明(旧バージョンの可能性)")
-    + " / 実行回数: " + neParseDiagCallCount
-    + " / site: " + parsed.site
-    + " / subtotalCheckMethod: " + (parsed.subtotalCheckMethod || "不明(旧バージョンの可能性)")
-    + " / parseStatus: " + parsed.parseStatus;
   summary.className = "order-parse-summary " + (parsed.parseStatus === "OK" ? "ok" : "ng");
   summary.replaceChildren();
 

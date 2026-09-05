@@ -218,10 +218,5 @@
     return result;
   }
 
-  // 診断専用の一時マーカー(2026-09診断作業)。本番ブラウザが実際にこのファイルの
-  // 最新版を読み込んで実行しているかを、client側から確認するためだけに存在する。
-  // 恒久機能ではないため、原因切り分けが終わり次第この値ごと削除すること。
-  const PARSER_BUILD_ID = "2026-09-05-diag1";
-
-  return { parseOrderText, PARSER_BUILD_ID };
+  return { parseOrderText };
 });
