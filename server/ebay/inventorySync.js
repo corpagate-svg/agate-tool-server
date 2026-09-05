@@ -96,6 +96,61 @@ function takeMatch(pool, key, anchorStartTime) {
   return { match, ambiguous };
 }
 
+const ELLIPSIS_FALLBACK_MIN_LEN = 70;
+// 末尾が「...」または「…」で終わるタイトルから、その省略記号だけを取り除いた本文を返す。
+// 省略記号で終わっていない(＝完全なタイトルの可能性がある)ものはnullを返し対象外にする。
+function stripTrailingEllipsisOnly(title) {
+  if (title.endsWith("...")) return title.slice(0, -3);
+  if (title.endsWith("…")) return title.slice(0, -1);
+  return null;
+}
+
+// US/UK/AUの完全一致(titleKey)で見つからなかった場合だけ使う、限定的なフォールバック。
+// eBayのUK/AU向けTitleが末尾で切り詰められ「...」が付与されるケース(2026-09時点で確認済み)
+// を救済する。あいまいなfuzzy matching・部分一致・startsWithだけの無条件採用は行わない。
+// 条件:
+//   1) UK/AU側タイトルが「...」「…」で終わっている(=省略の可能性がある)
+//   2) 省略記号を除いた本文が70文字以上(短い省略タイトルは対象外)
+//   3) その本文が、US側タイトルの先頭から同じ長さぶんと1文字も違わず完全一致する
+//   4) その省略タイトルに一致するUS候補が「ちょうど1件」、かつそのUS候補に一致する
+//      省略タイトル側候補も「ちょうど1件」の場合だけ採用する(どちらか一方でも
+//      2件以上あれば不採用)。
+//
+// 全US出品を1件ずつ処理しながらその都度フォールバックを試みる方式だと、後から処理される
+// 別のUS候補との曖昧さ(同じ省略タイトルに複数のUS候補が一致し得るケース)を見逃し、
+// 先に処理された方が誤って「早い者勝ち」で確定してしまう。これを避けるため、完全一致の
+// 処理がすべて終わってプールが確定した後に、残っている候補どうしの対応関係を一括かつ
+// 双方向(UK/AU側から見ても、US側から見ても一致がちょうど1件)に解決する。
+function resolveEllipsisFallbackMatches(pool, unmatchedUsEntries) {
+  const poolItems = [];
+  for (const list of pool.values()) for (const item of list) poolItems.push(item);
+
+  const usMatchesByPoolItem = new Map();
+  for (const item of poolItems) {
+    const base = stripTrailingEllipsisOnly(titleKey(item.title));
+    if (base === null || base.length < ELLIPSIS_FALLBACK_MIN_LEN) continue;
+    const matches = unmatchedUsEntries.filter((e) => e.key.length >= base.length && e.key.slice(0, base.length) === base);
+    usMatchesByPoolItem.set(item, matches);
+  }
+  const poolMatchCountByUsEntry = new Map();
+  for (const matches of usMatchesByPoolItem.values()) {
+    for (const usEntry of matches) poolMatchCountByUsEntry.set(usEntry, (poolMatchCountByUsEntry.get(usEntry) || 0) + 1);
+  }
+
+  const resolved = new Map(); // usEntry -> pool item
+  for (const [item, matches] of usMatchesByPoolItem) {
+    if (matches.length === 1 && poolMatchCountByUsEntry.get(matches[0]) === 1) resolved.set(matches[0], item);
+  }
+
+  for (const item of resolved.values()) {
+    for (const list of pool.values()) {
+      const idx = list.indexOf(item);
+      if (idx !== -1) { list.splice(idx, 1); break; }
+    }
+  }
+  return resolved;
+}
+
 // eBay APIへの通信(数秒〜数十秒かかり得る)はロックの外で行い、他の保存操作を
 // 不必要に待たせない。ロックを取るのは「在庫管理表.xlsxの読み込み→マージ→書き込み」
 // の間だけにし、しかもロック取得後に改めて最新のxlsxを読み込む(eBay通信中に行われた
@@ -170,10 +225,23 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
   const syncExecutionId = crypto.randomUUID();
   const detectedAt = new Date().toISOString();
 
-  for (const usItem of usItems) {
+  // パス1: 完全一致(titleKey)だけを全US出品に対して先に行う。ここでukPool/auPoolから
+  // 完全一致分が消費され、フォールバック判定の対象になる「残り」が確定する。
+  const usEntries = usItems.map((usItem) => {
     const key = titleKey(usItem.title);
-    const ukResult = takeMatch(ukPool, key, usItem.startTime);
-    const auResult = takeMatch(auPool, key, usItem.startTime);
+    return { usItem, key, ukResult: takeMatch(ukPool, key, usItem.startTime), auResult: takeMatch(auPool, key, usItem.startTime) };
+  });
+
+  // パス2: 完全一致で決まらなかった側だけ、末尾「...」「…」省略タイトルの限定フォールバックを
+  // 一括で解決する。US出品を1件ずつ処理しながらその都度フォールバックを試みると、まだ処理
+  // していない別のUS候補との曖昧さ(同じ省略タイトルに複数のUS候補が一致し得るケース)を
+  // 見逃し、先勝ちで誤って確定してしまうため、全件を集計してから双方向で解決する。
+  const ukFallback = resolveEllipsisFallbackMatches(ukPool, usEntries.filter((e) => !e.ukResult.match));
+  const auFallback = resolveEllipsisFallbackMatches(auPool, usEntries.filter((e) => !e.auResult.match));
+  for (const [usEntry, item] of ukFallback) usEntry.ukResult = { match: item, ambiguous: true };
+  for (const [usEntry, item] of auFallback) usEntry.auResult = { match: item, ambiguous: true };
+
+  for (const { usItem, key, ukResult, auResult } of usEntries) {
     if (ukResult.ambiguous || auResult.ambiguous) ambiguousCount++;
 
     const siteCount = 1 + (ukResult.match ? 1 : 0) + (auResult.match ? 1 : 0);
@@ -339,6 +407,7 @@ async function rebuildInventoryFromEbay({ INV_HEADERS, INVENTORY_PATH, loadInven
     `・eBay Trading API(GetMyeBaySelling / ActiveList)の取得結果(${today}時点)を元に、USサイトの出品を基準として自動更新しました。`,
     "・メインシートの行数は「USサイトの出品数(バリエーション出品を除く)」と必ず一致します。UK/AUの出品は対応するUS商品の行に付随情報として紐づけるだけで、単独の行としては追加していません。",
     "・商品名(タイトル)はeBayから取得した文字列をそのまま保存しています(前後・連続する空白の違いだけは無視して一致と判定しますが、それ以外は完全一致した場合のみ紐付けます。あいまいな類似判定は行いません)。",
+    "・完全一致で紐付かなかったUK/AU出品のうち、タイトル末尾が「...」等の省略記号で終わっているものだけは、省略記号を除いた70文字以上の本文がUS出品タイトルの先頭と完全一致し、かつ候補が1件だけの場合に限り、例外的に紐付けます(黄色でハイライトして要確認扱いにします)。候補が0件・2件以上の場合や本文が70文字未満の場合は、これまでどおり紐付けません。",
     "・黄色でハイライトした行は「UK/AUの対応付けが複数候補から推定で選ばれた」「在庫数が国ごとに違う」「UK/AUが3カ国揃っていない」のいずれかに該当します。",
     "・今回のUS Active Listingsに存在しないUS出品ID(=出品終了・売り切れ後の自動終了などでeBayから消えたもの)は、メインシートから削除しています(UK/AUの有無や在庫数0は削除理由にしていません)。",
     "・UK/AUが複数候補ある場合は、US出品の出品開始日時に最も近いものを自動選択しています(確実な保証はできないため、該当行は黄色でハイライトしています)。",
